@@ -161,7 +161,7 @@ This question tests the difference between FILTER predicates and BLOCK predicate
 
 A FILTER predicate restricts which existing rows are visible or accessible to SELECT, UPDATE, and DELETE operations.
 
-However, a FILTER predicate by itself does not prevent a user from inserting a row that belongs to another tenant. Therefore, option a is incomplete.
+However, a FILTER predicate by itself does not prevent a user from inserting a row that belongs to another tenant. It also does not prevent an UPDATE that changes a visible row's TenantId to another tenant: the filter is evaluated against the existing row (which the tenant owns), the update succeeds, and the row simply disappears from the tenant's view afterwards. Option a therefore violates both the INSERT requirement and the UPDATE-of-TenantId requirement, and is incomplete.
 
 Option b uses BLOCK predicates to protect INSERT and UPDATE operations, but it does not contain a FILTER predicate. As a result, it does not restrict which existing rows AppUser can see. Therefore, option b is incomplete.
 
