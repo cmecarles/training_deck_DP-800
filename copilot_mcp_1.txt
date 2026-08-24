@@ -1,0 +1,316 @@
+============================================================
+ SQL Server question — GitHub Copilot and MCP 1
+============================================================
+
+Statement
+---------
+
+The data engineering team at Meridian Analytics develops T-SQL in
+Visual Studio Code by using GitHub Copilot in agent mode.
+
+The team wants Copilot to work directly against the development
+database MeridianDev on the server dev-sql01 through the Microsoft
+SQL Server MCP server. The MCP server runs locally as a stdio
+process, is stored in the repository at ./tools/mssql-mcp/index.js,
+and reads its SQL connection string from the CONNECTION_STRING
+environment variable.
+
+The team defines the following requirements:
+
+1. The MCP server definition must live in the Git repository, so
+   that every developer who clones the repository and opens the
+   workspace gets the same server definition automatically.
+2. The SQL authentication password must not be committed to the
+   repository in plaintext.
+3. Through the MCP tools, Copilot must be able to list tables, read
+   schema metadata, and run SELECT validation queries against
+   MeridianDev.
+4. Prompt injection is an accepted threat: text stored in table data
+   or in fetched documents can reach the model through tool output
+   and can attempt to make the agent issue a destructive statement
+   (for example, DROP TABLE or DELETE). If that happens, the
+   statement must FAIL AT THE DATABASE ENGINE. The protection must
+   not depend on a developer noticing the statement in an approval
+   dialog.
+5. Developers must still review and approve each MCP tool
+   invocation individually by default.
+
+Which approach should the team use?
+
+
+a.
+
+Commit the following file as .vscode/mcp.json:
+
+{
+    "inputs": [
+        {
+            "id": "mssql-password",
+            "type": "promptString",
+            "description": "Password for the mssql_copilot_dev SQL login",
+            "password": true
+        }
+    ],
+    "servers": {
+        "meridian-mssql": {
+            "type": "stdio",
+            "command": "node",
+            "args": ["./tools/mssql-mcp/index.js"],
+            "env": {
+                "CONNECTION_STRING": "Server=dev-sql01;Database=MeridianDev;User Id=mssql_copilot_dev;Password=${input:mssql-password};TrustServerCertificate=True"
+            }
+        }
+    }
+}
+
+In MeridianDev, create the dedicated login and user
+mssql_copilot_dev, add it to the db_datareader fixed database role,
+and grant it VIEW DEFINITION. Grant it no DDL or data-modification
+permissions.
+
+Keep the default tool-approval behavior: do not enable
+chat.tools.global.autoApprove, and do not select a broad
+auto-approval scope in the confirmation dialog.
+
+
+b.
+
+Commit the same .vscode/mcp.json file as in option a, with one
+difference in the env value:
+
+"CONNECTION_STRING": "Server=dev-sql01;Database=MeridianDev;User Id=dev_admin;Password=${input:mssql-password};TrustServerCertificate=True"
+
+The dev_admin user is a member of the db_owner fixed database role,
+so Copilot can help with any future task without permission changes.
+
+Keep the default tool-approval behavior. Because Visual Studio Code
+shows each tool invocation with its input parameters before it
+runs, a developer will reject any injected destructive statement in
+the confirmation dialog, so the elevated permissions are safe.
+
+
+c.
+
+Have each developer run the MCP: Open User Configuration command
+and add the server to the mcp.json file in their user profile:
+
+{
+    "inputs": [
+        {
+            "id": "mssql-password",
+            "type": "promptString",
+            "description": "Password for the mssql_copilot_dev SQL login",
+            "password": true
+        }
+    ],
+    "servers": {
+        "meridian-mssql": {
+            "type": "stdio",
+            "command": "node",
+            "args": ["./tools/mssql-mcp/index.js"],
+            "env": {
+                "CONNECTION_STRING": "Server=dev-sql01;Database=MeridianDev;User Id=mssql_copilot_dev;Password=${input:mssql-password};TrustServerCertificate=True"
+            }
+        }
+    }
+}
+
+Use the same least-privilege mssql_copilot_dev login as in option
+a, and document the setup steps in the repository README.md so
+every developer can reproduce the configuration.
+
+
+d.
+
+Commit the following file as .github/copilot-instructions.md:
+
+# Copilot instructions for Meridian Analytics
+
+Register the following MCP server for this repository and use it for all
+database work:
+
+- command: node ./tools/mssql-mcp/index.js
+- environment: CONNECTION_STRING=Server=dev-sql01;Database=MeridianDev;User Id=mssql_copilot_dev;Password=<ask the developer>;TrustServerCertificate=True
+
+You may list tables, read schema metadata, and run SELECT queries.
+Never run DROP, DELETE, UPDATE, or INSERT statements.
+
+Because this file is automatically included in every chat request,
+Copilot registers the MCP server for the whole team, and the
+closing instruction guarantees that destructive statements are
+never executed.
+
+
+Correct Answer
+--------------
+
+a
+
+
+Explanation
+-----------
+
+The correct answer is a.
+
+This question tests three independent concepts:
+
+1. Where team-shared MCP server configuration lives in Visual
+   Studio Code.
+2. How secrets are kept out of a committed configuration file.
+3. Which layer actually stops a prompt-injected destructive
+   statement.
+
+The important trap is that the tool-approval dialog and
+prompt-level instructions are not the security boundary — the
+database permissions of the configured connection are.
+
+An MCP server that executes T-SQL runs every statement as the
+principal in its connection string. The model can never exceed
+those permissions, no matter what the prompt — or an injected
+payload inside tool output — asks for. Conversely, anything those
+permissions allow CAN happen if an invocation is approved (or
+auto-approved).
+
+Why option a is correct
+-----------------------
+
+Requirement 1 — shared definition. Visual Studio Code reads
+workspace MCP server definitions from .vscode/mcp.json, under the
+top-level servers key. Because the file lives inside the
+repository, every developer who clones the repository and opens the
+workspace gets the same server definition.
+
+Requirement 2 — no plaintext secret. The inputs array defines an
+input variable of type promptString with "password": true. The
+committed file contains only the placeholder
+${input:mssql-password}; Visual Studio Code prompts each developer
+for the value (with hidden typing) and substitutes it into the
+CONNECTION_STRING environment variable at server start. No secret
+is committed.
+
+Requirement 3 — needed capabilities. db_datareader grants SELECT on
+all tables and views, which covers listing tables and running
+validation queries, and VIEW DEFINITION exposes object metadata.
+Copilot can therefore explore the schema and validate queries
+through the MCP tools.
+
+Requirement 4 — injection fails at the engine. mssql_copilot_dev
+holds no INSERT, UPDATE, DELETE, ALTER, or CONTROL permission. If
+an injected payload ever makes the agent issue DROP TABLE or DELETE
+through the MCP server, the database engine rejects the statement
+with a permission error. This holds even if a developer approves
+the invocation without reading it, and even if a tool was
+previously auto-approved for the session or workspace. The control
+is enforced by SQL Server, not by human attention.
+
+Requirement 5 — per-invocation review. By default, agent mode shows
+a confirmation dialog with the tool name and its input parameters
+before a tool runs, and the developer chooses the approval scope
+(single use, session, workspace, or all future invocations). Option
+a keeps this default and explicitly avoids
+chat.tools.global.autoApprove, which would disable the prompts
+entirely.
+
+Defense in depth is the point: approval dialogs reduce noise and
+catch mistakes, but least privilege is what makes requirement 4
+deterministic.
+
+Why option b is wrong
+---------------------
+
+Option b commits the correct file to the correct location and
+handles the password correctly — the configuration mechanics are
+all right. Its single flaw is the security model.
+
+A db_owner member can drop tables, delete data, and alter any
+object in the database. With that connection, a prompt-injected
+DROP TABLE that reaches the engine SUCCEEDS. Requirement 4
+explicitly states the destructive statement must fail at the
+database engine and that protection must not depend on a developer
+noticing it in an approval dialog.
+
+Relying on the confirmation dialog fails for documented reasons:
+
+- Injected instructions can be hidden in comments or obscured
+  through formatting inside tool output, and a destructive
+  operation can be buried inside an innocuous-looking tool call; a
+  reviewer skimming parameters can miss it.
+- Approval is not guaranteed to stay manual: the confirmation
+  dialog lets a developer auto-approve a tool for the current
+  session, the workspace, or all future invocations. One convenient
+  click earlier in the day removes the human from the loop for
+  exactly the invocation that matters.
+
+The dialog is a usability and review feature layered on top of
+security — it is not a substitute for least-privilege database
+permissions.
+
+Why option c is wrong
+---------------------
+
+Option c uses the correct schema (servers, inputs, promptString
+with password: true) and the correct least-privilege login, but it
+puts the definition in the user-profile mcp.json (opened with
+MCP: Open User Configuration).
+
+User-profile configuration applies to that developer's own Visual
+Studio Code profile across their workspaces. It is not stored in
+the repository, so it violates requirement 1: a developer who
+clones the repository gets no server definition automatically.
+Every team member must hand-copy the JSON from the README.md, and
+nothing keeps the copies consistent as the configuration evolves —
+the exact drift problem workspace configuration in .vscode/mcp.json
+exists to solve.
+
+Why option d is wrong
+---------------------
+
+Option d confuses two different customization mechanisms.
+
+.github/copilot-instructions.md is a custom instructions file: its
+Markdown content is automatically included as natural-language
+context in every chat request for the workspace. It shapes how the
+model writes and behaves — coding standards, conventions,
+preferences. It cannot register an MCP server, launch a process, or
+set environment variables. A "server definition" written there is
+just prose the model reads; no MCP server exists, no tools appear
+in the chat session, and requirement 3 is never met.
+
+The closing line — "Never run DROP, DELETE, UPDATE, or INSERT
+statements" — also guarantees nothing. It is an instruction inside
+the prompt context, which is precisely the layer prompt injection
+attacks. A stronger injected instruction in tool output can
+override it, and the model may simply fail to follow it. Only
+permissions enforced by the database engine satisfy requirement 4.
+
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+In Visual Studio Code, keep the two customization surfaces
+separate:
+
+.vscode/mcp.json                  → registers MCP servers ("servers" + "inputs")
+.github/copilot-instructions.md   → natural-language guidance in every chat request
+
+Instruction files influence the model. They never register tools
+and never enforce anything.
+
+For the security of an MCP server that executes T-SQL, reason in
+layers:
+
+What CAN happen   = the database permissions of the configured connection
+What DOES happen  = whichever tool invocations get approved (or auto-approved)
+
+Approval dialogs can be skipped, broadened to a session or
+workspace, or fooled by instructions hidden in tool output.
+Database permissions cannot.
+
+So:
+
+- Least privilege on the connection → an injected destructive
+  statement fails at the engine
+- inputs / promptString with password: true → secrets never land in
+  the repository
+- Default per-invocation approval kept → humans stay in the loop as
+  an extra layer, not as the boundary

@@ -1,0 +1,242 @@
+# SQL Server question — Temporary Tables 1
+
+## Statement
+
+The payroll department runs its monthly batch in the database `PayrollHub`. The batch procedures exchange intermediate data through temporary objects, and a developer wants to know exactly which of them can see what.
+
+The following setup script runs first and completes without any error:
+
+```sql
+CREATE DATABASE PayrollHub;
+GO
+USE PayrollHub;
+GO
+CREATE SCHEMA Pay;
+GO
+CREATE TABLE Pay.RunLog
+(
+    LogID    int IDENTITY(1,1) PRIMARY KEY,
+    Source   nvarchar(40) NOT NULL,
+    RowsSeen int          NOT NULL
+);
+GO
+CREATE PROCEDURE Pay.usp_LoadAdjustments
+AS
+BEGIN
+    CREATE TABLE #Batch (EmpID int NOT NULL, Amount decimal(9,2) NOT NULL);
+    INSERT INTO #Batch VALUES (7, 50.00), (8, 75.00);
+    INSERT INTO Pay.RunLog (Source, RowsSeen)
+    SELECT N'LoadAdjustments', COUNT(*) FROM #Batch;
+END;
+GO
+CREATE PROCEDURE Pay.usp_Summarize
+AS
+BEGIN
+    INSERT INTO Pay.RunLog (Source, RowsSeen)
+    SELECT N'Summarize', COUNT(*) FROM #Batch;
+END;
+GO
+CREATE PROCEDURE Pay.usp_Stage
+AS
+BEGIN
+    CREATE TABLE ##Stage (EmpID int NOT NULL);
+    INSERT INTO ##Stage VALUES (1), (2), (3), (4);
+END;
+GO
+CREATE PROCEDURE Pay.usp_RunPayroll
+AS
+BEGIN
+    CREATE TABLE #Batch (EmpID int NOT NULL, Amount decimal(9,2) NOT NULL);
+    INSERT INTO #Batch VALUES (1, 1000.00), (2, 1100.00), (3, 900.00);
+
+    EXEC Pay.usp_LoadAdjustments;
+    EXEC Pay.usp_Summarize;
+
+    INSERT INTO Pay.RunLog (Source, RowsSeen)
+    SELECT N'RunPayroll', COUNT(*) FROM #Batch;
+END;
+GO
+```
+
+The same session then executes the following nine batches, in order. A batch that fails does not stop the session; the next batch still runs.
+
+```sql
+-- Batch A
+EXEC Pay.usp_RunPayroll;
+GO
+-- Batch B
+EXEC Pay.usp_Summarize;
+GO
+-- Batch C
+CREATE TABLE #Batch (EmpID int NOT NULL, Amount decimal(9,2) NOT NULL);
+INSERT INTO #Batch VALUES (10, 12.50);
+GO
+-- Batch D
+EXEC Pay.usp_Summarize;
+GO
+-- Batch E
+DECLARE @Recent TABLE (EmpID int NOT NULL);
+INSERT INTO @Recent VALUES (1);
+GO
+-- Batch F
+SELECT COUNT(*) AS RecentRows FROM @Recent;
+GO
+-- Batch G
+EXEC Pay.usp_Stage;
+GO
+-- Batch H
+SELECT COUNT(*) AS StagedRows FROM ##Stage;
+GO
+-- Batch I
+SELECT LogID, Source, RowsSeen
+FROM Pay.RunLog
+ORDER BY LogID;
+GO
+```
+
+Which batches raise an error, and what do batches H and I return?
+
+### a.
+
+Batches **B**, **F**, and **H** fail. Batch I returns:
+
+```text
+LogID  Source           RowsSeen
+-----  ---------------  --------
+    1  LoadAdjustments         2
+    2  Summarize               3
+    3  RunPayroll              3
+    4  Summarize               1
+```
+
+### b.
+
+Batches **B** and **F** fail. Batch H returns `StagedRows = 4`. Batch I returns:
+
+```text
+LogID  Source           RowsSeen
+-----  ---------------  --------
+    1  LoadAdjustments         5
+    2  Summarize               5
+    3  RunPayroll              5
+    4  Summarize               1
+```
+
+### c.
+
+Batches **B** and **F** fail. Batch H returns `StagedRows = 4`. Batch I returns:
+
+```text
+LogID  Source           RowsSeen
+-----  ---------------  --------
+    1  LoadAdjustments         2
+    2  Summarize               3
+    3  RunPayroll              3
+    4  Summarize               1
+```
+
+### d.
+
+Batches **B**, **D**, and **F** fail. Batch H returns `StagedRows = 4`. Batch I returns:
+
+```text
+LogID  Source           RowsSeen
+-----  ---------------  --------
+    1  LoadAdjustments         2
+    2  Summarize               3
+    3  RunPayroll              3
+```
+
+## Correct Answer
+
+**c**
+
+(Verified against SQL Server 2025: batch B fails with `Msg 208 — Invalid object name '#Batch'`, batch F fails with `Msg 1087 — Must declare the table variable "@Recent"`, batch H returns 4, and batch I returns exactly the four rows of option c.)
+
+## Explanation
+
+The question tests the three temporary-object scoping models side by side:
+
+| Object | Scope | Dropped when |
+|---|---|---|
+| `#local` temp table | creating session/procedure, **plus every procedure nested below the creator** | creating procedure returns (or session ends, if created at session level) |
+| `##global` temp table | **all** sessions | creating session ends *and* no other task references it — **not** when the creating procedure returns |
+| `@table` variable | the single batch / procedure / function that declares it — **never visible to nested procedures** | end of that batch |
+
+### Batch A — succeeds, logs three rows
+
+1. `usp_RunPayroll` creates `#Batch` (3 rows). A local temp table created in a procedure *"can be referenced by any nested stored procedures executed by the stored procedure that created the table"* (CREATE TABLE docs).
+2. `usp_LoadAdjustments` executes `CREATE TABLE #Batch` even though the caller already has one. This is legal: the nested procedure gets its **own** `#Batch` that shadows the caller's for the duration of the call. Its two `INSERT`ed rows (EmpID 7 and 8) go into that inner table, so it logs `('LoadAdjustments', 2)`. When it returns, its inner `#Batch` is dropped automatically; the caller's 3-row table was never touched.
+3. `usp_Summarize` creates no `#Batch` of its own, so name resolution finds the nearest enclosing one: `usp_RunPayroll`'s 3-row table. It logs `('Summarize', 3)`.
+4. Back in `usp_RunPayroll`, `#Batch` still has its original 3 rows → `('RunPayroll', 3)`.
+
+### Batch B — fails
+
+When `usp_RunPayroll` returned at the end of batch A, its `#Batch` was dropped automatically. `usp_Summarize` was created successfully thanks to deferred name resolution, but at execution time there is now no `#Batch` in scope anywhere, so the batch dies with:
+
+```text
+Msg 208, Level 16, State 1, Procedure Pay.usp_Summarize
+Invalid object name '#Batch'.
+```
+
+Nothing is logged.
+
+### Batches C and D — both succeed
+
+Batch C creates `#Batch` at **session** scope; a session-level local temp table survives across batches until the session ends or it is dropped. In batch D, `usp_Summarize` is a procedure nested below the session, so it sees the session's 1-row `#Batch` and logs `('Summarize', 1)`.
+
+### Batch E — succeeds; Batch F — fails
+
+A table variable is scoped to the batch that declares it. Inside batch E, `DECLARE` and `INSERT` share a batch, so both work. Batch F is a **new** batch: `@Recent` no longer exists, and because this is a *compile-time* error the whole batch is rejected before any statement in it runs:
+
+```text
+Msg 1087, Level 15, State 2
+Must declare the table variable "@Recent".
+```
+
+(This is also why, unlike batch B's runtime error, batch F could never be rescued by `TRY...CATCH` in the same batch — compile errors are not catchable at the same level.)
+
+### Batches G and H — both succeed
+
+`usp_Stage` creates the global temp table `##Stage` and returns. Unlike a `#local` table, a `##global` table is **not** dropped when the creating procedure finishes — it lives until the creating *session* ends (and no other task references it). So batch H, running later in the same session, returns `StagedRows = 4`. Any *other* session could read it too.
+
+### Batch I — the final log
+
+```text
+LogID  Source           RowsSeen
+-----  ---------------  --------
+    1  LoadAdjustments         2
+    2  Summarize               3
+    3  RunPayroll              3
+    4  Summarize               1
+```
+
+### Why option a is wrong
+
+Option a gets every log row right but claims batch H fails, applying the `#local` lifetime rule ("dropped when the creating procedure returns") to a `##global` table. This is the subtle distractor: global temp tables are dropped only when the creating **session** ends and no other session is still referencing them, so `##Stage` is alive and well in batch H.
+
+### Why option b is wrong
+
+Option b assumes there is only one `#Batch` per session, so `usp_LoadAdjustments`' two rows land in `usp_RunPayroll`'s table (3 + 2 = 5 everywhere). In reality the nested `CREATE TABLE #Batch` creates a distinct, inner-scoped table that shadows the caller's; the counts are 2, 3, 3 — never 5.
+
+### Why option d is wrong
+
+Option d treats the session-level `#Batch` from batch C as if it were batch-scoped like a table variable, and so predicts batch D fails and the fourth log row never appears. A local temp table created outside any procedure persists for the whole session, across `GO` boundaries, and is visible to procedures the session calls — batch D succeeds and logs `('Summarize', 1)`.
+
+## DP-800 Exam Rule to Remember
+
+Visibility flows **downward** only, and lifetime belongs to the **creator**:
+
+```text
+#local   created in a proc     → visible to that proc + procs it calls;
+                                 dropped when the creating proc returns
+#local   created in a session  → visible to all later batches + procs the
+                                 session calls; dropped at session end
+##global created anywhere      → visible to ALL sessions; dropped when the
+                                 creating SESSION ends (not the proc) and
+                                 nothing else references it
+@table variable                → one batch/proc only; invisible to nested
+                                 procs; gone at end of batch
+```
+
+Two trap behaviors worth memorizing: a nested procedure may `CREATE TABLE #X` while the caller also has a `#X` — it gets its own shadowing copy; and referencing a table variable from another batch is a *compile-time* error (Msg 1087) that kills the entire batch before it starts, while referencing a vanished temp table inside a procedure is a *runtime* error (Msg 208) thanks to deferred name resolution.

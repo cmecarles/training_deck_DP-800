@@ -1,0 +1,287 @@
+============================================================
+ SQL Server question — Dynamic Data Masking 1
+============================================================
+
+Statement
+---------
+
+A dental clinic stores patient records in an Azure SQL Database
+named ClinicCare.
+
+The complete history of the database is the following script,
+executed by the database owner from creation onward. Nothing else
+has ever been executed against the database.
+
+CREATE SCHEMA Med;
+GO
+
+CREATE TABLE Med.Patients
+(
+    PatientID   INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    FullName    NVARCHAR(60) NOT NULL
+                MASKED WITH (FUNCTION = 'partial(2, "#####", 2)'),
+    Email       VARCHAR(80)  NOT NULL
+                MASKED WITH (FUNCTION = 'email()'),
+    NationalID  CHAR(9)      NOT NULL
+                MASKED WITH (FUNCTION = 'partial(0, "XXXXX", 4)'),
+    MonthlyFee  DECIMAL(8,2) NOT NULL
+                MASKED WITH (FUNCTION = 'default()'),
+    NextVisit   DATE         NOT NULL
+                MASKED WITH (FUNCTION = 'default()')
+);
+GO
+
+INSERT INTO Med.Patients (FullName, Email, NationalID, MonthlyFee, NextVisit) VALUES
+(N'Marta Vidal',  'marta.vidal@dentalia.example',  '48291736M', 300.00, '2026-09-03'),
+(N'Joan Serra',   'j.serra@clinicare.example',     '10457829K', 180.00, '2026-09-10'),
+(N'Aina Pons',    'aina.pons@mail.example',        '39684215T', 300.00, '2026-09-17'),
+(N'Omar Haddad',  'omar.haddad@dentalia.example',  '52170348Z', 245.00, '2026-10-01');
+GO
+
+CREATE USER Reception WITHOUT LOGIN;
+GO
+
+GRANT SELECT ON SCHEMA::Med TO Reception;
+GRANT UNMASK ON Med.Patients(Email) TO Reception;
+GO
+
+Reception is not a member of any database role other than public,
+holds no other permission, and is not db_owner.
+
+The database owner then runs:
+
+EXECUTE AS USER = 'Reception';
+
+SELECT PatientID,
+       FullName,
+       UPPER(FullName) AS NameKey,
+       Email,
+       NationalID,
+       MonthlyFee,
+       NextVisit
+FROM Med.Patients
+WHERE MonthlyFee >= 200
+ORDER BY PatientID;
+
+REVERT;
+
+What exact result set does the SELECT return?
+
+a.
+
+The query returns zero rows (an empty result set), because for
+Reception every MonthlyFee is masked to 0.00, and 0.00 >= 200 is
+false for all four rows.
+
+b.
+
+PatientID | FullName  | NameKey | Email                        | NationalID | MonthlyFee | NextVisit
+----------+-----------+---------+------------------------------+------------+------------+-----------
+1         | Ma#####al | xxxx    | marta.vidal@dentalia.example | XXXXX736M  | 0.00       | 1900-01-01
+3         | Ai#####ns | xxxx    | aina.pons@mail.example       | XXXXX215T  | 0.00       | 1900-01-01
+4         | Om#####ad | xxxx    | omar.haddad@dentalia.example | XXXXX348Z  | 0.00       | 1900-01-01
+
+c.
+
+PatientID | FullName  | NameKey   | Email                        | NationalID | MonthlyFee | NextVisit
+----------+-----------+-----------+------------------------------+------------+------------+-----------
+1         | Ma#####al | MA#####AL | marta.vidal@dentalia.example | XXXXX736M  | 0.00       | 1900-01-01
+3         | Ai#####ns | AI#####NS | aina.pons@mail.example       | XXXXX215T  | 0.00       | 1900-01-01
+4         | Om#####ad | OM#####AD | omar.haddad@dentalia.example | XXXXX348Z  | 0.00       | 1900-01-01
+
+d.
+
+PatientID | FullName    | NameKey     | Email                        | NationalID | MonthlyFee | NextVisit
+----------+-------------+-------------+------------------------------+------------+------------+-----------
+1         | Marta Vidal | MARTA VIDAL | marta.vidal@dentalia.example | 48291736M  | 300.00     | 2026-09-03
+3         | Aina Pons   | AINA PONS   | aina.pons@mail.example       | 39684215T  | 300.00     | 2026-09-17
+4         | Omar Haddad | OMAR HADDAD | omar.haddad@dentalia.example | 52170348Z  | 245.00     | 2026-10-01
+
+Correct Answer
+--------------
+
+b
+
+No other option is equivalent to b; b is the only correct answer.
+
+Explanation
+-----------
+
+The correct answer is b.
+
+Three independent Dynamic Data Masking (DDM) behaviors decide
+this result set:
+
+1. Predicates always run against the real stored values. Masking
+   happens only when data is PRESENTED in the result set; it
+   never changes the data the engine filters, joins, sorts, or
+   groups on.
+2. UNMASK is grantable at column granularity (Azure SQL Database
+   and SQL Server 2022 and later).
+   GRANT UNMASK ON Med.Patients(Email) TO Reception; unmasks
+   ONLY Email — every other masked column stays masked for
+   Reception.
+3. Any expression that references a masked column is itself
+   masked with the default() function, regardless of which
+   masking function is defined on the underlying column. So
+   UPPER(FullName) does not return an upper-cased partial mask;
+   it returns the default string mask.
+
+Step 1 — which rows survive the WHERE clause
+--------------------------------------------
+
+WHERE MonthlyFee >= 200 is evaluated against the REAL fees, even
+though Reception can never display them:
+
+PatientID | Real MonthlyFee | >= 200?
+----------+-----------------+--------
+1         | 300.00          | yes
+2         | 180.00          | no
+3         | 300.00          | yes
+4         | 245.00          | yes
+
+Rows 1, 3 and 4 are returned; row 2 (Joan Serra) is filtered
+out. ORDER BY PatientID fixes the row order 1, 3, 4.
+
+This is exactly the inference leak Microsoft documents: the
+query already proves to Reception that three patients pay at
+least 200 and one does not. By repeating the query with narrower
+predicates (WHERE MonthlyFee = 300, WHERE MonthlyFee BETWEEN 240
+AND 250, ...), Reception can brute-force every exact fee while
+only ever SEEING 0.00. DDM is a presentation-layer control, not
+an authorization boundary — Microsoft explicitly recommends
+combining it with auditing, least-privilege permissions, RLS, or
+encryption.
+
+Step 2 — derive every displayed value
+-------------------------------------
+
+FullName — partial(2, "#####", 2) exposes the first 2
+characters, then the literal padding #####, then the last 2
+characters:
+
+- Marta Vidal → prefix Ma + ##### + last two characters al
+  (from Vid al) → Ma#####al
+- Aina Pons → prefix Ai + ##### + last two characters ns
+  (from Po ns) → Ai#####ns
+- Omar Haddad → prefix Om + ##### + last two characters ad
+  (from Hadd ad) → Om#####ad
+
+NameKey = UPPER(FullName) — a projected EXPRESSION over a masked
+column. Per the documentation, the expression result "will
+always be masked with the default function", whatever function
+the column itself uses. The default mask for string types is
+xxxx. So every row shows NameKey = xxxx.
+
+Email — email() but unmasked for this user. Reception holds
+column-level UNMASK on Med.Patients(Email) plus SELECT, so the
+real addresses are returned: marta.vidal@dentalia.example,
+aina.pons@mail.example, omar.haddad@dentalia.example. (Without
+that grant, email() would have exposed only the first character
+plus the constant XXX@XXXX.com: mXXX@XXXX.com, aXXX@XXXX.com,
+oXXX@XXXX.com.)
+
+NationalID — partial(0, "XXXXX", 4) exposes zero leading
+characters, the padding XXXXX, and the last 4 characters:
+
+- 48291736M (characters 4 8 2 9 1 7 3 6 M) → last four are
+  7 3 6 M → XXXXX736M
+- 39684215T (characters 3 9 6 8 4 2 1 5 T) → last four are
+  2 1 5 T → XXXXX215T
+- 52170348Z (characters 5 2 1 7 0 3 4 8 Z) → last four are
+  3 4 8 Z → XXXXX348Z
+
+MonthlyFee — default() on a numeric type returns a zero value;
+rendered with the column's decimal(8,2) scale, that is 0.00 for
+every row (a client that prints it as 0 is displaying the same
+value).
+
+NextVisit — default() on date and time types returns
+1900-01-01 00:00:00.0000000; for a DATE column that is
+1900-01-01 for every row.
+
+Every value in option b matches this derivation.
+
+Why option a is wrong
+---------------------
+
+Option a assumes the WHERE clause is evaluated against the
+masked value. It is not. Masking is applied to the RESULT SET
+PRESENTATION, after the engine has filtered on the real stored
+data. If masks fed the predicates, a masked user could never
+retrieve any row with a numeric filter — and the documented
+inference-attack scenario (filtering Salary between 99999 and
+100001 and getting rows back with Salary displayed as 0) could
+not exist.
+
+Why option c is wrong
+---------------------
+
+Option c gets the rows, the fees, the dates, the IDs and the
+emails right, but computes NameKey as UPPER() applied to the
+partial mask (MA#####AL, ...). That is not how DDM treats
+expressions: the engine does not produce a masked intermediate
+string and then run UPPER over it. Any projected expression
+referencing a masked column is masked as a whole, and always
+with the DEFAULT function — so the string result collapses to
+xxxx, losing even the partial-mask shape.
+
+Why option d is wrong
+---------------------
+
+Option d assumes that holding ANY UNMASK permission reveals
+everything, as if UNMASK were still the single database-wide
+permission it was before SQL Server 2022. Since SQL Server 2022
+(and in Azure SQL Database), UNMASK is grantable at four
+scopes — database, schema, table, and COLUMN — and this grant
+names exactly one column, Med.Patients(Email). FullName,
+NationalID, MonthlyFee and NextVisit therefore remain masked.
+(Only principals with UNMASK at a covering scope, or with
+CONTROL — e.g. db_owner, sysadmin — see those columns unmasked.)
+
+Why Dynamic Data Masking and not Always Encrypted here
+------------------------------------------------------
+
+Two distractor-level contrasts worth internalizing:
+
+- A masking rule CANNOT be defined on an Always Encrypted
+  column — the two features are mutually exclusive per column.
+- With Always Encrypted, the ENGINE ITSELF stores ciphertext and
+  could not have evaluated MonthlyFee >= 200 at all (range
+  predicates are not supported over encrypted columns unless
+  secure enclaves with enclave-enabled randomized encryption are
+  configured — a very different setup). The fact that the filter
+  works on real values is the signature of DDM: the server sees
+  everything; only the presentation is masked.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Dynamic Data Masking is a PRESENTATION-LAYER feature. Fix these
+five facts:
+
+1. Predicates see real data. WHERE, JOIN, GROUP BY, ORDER BY all
+   operate on stored values, so a masked user can INFER or
+   brute-force values they can never display. DDM alone is not
+   an authorization boundary — pair it with auditing, least
+   privilege, RLS, or encryption.
+2. Default masks by type:
+
+   string      → xxxx  (fewer x's if the column is shorter than 4)
+   numeric     → 0
+   date/time   → 1900-01-01 00:00:00.0000000
+   binary      → single byte 0
+
+3. Function constraints: email() → first character +
+   XXX@XXXX.com; partial(prefix, "padding", suffix) for strings;
+   random(low, high) is valid ONLY ON NUMERIC TYPES — it is the
+   one non-deterministic mask.
+4. UNMASK granularity (SQL Server 2022+ / Azure SQL Database):
+   grantable at database, schema, table, or single-column scope;
+   CONTROL (db_owner, sysadmin) always sees unmasked data. Any
+   EXPRESSION projected over a masked column is masked with
+   default(), whatever the column's own mask is.
+5. Copies stay masked: SELECT INTO / INSERT INTO ... SELECT
+   executed by a user without UNMASK persists the MASKED text
+   into the target table — and a mask cannot be defined on an
+   Always Encrypted column.

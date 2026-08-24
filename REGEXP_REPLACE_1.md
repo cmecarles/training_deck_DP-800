@@ -1,0 +1,166 @@
+# SQL Server question — REGEXP_REPLACE 1
+
+## Statement
+
+A newspaper digitizes its archive into SQL Server 2025 and builds a redaction pipeline with `REGEXP_REPLACE`. Before running it over millions of articles, the archivist tests it on three snippets.
+
+The complete session below runs top to bottom on SQL Server 2025 (17.x):
+
+```sql
+CREATE DATABASE NewsArchive;
+GO
+ALTER DATABASE NewsArchive SET COMPATIBILITY_LEVEL = 170;
+GO
+USE NewsArchive;
+GO
+CREATE SCHEMA Press;
+GO
+CREATE TABLE Press.Snippets
+(
+    SnippetID int           NOT NULL PRIMARY KEY,
+    Body      nvarchar(200) NOT NULL
+);
+GO
+INSERT INTO Press.Snippets (SnippetID, Body) VALUES
+    (1, N'He said "off the record" and later "print it all" twice.'),
+    (2, N'By Maria Torres and Omar Haddad'),
+    (3, N'Call 555-0117 or 555-0184 or 555-0199 now.');
+GO
+```
+
+The archivist then runs these five queries:
+
+```sql
+-- R1: redact quoted speech (greedy)
+SELECT REGEXP_REPLACE(Body, N'".*"', N'[QUOTE]') AS R1
+FROM Press.Snippets WHERE SnippetID = 1;
+
+-- R2: redact quoted speech (lazy)
+SELECT REGEXP_REPLACE(Body, N'".*?"', N'[QUOTE]') AS R2
+FROM Press.Snippets WHERE SnippetID = 1;
+
+-- R3: flip bylines to "Surname, Forename"
+SELECT REGEXP_REPLACE(Body, N'([A-Z][a-z]+) ([A-Z][a-z]+)', N'\2, \1') AS R3
+FROM Press.Snippets WHERE SnippetID = 2;
+
+-- R4: mask the second phone number only
+SELECT REGEXP_REPLACE(Body, N'([0-9]{3})-([0-9]{4})', N'\1-XXXX', 1, 2) AS R4
+FROM Press.Snippets WHERE SnippetID = 3;
+
+-- R5: mask the first phone number found from character 13 onward
+SELECT REGEXP_REPLACE(Body, N'([0-9]{3})-([0-9]{4})', N'\1-XXXX', 13, 1) AS R5
+FROM Press.Snippets WHERE SnippetID = 3;
+```
+
+Predict the **exact** string each query returns.
+
+## Correct Answer
+
+```text
+R1: He said [QUOTE] twice.
+R2: He said [QUOTE] and later [QUOTE] twice.
+R3: Maria, By Torres and Haddad, Omar
+R4: Call 555-0117 or 555-XXXX or 555-0199 now.
+R5: Call 555-0117 or 555-XXXX or 555-0199 now.
+```
+
+All five strings were executed and captured on SQL Server 2025 (RTM, 17.0.1000.7); every character above is the engine's actual output.
+
+## Explanation
+
+Signature (argument order matters and is a favorite exam trap):
+
+```text
+REGEXP_REPLACE(string_expression, pattern_expression
+               [, string_replacement [, start [, occurrence [, flags]]]])
+```
+
+Defaults: replacement `''` (matches are deleted), `start` 1, **`occurrence` 0 = replace ALL occurrences**, flags `c`. Note the contrast with `REGEXP_SUBSTR`, whose occurrence default is 1.
+
+### R1 — greedy `.*` swallows both quotes
+
+Input: `He said "off the record" and later "print it all" twice.`
+
+The regex `".*"` anchors nowhere, so the engine finds the leftmost match starting at the first `"` (character 9). `.*` is greedy: it first consumes everything to the end of the string, then backtracks just far enough for the final `"` to succeed — which is the **last** quote character in the string (the one closing `print it all`). So the single match is:
+
+```text
+"off the record" and later "print it all"
+```
+
+— from the first `"` to the last `"`, including the unquoted text between the two quotations. One match, replaced once:
+
+```text
+He said [QUOTE] twice.
+```
+
+### R2 — lazy `.*?` plus default occurrence 0
+
+`.*?` is lazy: after the opening `"` it consumes as *few* characters as possible, extending one character at a time until the next `"` closes the match. First match: `"off the record"`. Because `occurrence` was not supplied, the default 0 replaces **every** occurrence, so scanning resumes after the first replacement and also matches `"print it all"`:
+
+```text
+He said [QUOTE] and later [QUOTE] twice.
+```
+
+Anyone who believed the default occurrence is 1 (as in `REGEXP_SUBSTR`) would have predicted only the first quotation replaced.
+
+### R3 — capture groups: `\2, \1` — and the trap of what "first word pair" is
+
+Input: `By Maria Torres and Omar Haddad`
+
+The pattern `([A-Z][a-z]+) ([A-Z][a-z]+)` means: capital + one-or-more lowercase, space, capital + one-or-more lowercase. Walk it:
+
+- Position 1: `B` is `[A-Z]`, `y` is `[a-z]+` (one lowercase is enough — `+` is "one or more"). So group 1 = `By`. Then a space, then `M`+`aria` → group 2 = `Maria`. **First match: `By Maria`**, not `Maria Torres`. Replacement `\2, \1` writes `Maria, By`.
+- Scanning resumes after the match, at ` Torres and Omar Haddad`. `Torres` matches group 1, but the following word `and` starts with a lowercase letter, so `Torres and` fails group 2 — no match starting at `Torres`.
+- `Omar Haddad` matches → rewritten as `Haddad, Omar`.
+
+Default occurrence 0 applied both replacements:
+
+```text
+Maria, By Torres and Haddad, Omar
+```
+
+The intuitive answer `Torres, Maria and Haddad, Omar` is wrong twice over: `By` is a perfectly valid "forename" to this pattern, and once `By Maria` is consumed, `Torres` has no capitalized right-hand neighbor.
+
+### R4 — occurrence = 2 replaces only the second match
+
+Input: `Call 555-0117 or 555-0184 or 555-0199 now.`
+
+With `start = 1, occurrence = 2`, the engine finds matches left to right (`555-0117`, `555-0184`, `555-0199`) and replaces only the second. The replacement `\1-XXXX` keeps the captured area code:
+
+```text
+Call 555-0117 or 555-XXXX or 555-0199 now.
+```
+
+### R5 — start = 13 moves the search window, not the output
+
+Count the characters: `C(1) a(2) l(3) l(4) ␠(5) 5(6) 5(7) 5(8) -(9) 0(10) 1(11) 1(12) 7(13)` — character 13 is the final `7` **inside** the first phone number. Two engine-verified behaviors:
+
+1. The characters before `start` are *not* discarded from the result; the returned string keeps its full prefix untouched.
+2. A match must begin at or after `start`. `555-0117` begins at character 6 < 13, so it can never be occurrence 1 of this search; the first occurrence found is `555-0184`.
+
+Hence R5 equals R4's output even though its arguments say "first occurrence":
+
+```text
+Call 555-0117 or 555-XXXX or 555-0199 now.
+```
+
+### Engine-verified side notes (SQL Server 2025 RTM, 17.0.1000.7)
+
+- A back-reference to a **nonexistent** group is silently dropped, not kept literally and not an error: `REGEXP_REPLACE(N'555-0117', N'([0-9]{3})-([0-9]{4})', N'\1-\3end')` returns `555-end` (the `\3` vanishes), matching the documented "ignores the value" behavior.
+- Microsoft Learn documents `&` in the replacement as "insert the whole match", but on this RTM build `REGEXP_REPLACE(N'pier 9 dock 12', N'[0-9]+', N'<&>')` returns the literal `pier <&> dock <&>` — the token is **not** expanded. To reuse the whole match, wrap the entire pattern in parentheses and use `\1`. (Doc-vs-engine discrepancy observed empirically; do not rely on `&`.)
+- If the pattern matches nothing, `REGEXP_REPLACE` returns the **original string** — unlike `REGEXP_SUBSTR`, which returns NULL.
+
+### Equivalent alternatives
+
+- `[0-9]{3}` ≡ `\d{3}`: R4 rewritten with `N'(\d{3})-(\d{4})'` was executed and returns the identical string.
+- R1's greedy single match could equally be replaced with `occurrence = 1` explicitly (`1, 1` for start/occurrence): with only one possible match, occurrence 0 and 1 coincide.
+
+## DP-800 Exam Rule to Remember
+
+`REGEXP_REPLACE(string, pattern [, replacement [, start [, occurrence [, flags]]]])`
+
+- **Default occurrence is 0 = replace ALL** (`REGEXP_SUBSTR`/`REGEXP_INSTR` default to occurrence 1). Memorize this asymmetry.
+- Greedy `*`/`+` grab the longest match (first `"` to *last* `"`); lazy `*?`/`+?` grab the shortest. Redaction of paired delimiters almost always wants lazy — or a negated class like `"[^"]*"`.
+- `\1`–`\9` in the replacement insert capture groups; a reference beyond the group count is silently dropped.
+- `start` restricts where matches may *begin*; the prefix before `start` is preserved verbatim in the output, and occurrence counting restarts from `start`.
+- No match → the original string comes back unchanged (never NULL).

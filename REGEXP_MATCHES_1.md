@@ -1,0 +1,115 @@
+# SQL Server question — REGEXP_MATCHES 1
+
+## Statement
+
+A laboratory-supplies company stores reagent formulas in a SQL Server 2025 database and wants to decompose each formula into its element symbols and atom counts using the new table-valued function `REGEXP_MATCHES`.
+
+The following script is run on a SQL Server 2025 (17.x) instance, from scratch:
+
+```sql
+CREATE DATABASE ChemStock;
+GO
+ALTER DATABASE ChemStock SET COMPATIBILITY_LEVEL = 170;
+GO
+USE ChemStock;
+GO
+CREATE SCHEMA Chem;
+GO
+CREATE TABLE Chem.Reagents
+(
+    ReagentID int         NOT NULL PRIMARY KEY,
+    Formula   varchar(30) NOT NULL
+);
+GO
+INSERT INTO Chem.Reagents (ReagentID, Formula) VALUES
+  (1, 'H2SO4'),
+  (2, 'NaHCO3'),
+  (3, 'Fe2O3'),
+  (4, 'aq');
+GO
+```
+
+Then the inventory team runs this query:
+
+```sql
+SELECT
+    r.ReagentID,
+    m.match_id,
+    m.start_position,
+    m.end_position,
+    m.match_value,
+    m.substring_matches
+FROM Chem.Reagents AS r
+CROSS APPLY REGEXP_MATCHES(r.Formula, '([A-Z][a-z]?)(\d*)') AS m
+ORDER BY r.ReagentID, m.match_id;
+```
+
+Predict the **exact** returned table: number of rows, every column of every row, including the full `substring_matches` value.
+
+## Correct Answer
+
+Output copied from the engine (SQL Server 2025 RTM, 17.0.1000.7) — 9 rows:
+
+| ReagentID | match_id | start_position | end_position | match_value | substring_matches |
+|-----------|----------|----------------|--------------|-------------|-------------------|
+| 1 | 1 | 1 | 2 | H2  | `[{"value":"H","start":1,"length":1},{"value":"2","start":2,"length":1}]` |
+| 1 | 2 | 3 | 3 | S   | `[{"value":"S","start":3,"length":1},{"value":"","start":4,"length":0}]` |
+| 1 | 3 | 4 | 5 | O4  | `[{"value":"O","start":4,"length":1},{"value":"4","start":5,"length":1}]` |
+| 2 | 1 | 1 | 2 | Na  | `[{"value":"Na","start":1,"length":2},{"value":"","start":3,"length":0}]` |
+| 2 | 2 | 3 | 3 | H   | `[{"value":"H","start":3,"length":1},{"value":"","start":4,"length":0}]` |
+| 2 | 3 | 4 | 4 | C   | `[{"value":"C","start":4,"length":1},{"value":"","start":5,"length":0}]` |
+| 2 | 4 | 5 | 6 | O3  | `[{"value":"O","start":5,"length":1},{"value":"3","start":6,"length":1}]` |
+| 3 | 1 | 1 | 3 | Fe2 | `[{"value":"Fe","start":1,"length":2},{"value":"2","start":3,"length":1}]` |
+| 3 | 2 | 4 | 5 | O3  | `[{"value":"O","start":4,"length":1},{"value":"3","start":5,"length":1}]` |
+
+Reagent 4 (`'aq'`) produces **no rows at all**.
+
+## Explanation
+
+`REGEXP_MATCHES(string, pattern [, flags])` is one of the two table-valued regex functions introduced in SQL Server 2025 (the other is `REGEXP_SPLIT_TO_TABLE`). It returns **one row per non-overlapping match**, with exactly these columns (verified both on Microsoft Learn and via `sys.dm_exec_describe_first_result_set` on the engine):
+
+| Column | Type | Meaning |
+|---|---|---|
+| `match_id` | **bigint** | Sequence number of the match, starting at 1 **per function invocation** |
+| `start_position` | **int** | 1-based position of the first character of the match |
+| `end_position` | **int** | 1-based position of the **last** character of the match (inclusive — not "one past the end") |
+| `match_value` | same type as the input string | The matched text |
+| `substring_matches` | JSON (documented as **json**; described as `varchar(max)` on the RTM build) | Array describing the **capture groups** |
+
+Note there is no `start`/`occurrence` argument — unlike `REGEXP_INSTR`/`REGEXP_SUBSTR`, the TVF always scans the whole string and returns *all* matches; `flags` (`i`, `m`, `s`, `c`) is its only option.
+
+### Walking the pattern `([A-Z][a-z]?)(\d*)`
+
+Group 1 = an uppercase letter optionally followed by one lowercase letter (an element symbol); group 2 = zero or more digits (the atom count).
+
+- `H2SO4` → `H`+`2` (1–2), `S`+`` (3–3), `O`+`4` (4–5): 3 matches.
+- `NaHCO3` → `Na` (1–2), `H` (3), `C` (4), `O3` (5–6): 4 matches. `Na` shows the greedy `[a-z]?` consuming the lowercase letter, so `NaHCO3` is *not* split as `N`+`a`....
+- `Fe2O3` → `Fe2` (1–3), `O3` (4–5): 2 matches.
+- `aq` → the pattern requires an uppercase letter, so there is **no match**, `REGEXP_MATCHES` returns an **empty table**, and `CROSS APPLY` — like an inner join — **eliminates the outer row**. ReagentID 4 silently disappears from the result. With `OUTER APPLY` the row would survive as `4, NULL, NULL, NULL, NULL, NULL` (engine-verified).
+
+### The `substring_matches` traps
+
+1. **Only the capture groups appear** in the array — one element per parenthesized group, in order. The full match is *not* element zero; it lives in `match_value`. (Only when the pattern contains **no** groups at all does the engine put the whole match into `substring_matches` as its single element — engine-verified with pattern `'\w+'`.)
+2. **A group that participates but captures nothing** returns an **empty string**, not NULL: for the `S` of `H2SO4`, `(\d*)` matched zero digits at position 4, giving `{"value":"","start":4,"length":0}` — note the `start` still points at the position where the empty capture occurred (one past the symbol) and `length` is 0.
+3. **A group that does not participate at all** returns JSON **nulls**. Rewriting the count group as `(\d+)?` (optional group instead of star-quantified group) changes only that entry — engine output for `'H2SO4'`, `'([A-Z][a-z]?)(\d+)?'`, match 2 (`S`):
+
+   ```json
+   [{"value":"S","start":3,"length":1},{"value":null,"start":null,"length":null}]
+   ```
+
+   `(\d*)` → `""` (empty string, length 0) but `(\d+)?` → `null`. Empty capture and absent capture are different things, and the JSON records the difference.
+4. `match_id` restarts at 1 for **each** `CROSS APPLY` invocation (each reagent), so it is unique only per outer row — the `ORDER BY r.ReagentID, m.match_id` is what makes the output deterministic.
+5. `end_position` is the position of the **last matched character** (`H2` = 1–2), whereas `REGEXP_INSTR(..., return_option = 1)` returns the position *after* the match (would be 3). Two adjacent functions, two conventions.
+
+### Equivalent alternatives
+
+- Extracting the parts with scalar calls gives the same data one column at a time: `REGEXP_SUBSTR(Formula, '([A-Z][a-z]?)(\d*)', 1, n)` for the n-th match plus `REGEXP_INSTR(..., n, 0/1)` for its positions — but only `REGEXP_MATCHES` delivers all matches and all groups in a single table.
+- `JSON_VALUE(m.substring_matches, '$[0].value')` and `'$[1].value'` pull the element symbol and atom count out of the JSON array into relational columns.
+
+## DP-800 Exam Rule to Remember
+
+- SQL Server 2025 adds regex support: scalar functions (`REGEXP_LIKE`, `REGEXP_COUNT`, `REGEXP_INSTR`, `REGEXP_SUBSTR`, `REGEXP_REPLACE`) and **table-valued** functions (`REGEXP_MATCHES`, `REGEXP_SPLIT_TO_TABLE`).
+- Microsoft Learn states the TVFs require **database COMPATIBILITY_LEVEL 170** (or the `ALLOW_BUILTIN_TVF_IN_ALL_COMPAT_LEVELS` database-scoped configuration — a preview option that is not available on the RTM build; it ships with SQL Server 2025 CU5 and Azure SQL). Answer exam questions with the documented 170 requirement. (Engine-verified on RTM: at level 160 the TVF raises `Invalid object name 'REGEXP_MATCHES'`.)
+- `REGEXP_MATCHES` returns `match_id` (bigint, 1-based per invocation), `start_position` / `end_position` (1-based, end **inclusive**), `match_value`, and `substring_matches` (JSON array of the capture groups only).
+- In `substring_matches`: participating-but-empty capture → `"value":""` with `"length":0`; non-participating group → `null`s; pattern with no groups → the full match becomes the single array element.
+- **No match → zero rows**, so `CROSS APPLY` drops the outer row; use `OUTER APPLY` to keep unmatched rows with NULLs.

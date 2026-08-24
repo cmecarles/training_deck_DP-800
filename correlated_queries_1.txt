@@ -1,0 +1,268 @@
+============================================================
+ SQL Server question — Correlated queries 1
+============================================================
+
+Statement
+---------
+
+VineYield tracks harvest yields for a group of vineyards. Each
+harvest row records the vineyard, the year, the grape variety and
+the tons picked. One harvest was brought in from a leased plot that
+has not yet been registered as a vineyard, so its VineyardID is
+NULL — the column is deliberately nullable.
+
+The following session is executed exactly as shown, from database
+creation onward:
+
+CREATE DATABASE VineYield;
+GO
+USE VineYield;
+GO
+CREATE SCHEMA Farm;
+GO
+CREATE TABLE Farm.Vineyard
+(
+    VineyardID   INT          NOT NULL PRIMARY KEY,
+    VineyardName NVARCHAR(40) NOT NULL,
+    Region       NVARCHAR(40) NOT NULL
+);
+GO
+CREATE TABLE Farm.Harvest
+(
+    HarvestID    INT           NOT NULL PRIMARY KEY,
+    VineyardID   INT           NULL REFERENCES Farm.Vineyard(VineyardID),
+    HarvestYear  SMALLINT      NOT NULL,
+    GrapeVariety NVARCHAR(40)  NOT NULL,
+    TonsPicked   DECIMAL(6,2)  NOT NULL
+);
+GO
+INSERT INTO Farm.Vineyard (VineyardID, VineyardName, Region) VALUES
+  (1, N'Stonebrook', N'Rioja'),
+  (2, N'Mirador',    N'Priorat'),
+  (3, N'Coldwell',   N'Duero'),
+  (4, N'Larkspur',   N'Rioja');
+GO
+INSERT INTO Farm.Harvest (HarvestID, VineyardID, HarvestYear, GrapeVariety, TonsPicked) VALUES
+  (101, 1,    2024, N'Tempranillo', 8.40),
+  (102, 1,    2025, N'Tempranillo', 9.10),
+  (103, 2,    2024, N'Garnacha',    6.75),
+  (104, 2,    2025, N'Carinena',    6.75),
+  (105, 3,    2024, N'Verdejo',     5.20),
+  (106, NULL, 2025, N'Garnacha',    4.00);   -- leased plot, no vineyard yet
+GO
+
+The estate manager asks: "Which vineyards recorded no harvest at
+all in 2025?" Two developers each write a query.
+
+Query 1 (developer A — NOT IN):
+
+SELECT v.VineyardName
+FROM Farm.Vineyard AS v
+WHERE v.VineyardID NOT IN
+      (SELECT h.VineyardID
+       FROM Farm.Harvest AS h
+       WHERE h.HarvestYear = 2025)
+ORDER BY v.VineyardName;
+
+Query 2 (developer B — correlated NOT EXISTS):
+
+SELECT v.VineyardName
+FROM Farm.Vineyard AS v
+WHERE NOT EXISTS
+      (SELECT 1
+       FROM Farm.Harvest AS h
+       WHERE h.VineyardID  = v.VineyardID
+         AND h.HarvestYear = 2025)
+ORDER BY v.VineyardName;
+
+A third report lists, for every vineyard, its best harvest ever
+(the harvest with the most tons picked).
+
+Query 3 (correlated scalar subquery):
+
+SELECT v.VineyardName, h.HarvestYear, h.GrapeVariety, h.TonsPicked
+FROM Farm.Vineyard AS v
+JOIN Farm.Harvest  AS h
+  ON h.VineyardID = v.VineyardID
+WHERE h.TonsPicked =
+      (SELECT MAX(h2.TonsPicked)
+       FROM Farm.Harvest AS h2
+       WHERE h2.VineyardID = v.VineyardID)
+ORDER BY v.VineyardName, h.HarvestYear;
+
+Predict the exact result set of each query — every row, every
+value, in order — and in particular:
+
+1. how many rows Query 1 and Query 2 each return, and why they
+   differ if they do;
+2. how many rows Query 3 returns per vineyard, and which vineyards
+   are absent.
+
+Correct Answer
+--------------
+
+Query 1 returns exactly 0 rows (output captured from a SQL Server
+2025 RTM instance) — an empty result set. Not even Larkspur, which
+has never had any harvest recorded.
+
+Query 2 returns exactly 2 rows:
+
+VineyardName
+------------
+Coldwell
+Larkspur
+
+Query 3 returns exactly 4 rows:
+
+VineyardName | HarvestYear | GrapeVariety | TonsPicked
+-------------+-------------+--------------+-----------
+Coldwell     | 2024        | Verdejo      | 5.20
+Mirador      | 2024        | Garnacha     | 6.75
+Mirador      | 2025        | Carinena     | 6.75
+Stonebrook   | 2025        | Tempranillo  | 9.10
+
+Mirador appears twice (its two harvests tie at 6.75 tons);
+Larkspur does not appear at all.
+
+Explanation
+-----------
+
+Query 1 — the NOT IN + NULL trap
+................................
+
+The uncorrelated subquery returns the 2025 VineyardID values:
+{1, 2, NULL} (rows 102, 104, and the leased-plot row 106). For each
+vineyard, v.VineyardID NOT IN (1, 2, NULL) expands under
+three-valued logic to:
+
+v.VineyardID <> 1  AND  v.VineyardID <> 2  AND  v.VineyardID <> NULL
+
+The last comparison is never TRUE or FALSE — it is UNKNOWN for
+every row. An AND chain containing UNKNOWN can evaluate to FALSE
+(when some other conjunct is FALSE, e.g. for Stonebrook, whose ID
+equals 1) or to UNKNOWN (for Coldwell and Larkspur) — but never to
+TRUE. A WHERE clause keeps only rows whose predicate is TRUE, so
+the whole query returns zero rows. One single NULL in the
+subquery's select list silently empties a NOT IN result; it does
+not raise an error, which is exactly what makes the bug dangerous.
+
+(Note the asymmetry: plain IN still works with a NULL in the
+list — 1 IN (1, 2, NULL) is TRUE — because IN expands to an OR
+chain, and a single TRUE disjunct decides an OR regardless of any
+UNKNOWN. Only the negated form collapses.)
+
+Query 2 — why correlated NOT EXISTS is immune
+.............................................
+
+EXISTS never compares your outer value against a list; it asks,
+once per outer row, whether the correlated subquery yields at least
+one row. That per-row re-evaluation is what "correlated" means: the
+inner query references the outer alias v, so it cannot run on its
+own — conceptually it runs four times, once per vineyard:
+
+- v = Stonebrook (1): row 102 satisfies
+  h.VineyardID = 1 AND h.HarvestYear = 2025 → EXISTS TRUE →
+  NOT EXISTS FALSE → excluded.
+- v = Mirador (2): row 104 matches → excluded.
+- v = Coldwell (3): no 2025 row has VineyardID = 3. Crucially, row
+  106's predicate NULL = 3 is UNKNOWN, so it does not match — but
+  an unmatched row is simply not returned by the subquery; it never
+  poisons anything. Subquery empty → NOT EXISTS TRUE → kept.
+- v = Larkspur (4): same reasoning → kept.
+
+EXISTS and NOT EXISTS only ever produce TRUE or FALSE — never
+UNKNOWN — so the NULL row is harmless and the query returns the 2
+semantically correct rows. This is the canonical DP-800 pairing:
+NOT IN and NOT EXISTS are equivalent only when the subquery column
+is guaranteed non-nullable; here they differ by 2 rows (0 vs 2).
+
+Query 3 — top-1-per-group by correlated subquery
+................................................
+
+For each joined row, the scalar subquery computes MAX(TonsPicked)
+restricted to the current outer vineyard via the correlation
+h2.VineyardID = v.VineyardID; a row survives when its own tonnage
+equals its vineyard's maximum:
+
+- Stonebrook: max = 9.10 → row 102 only (8.40 filtered out).
+- Mirador: max = 6.75 → both rows 103 and 104 equal the max, so the
+  tie produces two rows. A correlated "equal to the group max"
+  filter keeps all tied rows — it is RANK()-like, not
+  ROW_NUMBER()-like.
+- Coldwell: max = 5.20 → row 105.
+- Larkspur: the JOIN (inner) finds no Harvest row with
+  VineyardID = 4, so Larkspur never reaches the WHERE clause at
+  all — absent. (Row 106 with VineyardID NULL joins to no vineyard
+  either, so the leased-plot harvest is invisible here too.)
+
+Total 4 rows, deterministically ordered by VineyardName,
+HarvestYear.
+
+Alias scoping, the machinery all three correlated subqueries rely
+on: inside a subquery, an unqualified or qualified reference first
+resolves against the subquery's own FROM (h2), and only names not
+found there resolve outward to v or h. That is why the correlation
+h2.VineyardID = v.VineyardID is legal, and why re-using the outer
+alias name for the inner table would silently de-correlate the
+predicate into h2.VineyardID = h2.VineyardID (always TRUE for
+non-NULL values). A related classic: if the inner table lacked the
+column you name unqualified, the engine would silently bind it to
+the outer table's column instead of erroring — always qualify
+columns in subqueries.
+
+Equivalent alternatives (engine-verified)
+.........................................
+
+For the "no 2025 harvest" question, both of the following return
+exactly Coldwell, Larkspur:
+
+- Repair the NOT IN by excluding NULLs inside the subquery —
+  WHERE h.HarvestYear = 2025 AND h.VineyardID IS NOT NULL;
+- SELECT VineyardID FROM Farm.Vineyard EXCEPT SELECT VineyardID
+  FROM Farm.Harvest WHERE HarvestYear = 2025 (returns IDs 3 and
+  4) — EXCEPT uses distinct-based semantics that treat two NULLs as
+  not distinct, so a NULL in the second set only removes a NULL
+  from the first set, never everything.
+
+For the best-harvest report, the windowed form returns the
+identical 4 rows, ties included:
+
+WITH R AS (
+    SELECT v.VineyardName, h.HarvestYear, h.GrapeVariety, h.TonsPicked,
+           RANK() OVER (PARTITION BY v.VineyardID ORDER BY h.TonsPicked DESC) AS rk
+    FROM Farm.Vineyard AS v
+    JOIN Farm.Harvest  AS h ON h.VineyardID = v.VineyardID
+)
+SELECT VineyardName, HarvestYear, GrapeVariety, TonsPicked
+FROM R WHERE rk = 1
+ORDER BY VineyardName, HarvestYear;
+
+Substituting ROW_NUMBER() for RANK() is not equivalent: it would
+keep only one arbitrary Mirador row (3 rows total) unless a
+deterministic tie-breaker column is added to the
+OVER (... ORDER BY ...).
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Three-valued logic turns NOT IN into a trap:
+
+x NOT IN (a, b, NULL)  =  x<>a AND x<>b AND x<>NULL  =  never TRUE
+                                                        → 0 rows, no error
+
+Decision rules:
+
+1. Anti-join over a nullable column → use correlated NOT EXISTS
+   (or EXCEPT, or NOT IN with an explicit IS NOT NULL guard).
+   [NOT] EXISTS is never UNKNOWN, so subquery NULLs cannot poison
+   it. IN with NULLs merely misses rows; NOT IN with NULLs returns
+   nothing.
+2. A correlated subquery is logically re-evaluated per outer row —
+   the correlation predicate (inner.col = outer_alias.col) is what
+   scopes it to the current row; outer aliases are visible inside
+   the subquery, and unqualified names bind to the innermost table
+   that has them (so always qualify).
+3. Top-1-per-group via = (SELECT MAX(...) ... correlated) keeps
+   ties — it matches RANK() = 1, not ROW_NUMBER() = 1 — and an
+   inner join means groups with no detail rows vanish from the
+   report.

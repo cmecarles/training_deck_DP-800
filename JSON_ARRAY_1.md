@@ -1,0 +1,141 @@
+# SQL Server question — JSON_ARRAY 1
+
+## Statement
+
+A cinema multiplex publishes its showtimes feed as compact JSON arrays: one array per showing, consumed positionally by the mobile app (element 0 = title, 1 = screen, 2 = rating, 3 = runtime, 4 = 3D flag, 5 = subtitle languages).
+
+The following script is run on SQL Server 2025 and completes without errors:
+
+```sql
+CREATE DATABASE CineSlate;
+GO
+ALTER DATABASE CineSlate SET COMPATIBILITY_LEVEL = 170;
+GO
+USE CineSlate;
+GO
+CREATE SCHEMA Cine;
+GO
+CREATE TABLE Cine.Showings (
+    ShowingId  INT          PRIMARY KEY,
+    FilmTitle  NVARCHAR(60) NOT NULL,
+    ScreenNo   INT          NOT NULL,
+    Rating     NVARCHAR(4)  NULL,
+    RuntimeMin INT          NOT NULL,
+    Is3D       BIT          NOT NULL,
+    SubLang1   NVARCHAR(5)  NULL,
+    SubLang2   NVARCHAR(5)  NULL
+);
+GO
+INSERT INTO Cine.Showings (ShowingId, FilmTitle, ScreenNo, Rating, RuntimeMin, Is3D, SubLang1, SubLang2) VALUES
+  (1, N'Solar Drift',    4, N'12A', 128, 1, N'fr', N'de'),
+  (2, N'Midnight "8"',   1, NULL,    95, 0, N'es', NULL),
+  (3, N'Paper Lanterns', 6, N'PG',  101, 0, NULL,  NULL);
+GO
+```
+
+Then this query is executed:
+
+```sql
+SELECT s.ShowingId,
+       JSON_ARRAY(s.FilmTitle, s.ScreenNo, s.Rating, s.RuntimeMin, s.Is3D,
+                  JSON_ARRAY(s.SubLang1, s.SubLang2 NULL ON NULL)) AS FeedRow
+FROM Cine.Showings AS s
+ORDER BY s.ShowingId;
+```
+
+What is the **exact** `FeedRow` string returned for `ShowingId = 2`?
+
+### a.
+
+```json
+["Midnight \"8\"",1,null,95,false,["es",null]]
+```
+
+### b.
+
+```json
+["Midnight \"8\"",1,95,false,["es",null]]
+```
+
+### c.
+
+```json
+["Midnight \"8\"",1,95,false,["es"]]
+```
+
+### d.
+
+```json
+["Midnight \"8\"",1,95,0,["es",null]]
+```
+
+## Correct Answer
+
+**b**
+
+For completeness, the full result set (all three `FeedRow` strings copied verbatim from the engine, in `ShowingId` order) is:
+
+```json
+["Solar Drift",4,"12A",128,true,["fr","de"]]
+["Midnight \"8\"",1,95,false,["es",null]]
+["Paper Lanterns",6,"PG",101,false,[null,null]]
+```
+
+## Explanation
+
+The correct answer is **b**.
+
+### The default for `JSON_ARRAY` is `ABSENT ON NULL`
+
+Per the Microsoft Learn reference for `JSON_ARRAY` (Transact-SQL): *"The default setting for this option is `ABSENT ON NULL`."*
+
+The **outer** `JSON_ARRAY` specifies no `json_null_clause`, so it uses that default: a SQL `NULL` argument is not rendered as JSON `null` — the element is **silently omitted**. For `ShowingId = 2`, `Rating` is `NULL`, so the outer array has **5 elements instead of 6**:
+
+```text
+declared position:   0=title  1=screen  2=rating  3=runtime  4=is3D  5=subs
+actual output:       0=title  1=screen  2=95      3=false    4=[...]
+```
+
+This is the trap for the positional consumer: the mobile app reading element 3 as "runtime" now receives `false`, and element 2 ("rating") receives the number `95`. Nothing fails — the array is perfectly valid JSON, just one element shorter. This is precisely why a feed like this should either use `NULL ON NULL` or emit key/value objects instead of positional arrays.
+
+The **inner** `JSON_ARRAY(s.SubLang1, s.SubLang2 NULL ON NULL)` explicitly overrides the default, so `SubLang2 = NULL` is kept as JSON `null`: `["es",null]`. Note the clause is written once, after the last element, and applies to the whole constructor — it is not "attached" to `SubLang2` only.
+
+Two more character-level rules used by the correct string:
+
+- **Escaping**: the stored title `Midnight "8"` renders as `"Midnight \"8\""` — each embedded double quote becomes `\"`.
+- **Type mapping**: `int` values render unquoted (`1`, `95`); `bit` renders as an unquoted JSON boolean, so `Is3D = 0` → `false`.
+
+In row 3, both subtitle columns are `NULL`, and the inner `NULL ON NULL` keeps both positions: `[null,null]`. Also note the inner constructor itself never returns SQL `NULL` — it returns the string `[null,null]` — so the outer array's `ABSENT ON NULL` default can never remove the nested array element, even when everything inside it is `NULL`.
+
+### Why option a is wrong
+
+Option a renders `Rating` as `null`, keeping the array at 6 elements. That assumes a default of `NULL ON NULL` — which is the default of **`JSON_OBJECT`**, not of `JSON_ARRAY`. This is the subtle distractor: the two constructors have opposite defaults, and with no `json_null_clause` on the outer array the `NULL` rating vanishes entirely.
+
+### Why option c is wrong
+
+Option c drops the `null` from the inner array (`["es"]`). The inner constructor explicitly specifies `NULL ON NULL`, which converts the SQL `NULL` in `SubLang2` to a JSON `null` element. Only the outer array — the one *without* a clause — drops `NULL`s.
+
+### Why option d is wrong
+
+Option d renders `Is3D` as the number `0`. The JSON constructors follow the `FOR JSON` type-conversion rules, under which the SQL `bit` type maps to a JSON boolean: `0` → `false`, `1` → `true`. It is never emitted as `0`/`1` or as the quoted string `"false"`.
+
+### Equivalent alternatives
+
+- `JSON_ARRAY(s.FilmTitle, s.ScreenNo, s.Rating, s.RuntimeMin, s.Is3D, JSON_ARRAY(s.SubLang1, s.SubLang2 NULL ON NULL) ABSENT ON NULL)` is exactly equivalent to the query shown — it only spells out the outer default.
+- To keep the feed positionally stable, the fix is `... s.Is3D, JSON_ARRAY(...) NULL ON NULL)` on the **outer** constructor, which would emit `["Midnight \"8\"",1,null,95,false,["es",null]]` (option a's string — correct output for a *different* query).
+
+## DP-800 Exam Rule to Remember
+
+`JSON_ARRAY` defaults to **`ABSENT ON NULL`**: a SQL `NULL` element disappears without a trace and the array **changes length**. `JSON_OBJECT` defaults to the opposite (`NULL ON NULL`). Memorize the pair:
+
+```text
+JSON_OBJECT ( 'k': NULL )  →  {"k":null}   -- key survives
+JSON_ARRAY  ( NULL )       →  []           -- element vanishes
+```
+
+Corollaries:
+
+- Positional JSON feeds built with default `JSON_ARRAY` are unsafe over nullable columns — add `NULL ON NULL` to freeze element positions.
+- One `json_null_clause` per constructor, written after the last argument; it governs all arguments of that constructor and only that constructor.
+- A nested `JSON_ARRAY`/`JSON_OBJECT` is never SQL `NULL` (worst case it is `[]` or `{}` as a value), so the enclosing constructor never absents it.
+- `bit` → `true`/`false`; numbers unquoted; `"` inside strings → `\"`.
