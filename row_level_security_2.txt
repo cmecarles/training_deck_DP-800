@@ -1,0 +1,373 @@
+Statement
+
+An organization hosts a multi-tenant application in Azure SQL Database.
+
+Application users do not connect directly to the database. The middle-tier application connects by using the database principal AppUser.
+
+At the beginning of each request, the application sets the current application user's ID:
+
+EXEC sys.sp_set_session_context
+    @key = N'UserId',
+    @value = 42;
+
+The following table contains data for all application users:
+
+CREATE TABLE Sales.OrderData
+(
+    OrderId    bigint NOT NULL PRIMARY KEY,
+    AppUserId  int NOT NULL,
+    Amount     decimal(12,2) NOT NULL
+);
+GO
+
+Three database principals already exist:
+
+- AppUser
+  Used only by the middle-tier application.
+
+- SupportAdmin
+  Used by support administrators.
+
+- ReportingUser
+  Used by a separate reporting workload.
+
+Assume that all three principals have already been granted SELECT and INSERT permissions on Sales.OrderData.
+
+You must implement Row-Level Security with the following requirements:
+
+1. AppUser must be able to SELECT only rows where AppUserId matches SESSION_CONTEXT(N'UserId').
+
+2. AppUser must be prevented from inserting a row whose AppUserId does not match SESSION_CONTEXT(N'UserId').
+
+3. SupportAdmin must be able to SELECT all rows and INSERT rows for any AppUserId.
+
+4. ReportingUser must see no rows and must be unable to insert any rows, even if ReportingUser calls sp_set_session_context and supplies a valid UserId.
+
+5. The solution must be enforced by Azure SQL Database and must not depend on application WHERE clauses.
+
+You create the following schema:
+
+CREATE SCHEMA Security;
+GO
+
+Which implementation should you use?
+
+
+a.
+
+CREATE FUNCTION Security.fn_OrderAccess
+(
+    @AppUserId int
+)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+(
+    SELECT 1 AS AccessResult
+    WHERE
+        DATABASE_PRINCIPAL_ID() <>
+            DATABASE_PRINCIPAL_ID(N'AppUser')
+        OR
+        @AppUserId =
+            CAST(SESSION_CONTEXT(N'UserId') AS int)
+);
+GO
+
+CREATE SECURITY POLICY Security.OrderPolicy
+ADD FILTER PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData,
+ADD BLOCK PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData AFTER INSERT
+WITH (STATE = ON);
+GO
+
+
+b.
+
+CREATE FUNCTION Security.fn_OrderAccess
+(
+    @AppUserId int
+)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+(
+    SELECT 1 AS AccessResult
+    WHERE
+        (
+            DATABASE_PRINCIPAL_ID() =
+                DATABASE_PRINCIPAL_ID(N'AppUser')
+            AND
+            @AppUserId =
+                CAST(SESSION_CONTEXT(N'UserId') AS int)
+        )
+        OR
+        DATABASE_PRINCIPAL_ID() =
+            DATABASE_PRINCIPAL_ID(N'SupportAdmin')
+);
+GO
+
+CREATE SECURITY POLICY Security.OrderPolicy
+ADD FILTER PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData,
+ADD BLOCK PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData AFTER INSERT
+WITH (STATE = ON);
+GO
+
+
+c.
+
+CREATE FUNCTION Security.fn_OrderAccess
+(
+    @AppUserId int
+)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+(
+    SELECT 1 AS AccessResult
+    WHERE
+        @AppUserId =
+            CAST(SESSION_CONTEXT(N'UserId') AS int)
+        OR
+        DATABASE_PRINCIPAL_ID() =
+            DATABASE_PRINCIPAL_ID(N'SupportAdmin')
+);
+GO
+
+CREATE SECURITY POLICY Security.OrderPolicy
+ADD FILTER PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData,
+ADD BLOCK PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData AFTER INSERT
+WITH (STATE = ON);
+GO
+
+
+d.
+
+CREATE FUNCTION Security.fn_OrderAccess
+(
+    @AppUserId int
+)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+(
+    SELECT 1 AS AccessResult
+    WHERE
+        (
+            DATABASE_PRINCIPAL_ID() =
+                DATABASE_PRINCIPAL_ID(N'AppUser')
+            OR
+            @AppUserId =
+                CAST(SESSION_CONTEXT(N'UserId') AS int)
+        )
+        AND
+        DATABASE_PRINCIPAL_ID() <>
+            DATABASE_PRINCIPAL_ID(N'ReportingUser')
+);
+GO
+
+CREATE SECURITY POLICY Security.OrderPolicy
+ADD FILTER PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData,
+ADD BLOCK PREDICATE
+    Security.fn_OrderAccess(AppUserId)
+    ON Sales.OrderData AFTER INSERT
+WITH (STATE = ON);
+GO
+
+
+Correct Answer
+--------------
+
+b
+
+
+Explanation
+-----------
+
+The correct answer is b.
+
+This question tests two independent RLS concepts:
+
+1. The application-level identity stored in SESSION_CONTEXT.
+2. The actual database principal executing the statement.
+
+The important trap is that SESSION_CONTEXT by itself is not an authorization boundary.
+
+A database session can set values in its own session context. Therefore, if a predicate checks only:
+
+    @AppUserId = CAST(SESSION_CONTEXT(N'UserId') AS int)
+
+then another database principal that already has SELECT or INSERT permission could potentially set UserId to a chosen value and satisfy the predicate.
+
+The RLS predicate must therefore verify BOTH:
+
+- that the executing database principal is AppUser, and
+- that the row's AppUserId matches the application UserId in SESSION_CONTEXT.
+
+SupportAdmin must be handled as a separate explicitly authorized database principal.
+
+
+Why option b is correct
+-----------------------
+
+The predicate contains:
+
+(
+    DATABASE_PRINCIPAL_ID() =
+        DATABASE_PRINCIPAL_ID(N'AppUser')
+    AND
+    @AppUserId =
+        CAST(SESSION_CONTEXT(N'UserId') AS int)
+)
+OR
+DATABASE_PRINCIPAL_ID() =
+    DATABASE_PRINCIPAL_ID(N'SupportAdmin')
+
+For AppUser:
+
+- The database-principal check succeeds.
+- The row must additionally match SESSION_CONTEXT(N'UserId').
+- The FILTER predicate limits SELECT visibility.
+- The AFTER INSERT BLOCK predicate prevents inserting a row for another application user.
+
+For SupportAdmin:
+
+- The second branch succeeds regardless of AppUserId.
+- All rows are visible.
+- Inserts for any AppUserId are permitted.
+
+For ReportingUser:
+
+- ReportingUser is neither AppUser nor SupportAdmin.
+- Even if ReportingUser executes:
+
+    EXEC sys.sp_set_session_context
+        @key = N'UserId',
+        @value = 42;
+
+  the AppUser database-principal check still fails.
+
+- The predicate returns no row.
+- The FILTER predicate hides all rows.
+- The AFTER INSERT BLOCK predicate rejects inserts.
+
+
+Why option a is wrong
+---------------------
+
+Option a contains:
+
+DATABASE_PRINCIPAL_ID() <>
+    DATABASE_PRINCIPAL_ID(N'AppUser')
+OR
+@AppUserId =
+    CAST(SESSION_CONTEXT(N'UserId') AS int)
+
+The first condition is TRUE for every principal other than AppUser.
+
+Therefore both SupportAdmin AND ReportingUser satisfy the predicate for every row.
+
+Because ReportingUser already has SELECT and INSERT permissions, RLS would effectively allow ReportingUser to see and insert all rows.
+
+This violates the requirements.
+
+
+Why option c is wrong
+---------------------
+
+Option c checks:
+
+@AppUserId =
+    CAST(SESSION_CONTEXT(N'UserId') AS int)
+OR
+DATABASE_PRINCIPAL_ID() =
+    DATABASE_PRINCIPAL_ID(N'SupportAdmin')
+
+This correctly permits SupportAdmin.
+
+However, it does not verify that a session using SESSION_CONTEXT is actually AppUser.
+
+ReportingUser can set:
+
+EXEC sys.sp_set_session_context
+    @key = N'UserId',
+    @value = 42;
+
+Rows having AppUserId = 42 would then satisfy the predicate.
+
+Therefore ReportingUser could gain row access despite the requirement that it must see no rows.
+
+
+Why option d is wrong
+---------------------
+
+Option d uses:
+
+(
+    DATABASE_PRINCIPAL_ID() =
+        DATABASE_PRINCIPAL_ID(N'AppUser')
+    OR
+    @AppUserId =
+        CAST(SESSION_CONTEXT(N'UserId') AS int)
+)
+AND
+DATABASE_PRINCIPAL_ID() <>
+    DATABASE_PRINCIPAL_ID(N'ReportingUser')
+
+The logical operator between the AppUser principal check and the SESSION_CONTEXT comparison is OR instead of AND.
+
+For AppUser, the first part becomes TRUE simply because the current database principal is AppUser.
+
+That means AppUser would satisfy the predicate for every AppUserId, regardless of the UserId stored in SESSION_CONTEXT.
+
+AppUser would therefore see every row and could insert rows for other application users.
+
+This violates the tenant-isolation requirements.
+
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+SESSION_CONTEXT identifies an application-level caller only because the database predicate chooses to trust that value.
+
+When multiple database principals have object permissions, a strong RLS predicate may need to validate BOTH:
+
+    database principal
+    +
+    application identity in SESSION_CONTEXT
+
+Think of the authorization test as:
+
+    Is this the expected database principal?
+                 AND
+    Does this row belong to the application identity?
+
+Then explicitly add any administrative principal that is supposed to bypass tenant filtering.
+
+For this scenario:
+
+AppUser
+    -> principal must be AppUser
+    -> AppUserId must match SESSION_CONTEXT
+
+SupportAdmin
+    -> explicitly allowed
+
+ReportingUser
+    -> never allowed by the predicate

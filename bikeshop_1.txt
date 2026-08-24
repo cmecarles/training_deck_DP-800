@@ -1,0 +1,150 @@
+============================================================
+ SQL Server question — BikeShop
+============================================================
+
+TASK
+Write a single T-SQL query that, run against BikeShop after the
+session below, returns exactly the result set in section 3:
+same column names, same values, same row order.
+
+------------------------------------------------------------
+ 1) SCHEMA
+------------------------------------------------------------
+CREATE DATABASE BikeShop;
+GO
+USE BikeShop;
+GO
+CREATE SCHEMA Sales;
+GO
+
+CREATE TABLE Sales.Customers (
+    CustomerID  INT IDENTITY(1,1) PRIMARY KEY,
+    FullName    NVARCHAR(80) NOT NULL,
+    City        NVARCHAR(60) NOT NULL,
+    JoinedOn    DATE         NOT NULL
+);
+
+CREATE TABLE Sales.Products (
+    ProductID   INT IDENTITY(1,1) PRIMARY KEY,
+    ProductName NVARCHAR(80)  NOT NULL,
+    Category    NVARCHAR(40)  NOT NULL,
+    ListPrice   DECIMAL(10,2) NOT NULL CHECK (ListPrice > 0)
+);
+
+CREATE TABLE Sales.Orders (
+    OrderID     INT IDENTITY(1000,1) PRIMARY KEY,
+    CustomerID  INT  NOT NULL REFERENCES Sales.Customers(CustomerID),
+    OrderDate   DATE NOT NULL,
+    OrderStatus VARCHAR(10) NOT NULL
+                CHECK (OrderStatus IN ('Pending','Shipped','Cancelled'))
+);
+
+CREATE TABLE Sales.OrderLines (
+    OrderID     INT      NOT NULL REFERENCES Sales.Orders(OrderID),
+    LineNum     SMALLINT NOT NULL,
+    ProductID   INT      NOT NULL REFERENCES Sales.Products(ProductID),
+    Quantity    SMALLINT NOT NULL CHECK (Quantity > 0),
+    UnitPrice   DECIMAL(10,2) NOT NULL,
+    CONSTRAINT PK_OrderLines PRIMARY KEY (OrderID, LineNum)
+);
+GO
+
+------------------------------------------------------------
+ 2) TERMINAL SESSION
+------------------------------------------------------------
+C:\Users\dba> sqlcmd -S localhost -d BikeShop -E
+1> INSERT INTO Sales.Customers (FullName, City, JoinedOn) VALUES
+2>   (N'Ana Ruiz',     N'Madrid', '2023-02-11'),
+3>   (N'Ben Okafor',   N'Lagos',  '2023-05-30'),
+4>   (N'Chloe Dubois', N'Lyon',   '2024-01-08'),
+5>   (N'Dev Patel',    N'Pune',   '2024-03-19');
+6> GO
+
+(4 rows affected)
+1> INSERT INTO Sales.Products (ProductName, Category, ListPrice) VALUES
+2>   (N'Trail Helmet',   N'Accessories',   59.90),
+3>   (N'Road Bike R200', N'Bikes',        899.00),
+4>   (N'Gravel Bike G1', N'Bikes',       1249.00),
+5>   (N'Bottle Cage',    N'Accessories',    9.50),
+6>   (N'Repair Kit',     N'Tools',         24.00);
+7> GO
+
+(5 rows affected)
+1> INSERT INTO Sales.Orders (CustomerID, OrderDate, OrderStatus) VALUES
+2>   (1, '2024-04-02', 'Shipped'),
+3>   (2, '2024-04-05', 'Shipped'),
+4>   (1, '2024-04-20', 'Cancelled'),
+5>   (3, '2024-05-03', 'Shipped'),
+6>   (2, '2024-05-14', 'Pending'),
+7>   (3, '2024-05-21', 'Shipped');
+8> GO
+
+(6 rows affected)
+1> INSERT INTO Sales.OrderLines (OrderID, LineNum, ProductID, Quantity, UnitPrice) VALUES
+2>   (1000, 1, 2, 1,  899.00),
+3>   (1000, 2, 1, 1,   59.90),
+4>   (1000, 3, 4, 2,    9.50),
+5>   (1001, 1, 5, 3,   24.00),
+6>   (1002, 1, 3, 1, 1249.00),
+7>   (1003, 1, 4, 4,    9.50),
+8>   (1003, 2, 1, 2,   54.90),
+9>   (1004, 1, 2, 1,  899.00),
+10>   (1005, 1, 5, 1,   24.00),
+11>   (1005, 2, 3, 1, 1199.00);
+12> GO
+
+(10 rows affected)
+1> EXIT
+
+C:\Users\dba>
+
+------------------------------------------------------------
+ 3) EXPECTED RESULT SET (JSON)
+------------------------------------------------------------
+[
+  { "FullName": "Chloe Dubois", "City": "Lyon",   "ShippedOrders": 2, "Revenue": 1370.80, "LastShippedOn": "2024-05-21" },
+  { "FullName": "Ana Ruiz",     "City": "Madrid", "ShippedOrders": 1, "Revenue": 977.90,  "LastShippedOn": "2024-04-02" },
+  { "FullName": "Ben Okafor",   "City": "Lagos",  "ShippedOrders": 1, "Revenue": 72.00,   "LastShippedOn": "2024-04-05" },
+  { "FullName": "Dev Patel",    "City": "Pune",   "ShippedOrders": 0, "Revenue": 0.00,    "LastShippedOn": null }
+]
+
+------------------------------------------------------------
+ 4) ANSWER (reference query)
+------------------------------------------------------------
+SELECT
+    c.FullName,
+    c.City,
+    COUNT(DISTINCT o.OrderID)                   AS ShippedOrders,
+    ISNULL(SUM(ol.Quantity * ol.UnitPrice), 0)  AS Revenue,
+    MAX(o.OrderDate)                            AS LastShippedOn
+FROM Sales.Customers AS c
+LEFT JOIN Sales.Orders AS o
+       ON o.CustomerID  = c.CustomerID
+      AND o.OrderStatus = 'Shipped'
+LEFT JOIN Sales.OrderLines AS ol
+       ON ol.OrderID = o.OrderID
+GROUP BY c.CustomerID, c.FullName, c.City
+ORDER BY Revenue DESC;
+
+-- To emit section 3 literally: append
+--   FOR JSON PATH, INCLUDE_NULL_VALUES
+-- (without INCLUDE_NULL_VALUES, Dev Patel's LastShippedOn key is omitted).
+
+WHAT THE RESULT SET TESTS
+ a) The status filter belongs in the ON clause of the LEFT JOIN.
+    Put it in WHERE and Dev Patel (no shipped orders) disappears.
+ b) Both joins must be outer. An INNER JOIN to OrderLines also
+    drops Dev Patel.
+ c) COUNT(DISTINCT o.OrderID), not COUNT(*). COUNT(*) returns
+    4, 3, 1, 1 (line counts, plus the NULL-extended row for Dev).
+ d) Revenue comes from OrderLines.UnitPrice, not Products.ListPrice.
+    Two lines were sold below list (helmet 54.90, gravel bike
+    1199.00); using ListPrice gives Chloe 1430.80 instead of 1370.80.
+ e) ISNULL/COALESCE turns the empty SUM into 0.00, while
+    MAX(OrderDate) is left NULL — the answer must do one, not both.
+ f) ORDER BY Revenue DESC; and IDENTITY(1000,1) is what maps
+    OrderLines 1000-1005 back to the six inserted orders.
+
+Equivalent approaches (also correct): OUTER APPLY with a
+pre-aggregated subquery per customer, or three correlated
+scalar subqueries in the SELECT list.

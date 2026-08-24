@@ -1,0 +1,317 @@
+# SQL Server question — BikeShop
+
+## Task
+
+The PowerShell session below is the complete history of a SQL Server database, from creation onward. After the session ends, a single T-SQL query is run against `BikeShop` and returns exactly the result set in section 2: same column names, same values, same row order.
+
+Write that query.
+
+## 1. Terminal session
+
+```powershell
+PS C:\Users\dba> sqlcmd -S localhost -E
+1> CREATE DATABASE BikeShop;
+2> GO
+1> USE BikeShop;
+2> GO
+Changed database context to 'BikeShop'.
+1> CREATE SCHEMA Sales;
+2> GO
+1> CREATE TABLE Sales.Customers (
+2>     CustomerID  INT IDENTITY(1,1) PRIMARY KEY,
+3>     FullName    NVARCHAR(80) NOT NULL,
+4>     City        NVARCHAR(60) NOT NULL,
+5>     JoinedOn    DATE         NOT NULL
+6> );
+7> GO
+1> CREATE TABLE Sales.Products (
+2>     ProductID   INT IDENTITY(1,1) PRIMARY KEY,
+3>     ProductName NVARCHAR(80)  NOT NULL,
+4>     Category    NVARCHAR(40)  NOT NULL,
+5>     ListPrice   DECIMAL(10,2) NOT NULL CHECK (ListPrice > 0)
+6> );
+7> GO
+1> CREATE TABLE Sales.Orders (
+2>     OrderID     INT IDENTITY(1000,1) PRIMARY KEY,
+3>     CustomerID  INT  NOT NULL REFERENCES Sales.Customers(CustomerID),
+4>     OrderDate   DATE NOT NULL,
+5>     OrderStatus VARCHAR(10) NOT NULL
+6>                 CHECK (OrderStatus IN ('Pending','Shipped','Cancelled'))
+7> );
+8> GO
+1> CREATE TABLE Sales.OrderLines (
+2>     OrderID     INT      NOT NULL REFERENCES Sales.Orders(OrderID),
+3>     LineNum     SMALLINT NOT NULL,
+4>     ProductID   INT      NOT NULL REFERENCES Sales.Products(ProductID),
+5>     Quantity    SMALLINT NOT NULL CHECK (Quantity > 0),
+6>     UnitPrice   DECIMAL(10,2) NOT NULL,
+7>     CONSTRAINT PK_OrderLines PRIMARY KEY (OrderID, LineNum)
+8> );
+9> GO
+1> INSERT INTO Sales.Customers (FullName, City, JoinedOn) VALUES
+2>   (N'Ana Ruiz',     N'Madrid', '2023-02-11'),
+3>   (N'Ben Okafor',   N'Lagos',  '2023-05-30'),
+4>   (N'Chloe Dubois', N'Lyon',   '2024-01-08'),
+5>   (N'Dev Patel',    N'Pune',   '2024-03-19');
+6> GO
+
+(4 rows affected)
+1> INSERT INTO Sales.Products (ProductName, Category, ListPrice) VALUES
+2>   (N'Trail Helmet',   N'Accessories',   59.90),
+3>   (N'Road Bike R200', N'Bikes',        899.00),
+4>   (N'Gravel Bike G1', N'Bikes',       1249.00),
+5>   (N'Bottle Cage',    N'Accessories',    9.50),
+6>   (N'Repair Kit',     N'Tools',         24.00);
+7> GO
+
+(5 rows affected)
+1> INSERT INTO Sales.Orders (CustomerID, OrderDate, OrderStatus) VALUES
+2>   (1, '2024-04-02', 'Shipped'),
+3>   (2, '2024-04-05', 'Shipped'),
+4>   (1, '2024-04-20', 'Cancelled'),
+5>   (3, '2024-05-03', 'Shipped'),
+6>   (2, '2024-05-14', 'Pending'),
+7>   (3, '2024-05-21', 'Shipped');
+8> GO
+
+(6 rows affected)
+1> INSERT INTO Sales.OrderLines (OrderID, LineNum, ProductID, Quantity, UnitPrice) VALUES
+2>   (1000, 1, 2, 1,  899.00),
+3>   (1000, 2, 1, 1,   59.90),
+4>   (1000, 3, 4, 2,    9.50),
+5>   (1001, 1, 5, 3,   24.00),
+6>   (1002, 1, 3, 1, 1249.00),
+7>   (1003, 1, 4, 4,    9.50),
+8>   (1003, 2, 1, 2,   54.90),
+9>   (1004, 1, 2, 1,  899.00),
+10>   (1005, 1, 5, 1,   24.00),
+11>   (1005, 2, 3, 1, 1199.00);
+12> GO
+
+(10 rows affected)
+1> EXIT
+PS C:\Users\dba>
+```
+
+## 2. Expected result set (JSON)
+
+```json
+[
+  { "FullName": "Chloe Dubois", "City": "Lyon",   "ShippedOrders": 2, "Revenue": 1370.80, "LastShippedOn": "2024-05-21" },
+  { "FullName": "Ana Ruiz",     "City": "Madrid", "ShippedOrders": 1, "Revenue": 977.90,  "LastShippedOn": "2024-04-02" },
+  { "FullName": "Ben Okafor",   "City": "Lagos",  "ShippedOrders": 1, "Revenue": 72.00,   "LastShippedOn": "2024-04-05" },
+  { "FullName": "Dev Patel",    "City": "Pune",   "ShippedOrders": 0, "Revenue": 0.00,    "LastShippedOn": null }
+]
+```
+
+---
+
+## 3. Answer
+
+### 3.1 Reference query
+
+```sql
+SELECT
+    c.FullName,
+    c.City,
+    COUNT(DISTINCT o.OrderID)                   AS ShippedOrders,
+    ISNULL(SUM(ol.Quantity * ol.UnitPrice), 0)  AS Revenue,
+    MAX(o.OrderDate)                            AS LastShippedOn
+FROM Sales.Customers AS c
+LEFT JOIN Sales.Orders AS o
+       ON o.CustomerID  = c.CustomerID
+      AND o.OrderStatus = 'Shipped'
+LEFT JOIN Sales.OrderLines AS ol
+       ON ol.OrderID = o.OrderID
+GROUP BY c.CustomerID, c.FullName, c.City
+ORDER BY Revenue DESC;
+```
+
+To emit section 2 literally, append `FOR JSON PATH, INCLUDE_NULL_VALUES`. Without `INCLUDE_NULL_VALUES`, Dev Patel's `LastShippedOn` key is omitted from the JSON.
+
+### 3.2 How the query gets from the buffer to the table, step by step
+
+This section is for the reader who has seen the buffer, the JSON and the query, and still cannot see *why* those lines produce those numbers. It uses no SQL. Each step ends with a pointer to the clause that performs it.
+
+#### Step 0 — read the buffer as a map, not as code
+
+The four `CREATE TABLE` batches define four tables, and every `REFERENCES` inside them is an arrow from a column in one table to the key of another:
+
+```text
+Customers ◄── Orders ◄── OrderLines ──► Products
+
+  Orders.CustomerID      points at   Customers.CustomerID
+  OrderLines.OrderID     points at   Orders.OrderID
+  OrderLines.ProductID   points at   Products.ProductID
+```
+
+An arrow means "this row knows which row over there it belongs to". An order line knows its order and its product. An order knows its customer. Nothing points the other way: a customer row does not list its orders. So "find this customer's orders" always means "scan Orders for rows that carry this CustomerID", and "find this order's lines" means "scan OrderLines for rows that carry this OrderID". Every question in this exercise is answered by walking these arrows, and the only real decisions are where to start, which direction to walk, and what to keep along the way.
+
+The buffer never types a single ID. SQL Server assigns them in insertion order because the key columns are `IDENTITY`: customers get 1–4, products get 1–5, orders get 1000–1005 (the seed is 1000). That is the decoder ring for the last batch. `(1003, 2, 1, 2, 54.90)` reads as: the fourth order inserted (Chloe Dubois, 2024-05-03, Shipped), line 2, the first product inserted (Trail Helmet), two units, at 54.90 each.
+
+Decoding every line this way gives the whole story of the shop in one view:
+
+| Order | Customer | Status | Line | Product | Qty | Paid each | List price | Line total |
+|---|---|---|---|---|---|---|---|---|
+| 1000 | Ana Ruiz | Shipped | 1 | Road Bike R200 | 1 | 899.00 | 899.00 | 899.00 |
+| 1000 | Ana Ruiz | Shipped | 2 | Trail Helmet | 1 | 59.90 | 59.90 | 59.90 |
+| 1000 | Ana Ruiz | Shipped | 3 | Bottle Cage | 2 | 9.50 | 9.50 | 19.00 |
+| 1001 | Ben Okafor | Shipped | 1 | Repair Kit | 3 | 24.00 | 24.00 | 72.00 |
+| 1002 | Ana Ruiz | Cancelled | 1 | Gravel Bike G1 | 1 | 1249.00 | 1249.00 | — |
+| 1003 | Chloe Dubois | Shipped | 1 | Bottle Cage | 4 | 9.50 | 9.50 | 38.00 |
+| 1003 | Chloe Dubois | Shipped | 2 | Trail Helmet | 2 | **54.90** | 59.90 | 109.80 |
+| 1004 | Ben Okafor | Pending | 1 | Road Bike R200 | 1 | 899.00 | 899.00 | — |
+| 1005 | Chloe Dubois | Shipped | 1 | Repair Kit | 1 | 24.00 | 24.00 | 24.00 |
+| 1005 | Chloe Dubois | Shipped | 2 | Gravel Bike G1 | 1 | **1199.00** | 1249.00 | 1199.00 |
+
+Dev Patel is not in this table at all: no order ever points at customer 4.
+
+#### Step 1 — let the result tell you where to start
+
+The JSON has four rows and they are the four customers, including Dev Patel with 0, 0.00 and null. So the shape of the answer is "one row per customer, no matter what". That fixes the direction of the walk: start at Customers and follow the arrows *outward* (customer → orders → lines).
+
+Walking the other way — start at an order line, follow its arrow to the order, follow the next arrow to the customer — looks just as natural, and it is how you would naturally read the buffer. But that walk can only ever reach customers that some line points to. Dev Patel has no lines, so no path leads to him, and he would be missing from the result. The row that has nothing is what dictates the starting point.
+
+*In the query:* `FROM Sales.Customers AS c` is the starting table, and the two `LEFT JOIN`s are the two outward hops; "left" means "keep the customer even if nothing matches on the other side".
+
+#### Step 2 — from each customer, collect their orders, keeping only the shipped ones
+
+Take the customer's CustomerID and collect every Orders row that carries it, applying the "shipped only" rule *at the moment of collecting*:
+
+- Ana Ruiz (1): orders 1000 (Shipped) and 1002 (Cancelled) → keep 1000.
+- Ben Okafor (2): 1001 (Shipped) and 1004 (Pending) → keep 1001.
+- Chloe Dubois (3): 1003 and 1005, both Shipped → keep both.
+- Dev Patel (4): nothing → keep Dev anyway, attached to an empty placeholder.
+
+Why "at the moment of collecting" matters: if you instead attached *all* orders first and then deleted every row whose status is not Shipped, Dev's placeholder has a blank status, blank is not Shipped, and the placeholder is deleted along with everything else. Dev disappears. Filtering while matching keeps him; filtering afterwards loses him.
+
+*In the query:* `LEFT JOIN Sales.Orders AS o ON o.CustomerID = c.CustomerID AND o.OrderStatus = 'Shipped'` — the status test sits inside `ON`, which is "while matching". Moving it to `WHERE` is "afterwards".
+
+#### Step 3 — from each surviving order, collect its lines
+
+Take each kept OrderID and collect every OrderLines row that carries it: 1000 brings three lines, 1001 one, 1003 two, 1005 two. Dev's placeholder has no OrderID, so it collects nothing and stays a placeholder. Orders 1002 and 1004 were dropped in step 2, so their lines are never visited; that is why the cancelled gravel bike and the pending road bike contribute nothing.
+
+*In the query:* `LEFT JOIN Sales.OrderLines AS ol ON ol.OrderID = o.OrderID`, again "left" so the placeholder survives.
+
+#### Step 4 — price each line with the line's own price
+
+Each line carries its own `UnitPrice`: the price actually charged when that line was entered. Multiply it by `Quantity`:
+
+- 1000: 899.00 + 59.90 + 2 × 9.50 = 977.90
+- 1001: 3 × 24.00 = 72.00
+- 1003: 4 × 9.50 + 2 × 54.90 = 38.00 + 109.80 = 147.80
+- 1005: 24.00 + 1199.00 = 1223.00
+
+Notice that Products was never needed. The walk reaches the money without ever following the line → product arrow.
+
+**How do we know two products were sold below list price?** By following that unused arrow once, just to check. Line (1003, 2) carries ProductID 1; Products row 1 is Trail Helmet with a ListPrice of 59.90; the line says 54.90. Line (1005, 2) carries ProductID 3; Products row 3 is Gravel Bike G1, ListPrice 1249.00; the line says 1199.00. There are two prices for the same product — the catalog price stored in Products and the charged price stored on the line — and they disagree in exactly those two places. Had the query priced lines with the catalog price, Chloe's revenue would come out as 1430.80, not the 1370.80 the JSON shows. So the result itself tells you which of the two columns was used: the one on the line.
+
+*In the query:* `ol.Quantity * ol.UnitPrice`; there is no join to `Sales.Products` at all.
+
+#### Step 5 — fold everything back to one row per customer
+
+After steps 2–4, Chloe is spread over four line rows, Ana over three, Ben over one, Dev over one empty placeholder. Collapse each customer's rows into one:
+
+- **ShippedOrders** — count how many *different* orders appear among the rows, not how many rows. Chloe has four rows but only two order numbers, 1003 and 1005. Dev's placeholder has no order number, so the count is 0.
+- **Revenue** — add up the line totals: Chloe 147.80 + 1223.00 = 1370.80; Ana 977.90; Ben 72.00. Dev has nothing to add, which would leave a blank; the JSON shows 0.00, so the blank is replaced by zero.
+- **LastShippedOn** — take the latest order date among the rows: Chloe 2024-05-21, Ana 2024-04-02, Ben 2024-04-05. Dev has no date, and the JSON shows null, so here the blank is left alone.
+
+*In the query:* `GROUP BY c.CustomerID, c.FullName, c.City` does the collapsing; `COUNT(DISTINCT o.OrderID)`, `ISNULL(SUM(...), 0)` and `MAX(o.OrderDate)` are the three folds.
+
+#### Step 6 — sort
+
+The buffer inserted Ana first, but the JSON lists Chloe first, so the rows are not in insertion order. The only column that runs monotonically down the JSON is Revenue: 1370.80, 977.90, 72.00, 0.00. Largest first.
+
+*In the query:* `ORDER BY Revenue DESC`.
+
+#### The method, in one breath
+
+Column names say which tables are involved (FullName and City live in Customers; an order count and a last date live in Orders; money lives in OrderLines). The row with zeros says which table to start from, and that nothing may be discarded along the way. The figures say which price column was used. The row order says how to sort. Everything else is walking the arrows.
+
+### 3.3 Alternative correct solutions
+
+All three below return the same four rows in the same order. They differ only in *where* steps 2–5 happen.
+
+**A. Pre-aggregate per order, then outer-join.** The "shipped only" rule and the per-order totals are computed in a CTE *before* the customer join. Because the filter runs before the outer join, it may live in `WHERE`, and `COUNT` needs no `DISTINCT` since each CTE row is one order.
+
+```sql
+WITH ShippedOrderTotals AS (
+    SELECT
+        o.OrderID,
+        o.CustomerID,
+        o.OrderDate,
+        SUM(ol.Quantity * ol.UnitPrice) AS OrderTotal
+    FROM Sales.Orders AS o
+    JOIN Sales.OrderLines AS ol
+      ON ol.OrderID = o.OrderID
+    WHERE o.OrderStatus = 'Shipped'
+    GROUP BY o.OrderID, o.CustomerID, o.OrderDate
+)
+SELECT
+    c.FullName,
+    c.City,
+    COUNT(s.OrderID)              AS ShippedOrders,
+    ISNULL(SUM(s.OrderTotal), 0)  AS Revenue,
+    MAX(s.OrderDate)              AS LastShippedOn
+FROM Sales.Customers AS c
+LEFT JOIN ShippedOrderTotals AS s
+       ON s.CustomerID = c.CustomerID
+GROUP BY c.CustomerID, c.FullName, c.City
+ORDER BY Revenue DESC;
+```
+
+**B. `OUTER APPLY` with one aggregate per customer.** Steps 2–5 run once per customer inside the applied subquery. An aggregate query without `GROUP BY` always returns exactly one row, so Dev Patel gets a row of `0`, `NULL`, `NULL`, and the outer `ISNULL` turns the `NULL` revenue into `0.00`.
+
+```sql
+SELECT
+    c.FullName,
+    c.City,
+    s.OrderCount            AS ShippedOrders,
+    ISNULL(s.LineTotal, 0)  AS Revenue,
+    s.LastDate              AS LastShippedOn
+FROM Sales.Customers AS c
+OUTER APPLY (
+    SELECT
+        COUNT(DISTINCT o.OrderID)        AS OrderCount,
+        SUM(ol.Quantity * ol.UnitPrice)  AS LineTotal,
+        MAX(o.OrderDate)                 AS LastDate
+    FROM Sales.Orders AS o
+    JOIN Sales.OrderLines AS ol
+      ON ol.OrderID = o.OrderID
+    WHERE o.CustomerID  = c.CustomerID
+      AND o.OrderStatus = 'Shipped'
+) AS s
+ORDER BY Revenue DESC;
+```
+
+**C. Three correlated scalar subqueries.** The most literal translation of steps 2–5: each output column asks its own question about the current customer. Note that `COUNT(*)` is correct here, because the counting subquery looks at orders, not lines.
+
+```sql
+SELECT
+    c.FullName,
+    c.City,
+    (SELECT COUNT(*)
+       FROM Sales.Orders AS o
+      WHERE o.CustomerID  = c.CustomerID
+        AND o.OrderStatus = 'Shipped')                         AS ShippedOrders,
+    ISNULL((SELECT SUM(ol.Quantity * ol.UnitPrice)
+              FROM Sales.Orders AS o
+              JOIN Sales.OrderLines AS ol ON ol.OrderID = o.OrderID
+             WHERE o.CustomerID  = c.CustomerID
+               AND o.OrderStatus = 'Shipped'), 0)             AS Revenue,
+    (SELECT MAX(o.OrderDate)
+       FROM Sales.Orders AS o
+      WHERE o.CustomerID  = c.CustomerID
+        AND o.OrderStatus = 'Shipped')                         AS LastShippedOn
+FROM Sales.Customers AS c
+ORDER BY Revenue DESC;
+```
+
+### 3.4 What the result set tests
+
+1. **Every customer must appear, even one with no qualifying orders.** The walk has to start at Customers and must not discard customers that match nothing: a `LEFT JOIN`, an `OUTER APPLY`, or scalar subqueries. In the single-pass join form (3.1), the status test must sit in `ON`; moving it to `WHERE` removes Dev Patel. Pre-filtering in a CTE (alternative A) sidesteps this because the filter runs before the outer join.
+2. **Both hops must preserve the customer.** In the join form, an `INNER JOIN` to `OrderLines` also drops Dev Patel.
+3. **Count orders, not lines.** Chloe has four lines but two orders; `COUNT(*)` over the joined rows gives 4, 3, 1, 1 (Dev's placeholder row counts as one). Use `COUNT(DISTINCT o.OrderID)`, or count at a level where each row is one order (alternatives A and C).
+4. **Price from `OrderLines.UnitPrice`, not `Products.ListPrice`.** Two lines were sold below list; pricing with `ListPrice` gives Chloe 1430.80 instead of 1370.80.
+5. **An empty sum becomes 0.00 (`ISNULL`/`COALESCE`); an empty max stays NULL.** One, not both.
+6. **`ORDER BY Revenue DESC`**, and the `IDENTITY(1000,1)` seed is what maps `OrderLines` 1000–1005 back to the six inserted orders.
