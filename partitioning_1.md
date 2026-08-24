@@ -1,0 +1,179 @@
+# SQL Server question — Partitioning 1
+
+## Statement
+
+An energy utility stores IoT electricity-grid sensor telemetry in a SQL Server 2022 database named `GridSense`. Readings are partitioned by month so that old months can be purged instantly.
+
+The following batch is executed on a brand-new, empty `GridSense` database. Every statement succeeds.
+
+```sql
+USE GridSense;
+GO
+
+CREATE SCHEMA Ops;
+GO
+
+CREATE PARTITION FUNCTION PF_ReadingMonth (date)
+AS RANGE LEFT
+FOR VALUES ('20250201', '20250301', '20250401');
+GO
+
+CREATE PARTITION SCHEME PS_ReadingMonth
+AS PARTITION PF_ReadingMonth
+ALL TO ([PRIMARY]);
+GO
+
+CREATE TABLE Ops.Readings
+(
+    ReadingId    bigint        NOT NULL,
+    SensorId     int           NOT NULL,
+    ReadingDate  date          NOT NULL,
+    kWh          decimal(9,3)  NOT NULL,
+    CONSTRAINT PK_Readings
+        PRIMARY KEY CLUSTERED (ReadingId, ReadingDate)
+) ON PS_ReadingMonth (ReadingDate);
+GO
+
+INSERT INTO Ops.Readings (ReadingId, SensorId, ReadingDate, kWh) VALUES
+    ( 1, 101, '20250115',  42.500),
+    ( 2, 101, '20250131',  40.250),
+    ( 3, 102, '20250201',  38.900),
+    ( 4, 102, '20250202',  39.100),
+    ( 5, 103, '20250228',  41.000),
+    ( 6, 103, '20250301',  37.750),
+    ( 7, 104, '20250315',  44.300),
+    ( 8, 104, '20250331',  43.600),
+    ( 9, 105, '20250401',  36.200),
+    (10, 105, '20250402',  35.800);
+GO
+
+TRUNCATE TABLE Ops.Readings
+WITH (PARTITIONS (2, 4));
+GO
+```
+
+After the batch completes, the following query is executed:
+
+```sql
+SELECT
+    $PARTITION.PF_ReadingMonth(ReadingDate) AS PartitionNumber,
+    COUNT(*)                                AS ReadingCount
+FROM Ops.Readings
+GROUP BY $PARTITION.PF_ReadingMonth(ReadingDate)
+ORDER BY PartitionNumber;
+```
+
+Which result set does the query return?
+
+### a.
+
+| PartitionNumber | ReadingCount |
+|---|---|
+| 1 | 2 |
+| 3 | 3 |
+
+### b.
+
+| PartitionNumber | ReadingCount |
+|---|---|
+| 1 | 3 |
+| 3 | 3 |
+
+### c.
+
+| PartitionNumber | ReadingCount |
+|---|---|
+| 2 | 3 |
+| 4 | 1 |
+
+### d.
+
+| PartitionNumber | ReadingCount |
+|---|---|
+| 1 | 3 |
+
+## Correct Answer
+
+**b**
+
+## Explanation
+
+The correct answer is **b**.
+
+Two independent facts decide this question:
+
+1. **`RANGE LEFT` boundary placement.** With `RANGE LEFT`, each boundary value belongs to the partition on its **left** — the lower partition. Three boundary values create four partitions:
+
+   | Partition | Condition |
+   |---|---|
+   | 1 | `ReadingDate <= '2025-02-01'` |
+   | 2 | `'2025-02-01' < ReadingDate <= '2025-03-01'` |
+   | 3 | `'2025-03-01' < ReadingDate <= '2025-04-01'` |
+   | 4 | `ReadingDate > '2025-04-01'` |
+
+   Note the trap: the DDL uses first-of-month boundaries, which *look* like the start of each month's partition — but with `RANGE LEFT` the first of a month is the **last** day of the previous partition. First-of-month boundaries behave the intuitive way only with `RANGE RIGHT`.
+
+2. **`TRUNCATE TABLE ... WITH (PARTITIONS (2, 4))`** removes all rows from partitions 2 and 4 only (the list names the partitions to empty, not to keep). It is legal here because the table's only index — the clustered primary key — is created on the partition scheme, so the table is aligned.
+
+### Row-by-row partition assignment
+
+| ReadingId | ReadingDate | Comparison against boundaries | Partition |
+|---|---|---|---|
+| 1 | 2025-01-15 | `<= 2025-02-01` | 1 |
+| 2 | 2025-01-31 | `<= 2025-02-01` | 1 |
+| 3 | 2025-02-01 | **equals boundary 1 → LEFT → lower partition** | 1 |
+| 4 | 2025-02-02 | `> 2025-02-01` and `<= 2025-03-01` | 2 |
+| 5 | 2025-02-28 | `> 2025-02-01` and `<= 2025-03-01` | 2 |
+| 6 | 2025-03-01 | **equals boundary 2 → LEFT → lower partition** | 2 |
+| 7 | 2025-03-15 | `> 2025-03-01` and `<= 2025-04-01` | 3 |
+| 8 | 2025-03-31 | `> 2025-03-01` and `<= 2025-04-01` | 3 |
+| 9 | 2025-04-01 | **equals boundary 3 → LEFT → lower partition** | 3 |
+| 10 | 2025-04-02 | `> 2025-04-01` | 4 |
+
+Counts before the truncate: partition 1 = 3 rows (1, 2, 3), partition 2 = 3 rows (4, 5, 6), partition 3 = 3 rows (7, 8, 9), partition 4 = 1 row (10).
+
+`TRUNCATE TABLE Ops.Readings WITH (PARTITIONS (2, 4))` deletes rows 4, 5, 6 (partition 2) and row 10 (partition 4).
+
+Remaining rows: 1, 2, 3 in partition 1 and 7, 8, 9 in partition 3. The `GROUP BY` produces one row per **nonempty** partition — empty partitions simply do not appear, they are not reported as zero. With `ORDER BY PartitionNumber` the result is exactly:
+
+| PartitionNumber | ReadingCount |
+|---|---|
+| 1 | 3 |
+| 3 | 3 |
+
+The `date` literals in `yyyymmdd` form and the explicit `ORDER BY` make the result independent of language, `DATEFORMAT`, and plan choices, so this is the single unambiguous answer; no equivalent alternative result set exists.
+
+### Why option a is wrong
+
+Option a is the answer you get by applying **`RANGE RIGHT`** semantics to a `RANGE LEFT` function. Under `RANGE RIGHT`, each boundary would belong to the partition on its right:
+
+- 2025-02-01 → partition 2, 2025-03-01 → partition 3, 2025-04-01 → partition 4.
+- Pre-truncate counts would be 2, 3, 3, 2; after truncating partitions 2 and 4, the survivors would be partition 1 = 2 rows (2025-01-15, 2025-01-31) and partition 3 = 3 rows (2025-03-01, 2025-03-15, 2025-03-31).
+
+But the function is declared `AS RANGE LEFT`, so every row equal to a boundary value (rows 3, 6, 9) lands one partition *lower* than that intuition suggests. Row 3 (2025-02-01) is in partition 1, so partition 1 holds 3 rows, not 2.
+
+### Why option c is wrong
+
+Option c inverts the meaning of the `WITH (PARTITIONS ...)` clause, treating `(2, 4)` as the partitions to **keep**. The clause specifies the partitions to **truncate**: partitions 2 and 4 are emptied and partitions 1 and 3 survive. (Option c even reports partition 2 with the 3 rows and partition 4 with the 1 row that the truncate just removed.)
+
+### Why option d is wrong
+
+Option d reads `WITH (PARTITIONS (2, 4))` as the range `2 TO 4`, truncating partitions 2, 3, and 4 and leaving only partition 1. A range requires the keyword `TO` — `WITH (PARTITIONS (2 TO 4))`. A comma-separated list names individual partitions, so partition 3 is untouched and its 3 rows (2025-03-15, 2025-03-31, 2025-04-01) must appear in the result.
+
+## DP-800 Exam Rule to Remember
+
+For `CREATE PARTITION FUNCTION ... AS RANGE { LEFT | RIGHT } FOR VALUES (b1, ..., bn)`:
+
+```text
+n boundary values  →  n + 1 partitions
+
+RANGE LEFT   →  a row EQUAL to a boundary goes to the LOWER  partition (col <= boundary)
+RANGE RIGHT  →  a row EQUAL to a boundary goes to the HIGHER partition (col >= boundary)
+LEFT is the default when neither is specified.
+```
+
+Practical consequences to memorize:
+
+- **Date partitioning idiom:** first-of-month (or first-of-year) boundaries pair naturally with `RANGE RIGHT`, so each partition starts exactly on its boundary. The same boundaries with `RANGE LEFT` silently push every boundary-date row into the *previous* month's partition.
+- **`$PARTITION.function_name(value)`** returns the 1-based partition number for any value — usable in `SELECT`, `WHERE`, or `GROUP BY` to audit where rows actually live. Grouping by it reports only nonempty partitions.
+- **`TRUNCATE TABLE ... WITH (PARTITIONS (...))`** (SQL Server 2016+) empties only the listed partitions — individual numbers, ranges with `TO` (e.g. `6 TO 8`), or a mix. It requires a partitioned table whose indexes are aligned with the table's partition function; the list names what is *removed*, never what is kept.
