@@ -1,0 +1,186 @@
+============================================================
+ SQL Server question — JSON_OBJECT 1
+============================================================
+
+Statement
+---------
+
+A smart-home platform stores the configuration of every device in a
+mesh network. A REST endpoint must return one JSON configuration
+document per device, built directly in T-SQL with the JSON_OBJECT
+constructor.
+
+The following script is run on SQL Server 2025 and completes without
+errors:
+
+CREATE DATABASE HomeMesh;
+GO
+ALTER DATABASE HomeMesh SET COMPATIBILITY_LEVEL = 170;
+GO
+USE HomeMesh;
+GO
+CREATE SCHEMA Iot;
+GO
+CREATE TABLE Iot.Devices (
+    DeviceId   INT           PRIMARY KEY,
+    DeviceName NVARCHAR(60)  NOT NULL,
+    Room       NVARCHAR(40)  NULL,
+    StreamPath NVARCHAR(80)  NULL,
+    IpAddress  VARCHAR(15)   NOT NULL,
+    Gateway    VARCHAR(15)   NULL,
+    Brightness INT           NULL,
+    Volume     INT           NULL,
+    IsOnline   BIT           NOT NULL
+);
+GO
+INSERT INTO Iot.Devices (DeviceId, DeviceName, Room, StreamPath, IpAddress, Gateway, Brightness, Volume, IsOnline) VALUES
+  (1, N'Hall Thermostat',  N'Hallway', NULL,                    '10.0.0.7',  '10.0.0.1', 80,   NULL, 1),
+  (2, N'Kids "Play" Lamp', NULL,       NULL,                    '10.0.0.9',  NULL,       NULL, 35,   0),
+  (3, N'Garage Cam',       N'Garage',  N'\\hub01\streams\cam2', '10.0.0.12', '10.0.0.1', NULL, NULL, 1);
+GO
+
+Then this query is executed:
+
+SELECT d.DeviceId,
+       JSON_OBJECT(
+           'device': d.DeviceName,
+           'room':   d.Room,
+           'path':   d.StreamPath,
+           'net':    JSON_OBJECT('ip': d.IpAddress, 'gw': d.Gateway ABSENT ON NULL),
+           'levels': JSON_ARRAY(d.Brightness, d.Volume NULL ON NULL),
+           'online': d.IsOnline
+       ) AS ConfigJson
+FROM Iot.Devices AS d
+ORDER BY d.DeviceId;
+
+Write the EXACT ConfigJson string returned for each of the three
+rows — every character, including quoting, escaping, key order, and
+how every SQL NULL is (or is not) represented.
+
+Correct Answer
+--------------
+
+The query returns three rows, in DeviceId order. The ConfigJson
+strings, copied verbatim from the engine, are:
+
+DeviceId 1:
+
+{"device":"Hall Thermostat","room":"Hallway","path":null,"net":{"ip":"10.0.0.7","gw":"10.0.0.1"},"levels":[80,null],"online":true}
+
+DeviceId 2:
+
+{"device":"Kids \"Play\" Lamp","room":null,"path":null,"net":{"ip":"10.0.0.9"},"levels":[null,35],"online":false}
+
+DeviceId 3:
+
+{"device":"Garage Cam","room":"Garage","path":"\\\\hub01\\streams\\cam2","net":{"ip":"10.0.0.12","gw":"10.0.0.1"},"levels":[null,null],"online":true}
+
+Explanation
+-----------
+
+Five independent rendering rules combine to produce these strings.
+Getting any one of them wrong changes the output
+character-for-character.
+
+1. The JSON_OBJECT default is NULL ON NULL
+------------------------------------------
+
+Per the Microsoft Learn reference for JSON_OBJECT (Transact-SQL):
+"The default setting for this option is NULL ON NULL."
+
+The outer object specifies no json_null_clause, so every SQL NULL
+value becomes a JSON null with its key kept:
+
+- Row 1: StreamPath is NULL → "path":null
+- Row 2: Room and StreamPath are NULL → "room":null,"path":null
+
+Neither key disappears. This is the exact opposite of JSON_ARRAY and
+JSON_ARRAYAGG, whose default is ABSENT ON NULL — the single
+most-confused fact about the JSON constructor family.
+
+2. ABSENT ON NULL removes the whole key
+---------------------------------------
+
+The nested object JSON_OBJECT('ip': ..., 'gw': ... ABSENT ON NULL)
+overrides the default. In row 2, Gateway is NULL, so the "gw" key is
+omitted entirely:
+
+"net":{"ip":"10.0.0.9"}
+
+The object shrinks from two keys to one. In rows 1 and 3 (Gateway
+non-NULL) both keys appear.
+
+Note what does NOT happen: the inner JSON_OBJECT call itself never
+returns a SQL NULL — it always returns a valid JSON string. So the
+outer "net" key can never be turned into null or removed by the
+outer object's null handling; only the arguments inside a
+constructor are subject to its null clause.
+
+3. JSON_ARRAY(... NULL ON NULL) keeps positions
+-----------------------------------------------
+
+The levels array explicitly requests NULL ON NULL, so SQL NULL
+elements are rendered as JSON null and the array is always length 2:
+
+- Row 1: [80,null] (Volume is NULL)
+- Row 2: [null,35] (Brightness is NULL)
+- Row 3: [null,null]
+
+Had the clause been omitted, JSON_ARRAY's default ABSENT ON NULL
+would have produced [80], [35], and [] — different lengths per row.
+
+4. bit renders as JSON true/false, unquoted
+-------------------------------------------
+
+JSON_OBJECT uses the FOR JSON type-conversion rules: SQL bit maps to
+the JSON boolean type. IsOnline = 1 → "online":true; IsOnline = 0 →
+"online":false. Writing "online":1 or "online":"true" is wrong.
+
+5. Escaping of " and \ inside string values
+-------------------------------------------
+
+String values are escaped by the FOR JSON escaping rules:
+
+- Row 2: the stored value Kids "Play" Lamp renders as
+  "Kids \"Play\" Lamp" — each embedded double quote becomes \".
+- Row 3: the stored value is \\hub01\streams\cam2 (T-SQL string
+  literals do NOT treat backslash as an escape character, so the
+  literal N'\\hub01\streams\cam2' really contains two leading
+  backslashes). In JSON every backslash must be escaped, so the four
+  backslashes render as eight: "\\\\hub01\\streams\\cam2".
+
+Key order and whitespace
+------------------------
+
+Keys appear exactly in the order the key : value pairs are listed in
+the JSON_OBJECT call, and the output contains no whitespace between
+tokens. The result is nvarchar(max) (adding RETURNING json would
+return the native json type instead).
+
+Equivalent alternatives
+-----------------------
+
+- Writing the outer object as
+  JSON_OBJECT(... 'online': d.IsOnline NULL ON NULL) is exactly
+  equivalent — it only spells out the default.
+- JSON_OBJECT('ip': d.IpAddress, 'gw': ISNULL(d.Gateway, ...)) is
+  NOT equivalent to ABSENT ON NULL; there is no substitution value
+  that removes a key.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+The JSON constructor family has two different defaults:
+
+JSON_OBJECT    → default NULL ON NULL    (key kept, value null)
+JSON_ARRAY     → default ABSENT ON NULL  (element removed)
+JSON_ARRAYAGG  → default ABSENT ON NULL  (element removed)
+
+Additional per-character rules that exams probe:
+
+- A nested JSON_OBJECT/JSON_ARRAY argument is never SQL NULL, so the
+  enclosing constructor's null clause never touches it.
+- bit → unquoted true/false.
+- " → \" and \ → \\ inside string values (T-SQL itself never escapes
+  backslashes, JSON always does).
+- Keys are emitted in call order, with no whitespace.

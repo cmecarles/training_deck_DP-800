@@ -1,0 +1,253 @@
+============================================================
+ SQL Server question — Indexed Views 1
+============================================================
+
+Statement
+---------
+
+A wholesale fresh-produce market runs SQL Server with a database
+named FreshWholesale. Order lines arrive continuously, and the
+analytics team wants revenue per produce item PRE-AGGREGATED AND
+MATERIALIZED by the engine, so they decide to create an indexed
+view.
+
+The base schema is:
+
+CREATE DATABASE FreshWholesale;
+GO
+USE FreshWholesale;
+GO
+CREATE SCHEMA Mkt;
+GO
+CREATE TABLE Mkt.Produce
+(
+    ProduceID   INT          NOT NULL PRIMARY KEY,
+    ProduceName NVARCHAR(40) NOT NULL,
+    Category    NVARCHAR(20) NOT NULL
+);
+GO
+CREATE TABLE Mkt.OrderLine
+(
+    OrderID    INT          NOT NULL,
+    LineNum    SMALLINT     NOT NULL,
+    ProduceID  INT          NOT NULL REFERENCES Mkt.Produce(ProduceID),
+    Kg         DECIMAL(8,2) NOT NULL,
+    PricePerKg DECIMAL(8,2) NOT NULL,
+    CONSTRAINT PK_OrderLine PRIMARY KEY (OrderID, LineNum)
+);
+GO
+
+Each option below is executed IN ISOLATION in a fresh copy of the
+database, from a session with QUOTED_IDENTIFIER and ANSI_NULLS set
+to ON. For exactly one option, BOTH the CREATE VIEW and the CREATE
+UNIQUE CLUSTERED INDEX complete successfully, producing a working
+indexed view. Which one?
+
+a.
+
+CREATE VIEW Mkt.RevenueByProduce
+AS
+SELECT ProduceID,
+       SUM(Kg * PricePerKg) AS Revenue,
+       COUNT_BIG(*)         AS LineCount
+FROM Mkt.OrderLine
+GROUP BY ProduceID;
+GO
+CREATE UNIQUE CLUSTERED INDEX IX_RevenueByProduce
+    ON Mkt.RevenueByProduce (ProduceID);
+GO
+
+b.
+
+CREATE VIEW Mkt.RevenueByProduce
+WITH SCHEMABINDING
+AS
+SELECT ProduceID,
+       SUM(Kg * PricePerKg) AS Revenue,
+       COUNT(*)             AS LineCount
+FROM Mkt.OrderLine
+GROUP BY ProduceID;
+GO
+CREATE UNIQUE CLUSTERED INDEX IX_RevenueByProduce
+    ON Mkt.RevenueByProduce (ProduceID);
+GO
+
+c.
+
+CREATE VIEW Mkt.RevenueByProduce
+WITH SCHEMABINDING
+AS
+SELECT ProduceID,
+       SUM(Kg * PricePerKg) AS Revenue,
+       COUNT_BIG(*)         AS LineCount
+FROM Mkt.OrderLine
+GROUP BY ProduceID;
+GO
+CREATE UNIQUE CLUSTERED INDEX IX_RevenueByProduce
+    ON Mkt.RevenueByProduce (ProduceID);
+GO
+
+d.
+
+CREATE VIEW Mkt.RevenueByCategory
+WITH SCHEMABINDING
+AS
+SELECT p.Category,
+       SUM(ol.Kg * ol.PricePerKg) AS Revenue,
+       COUNT_BIG(*)               AS LineCount
+FROM Mkt.Produce AS p
+LEFT JOIN Mkt.OrderLine AS ol
+       ON ol.ProduceID = p.ProduceID
+GROUP BY p.Category;
+GO
+CREATE UNIQUE CLUSTERED INDEX IX_RevenueByCategory
+    ON Mkt.RevenueByCategory (Category);
+GO
+
+Correct Answer
+--------------
+
+c
+
+Explanation
+-----------
+
+All four scripts were executed against SQL Server 2025 (RTM); the
+error numbers and messages below are the engine's literal output.
+
+An aggregating view can be indexed only when its definition lets
+the engine maintain the materialized rows incrementally on every
+INSERT/UPDATE/DELETE of the base tables. That drives every
+requirement tested here.
+
+Why option c is correct
+.......................
+
+Option c satisfies the full checklist for an indexed aggregate
+view:
+
+- WITH SCHEMABINDING — mandatory, so the base table's schema cannot
+  drift under the materialized data.
+- Two-part object names (Mkt.OrderLine) — mandatory inside any
+  schemabound module.
+- GROUP BY accompanied by COUNT_BIG(*) in the select list —
+  mandatory, so the engine can decrement group row counts and
+  delete a group's row when it becomes empty.
+- Deterministic, precise expressions over NOT NULL columns
+  (SUM(Kg * PricePerKg) on two DECIMAL NOT NULL columns).
+- A single-table FROM, free of outer joins.
+- The FIRST index created on the view is a UNIQUE CLUSTERED index,
+  keyed on the GROUP BY column — which is unique per group by
+  construction.
+
+Both statements complete without error. From then on the engine
+maintains the view automatically: after inserting a new order line
+for produce 2, SELECT ... FROM Mkt.RevenueByProduce WITH (NOEXPAND)
+immediately reflects the new Revenue and LineCount with a single
+Clustered Index Scan on IX_RevenueByProduce — no aggregation at
+query time.
+
+Why option a is wrong
+.....................
+
+The view is not schemabound. The view itself is created fine (it is
+a perfectly legal ordinary view), but the index fails:
+
+Msg 1939, Level 16, State 1
+Cannot create index on view 'RevenueByProduce' because the view is not schema bound.
+
+Without schema binding, someone could alter or drop Mkt.OrderLine
+out from under the materialized rows, so the engine refuses.
+
+Why option b is wrong (the subtle one)
+......................................
+
+Everything is right except one token: COUNT(*) instead of
+COUNT_BIG(*). The view creates successfully; the index fails:
+
+Msg 10136, Level 16, State 1
+Cannot create index on view "FreshWholesale.Mkt.RevenueByProduce" because it uses
+the aggregate COUNT. Use COUNT_BIG instead.
+
+An indexed view with GROUP BY must contain COUNT_BIG(*) (which
+returns bigint) in its select list; the 4-byte COUNT is
+disqualified outright.
+
+Why option d is wrong
+.....................
+
+The definition uses a LEFT JOIN. View creation succeeds; the index
+fails:
+
+Msg 10113, Level 16, State 1
+Cannot create index on view "FreshWholesale.Mkt.RevenueByCategory" because it uses
+a LEFT, RIGHT, or FULL OUTER join, and no OUTER joins are allowed in indexed views.
+Consider using an INNER join instead.
+
+Outer joins are banned because NULL-extended rows cannot be
+maintained incrementally in a sound way. Rewriting with INNER JOIN
+(and keeping the rest of the checklist) would make it indexable.
+
+Neighboring traps, all verified on the engine
+.............................................
+
+- Unique clustered index must come first. On a valid view
+  definition, attempting CREATE NONCLUSTERED INDEX before any
+  clustered index fails with Msg 1940 — Cannot create index on
+  view 'Mkt.RevenueByProduce'. It does not have a unique clustered
+  index. Nonclustered indexes are allowed only after the unique
+  clustered one exists.
+- One-part names don't just "work anyway." Writing FROM OrderLine
+  inside the schemabound view fails at CREATE VIEW time (not at
+  index time) with Msg 4512 — Cannot schema bind view
+  'Mkt.RevenueByProduce' because name 'OrderLine' is invalid for
+  schema binding. Names must be in two-part format and an object
+  cannot reference itself.
+- SET options matter. The same scripts run from a legacy session
+  with QUOTED_IDENTIFIER OFF (the default of classic sqlcmd
+  without -I) fail with Msg 1935 — Cannot create index. Object
+  'RevenueByProduce' was created with the following SET options
+  off: 'QUOTED_IDENTIFIER'. Indexed views require the ANSI session
+  settings (QUOTED_IDENTIFIER ON, ANSI_NULLS ON, etc.) both when
+  the view is created and when the index is created.
+- NOEXPAND. Historically only Enterprise Edition's optimizer
+  matched queries to an indexed view automatically; on other
+  editions you had to reference the view with WITH (NOEXPAND) to
+  use its index. On the test instance (Developer edition with
+  Standard feature set), SELECT ... FROM Mkt.RevenueByProduce
+  ORDER BY ProduceID without the hint produces a plan that expands
+  the view and re-aggregates Mkt.OrderLine (Clustered Index Scan
+  of PK_OrderLine + Stream Aggregate), while adding WITH (NOEXPAND)
+  produces a single ordered Clustered Index Scan of
+  IX_RevenueByProduce. The materialized rows are maintained on
+  every DML either way — the hint only controls whether reads use
+  them.
+
+Equivalent alternatives
+.......................
+
+For option c, the index key could equivalently be declared with an
+explicit name-only variation (any index name works), and
+SUM(ISNULL(...)) wrapping is unnecessary here because both columns
+are NOT NULL — a SUM over a nullable expression would be another
+disqualifier.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Checklist for an indexable aggregate view — every item is enforced
+with its own error:
+
+WITH SCHEMABINDING                 (else Msg 1939 at CREATE INDEX)
+two-part names inside the view     (else Msg 4512 at CREATE VIEW)
+GROUP BY  =>  COUNT_BIG(*)         (else Msg 10136; COUNT is not enough)
+no OUTER joins                     (else Msg 10113)
+deterministic, precise, non-null-aggregated expressions
+ANSI SET options ON at both CREATEs (else Msg 1935)
+FIRST index = UNIQUE CLUSTERED on the GROUP BY key (else Msg 1940)
+
+After the unique clustered index exists, the engine maintains the
+view automatically on every DML against the base tables (that
+maintenance cost is the price you pay). Reading through the index
+is guaranteed with WITH (NOEXPAND); automatic view matching without
+the hint is an optimizer feature of Enterprise-class editions.

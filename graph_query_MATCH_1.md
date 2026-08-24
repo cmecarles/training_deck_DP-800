@@ -1,0 +1,195 @@
+# SQL Server question — Graph query MATCH 1
+
+## Statement
+
+`ConfGraph` models the collaboration network of a tech conference as a SQL Server graph database. Speakers present sessions, and senior speakers mentor junior ones. The organizers want to answer questions such as "who co-presents with whom?" and "which mentorship chains exist?" using the `MATCH` clause.
+
+The following session is executed exactly as shown, from database creation onward:
+
+```sql
+CREATE DATABASE ConfGraph;
+GO
+USE ConfGraph;
+GO
+CREATE SCHEMA Net;
+GO
+CREATE TABLE Net.Speaker
+(
+    SpeakerID   INT          NOT NULL PRIMARY KEY,
+    SpeakerName NVARCHAR(40) NOT NULL
+) AS NODE;
+GO
+CREATE TABLE Net.Session
+(
+    SessionID INT          NOT NULL PRIMARY KEY,
+    Title     NVARCHAR(60) NOT NULL
+) AS NODE;
+GO
+CREATE TABLE Net.SpeaksAt AS EDGE;
+GO
+CREATE TABLE Net.Mentors AS EDGE;
+GO
+INSERT INTO Net.Speaker (SpeakerID, SpeakerName) VALUES
+  (1, N'Ada'), (2, N'Bram'), (3, N'Chen'), (4, N'Dana'), (5, N'Elif');
+GO
+INSERT INTO Net.Session (SessionID, Title) VALUES
+  (10, N'Graph Deep Dive'), (20, N'Vector Search'), (30, N'Edge AI');
+GO
+-- A speaker SpeaksAt a session: edge direction is speaker -> session.
+INSERT INTO Net.SpeaksAt ($from_id, $to_id) VALUES
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 1), (SELECT $node_id FROM Net.Session WHERE SessionID = 10)),
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 2), (SELECT $node_id FROM Net.Session WHERE SessionID = 10)),
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 1), (SELECT $node_id FROM Net.Session WHERE SessionID = 20)),
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 3), (SELECT $node_id FROM Net.Session WHERE SessionID = 20)),
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 4), (SELECT $node_id FROM Net.Session WHERE SessionID = 30));
+GO
+-- X Mentors Y: edge direction is mentor -> mentee.
+INSERT INTO Net.Mentors ($from_id, $to_id) VALUES
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 1), (SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 2)),
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 2), (SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 3)),
+  ((SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 4), (SELECT $node_id FROM Net.Speaker WHERE SpeakerID = 5));
+GO
+```
+
+In prose, the graph is:
+
+```text
+SpeaksAt:  Ada -> Graph Deep Dive     Mentors:  Ada  -> Bram
+           Bram -> Graph Deep Dive              Bram -> Chen
+           Ada -> Vector Search                 Dana -> Elif
+           Chen -> Vector Search
+           Dana -> Edge AI
+```
+
+Then three queries are run.
+
+**Query 1 — co-presenters:**
+
+```sql
+SELECT s1.SpeakerName AS SpeakerA,
+       sess.Title     AS SessionTitle,
+       s2.SpeakerName AS SpeakerB
+FROM Net.Speaker  AS s1,
+     Net.SpeaksAt AS sa1,
+     Net.Session  AS sess,
+     Net.SpeaksAt AS sa2,
+     Net.Speaker  AS s2
+WHERE MATCH(s1-(sa1)->sess<-(sa2)-s2)
+  AND s1.SpeakerName < s2.SpeakerName
+ORDER BY sess.Title, s1.SpeakerName;
+```
+
+**Query 2:**
+
+```sql
+SELECT s2.SpeakerName AS Person
+FROM Net.Speaker AS s1,
+     Net.Mentors AS m,
+     Net.Speaker AS s2
+WHERE MATCH(s2<-(m)-s1)
+  AND s1.SpeakerName = N'Ada'
+ORDER BY Person;
+```
+
+**Query 3 — two-hop chains:**
+
+```sql
+SELECT a.SpeakerName AS Mentor,
+       b.SpeakerName AS Intermediate,
+       c.SpeakerName AS GrandMentee
+FROM Net.Speaker AS a,
+     Net.Mentors AS m1,
+     Net.Speaker AS b,
+     Net.Mentors AS m2,
+     Net.Speaker AS c
+WHERE MATCH(a-(m1)->b-(m2)->c)
+ORDER BY Mentor;
+```
+
+Predict the **exact** rows each query returns, in order. In particular, decide carefully whether Query 2 returns the people **Ada mentors** or the people **who mentor Ada**.
+
+## Correct Answer
+
+**Query 1 returns exactly 2 rows** (output captured from a SQL Server 2025 RTM instance):
+
+| SpeakerA | SessionTitle    | SpeakerB |
+|----------|-----------------|----------|
+| Ada      | Graph Deep Dive | Bram     |
+| Ada      | Vector Search   | Chen     |
+
+**Query 2 returns exactly 1 row:**
+
+| Person |
+|--------|
+| Bram   |
+
+Query 2 returns the person **Ada mentors** — not Ada's mentor. `MATCH(s2<-(m)-s1)` is the same pattern as `MATCH(s1-(m)->s2)`, merely written right-to-left: the arrow still leaves `s1` and enters `s2`, so `s1` (fixed to Ada) is the `$from_id` end (the mentor) and `s2` is the `$to_id` end (the mentee).
+
+**Query 3 returns exactly 1 row:**
+
+| Mentor | Intermediate | GrandMentee |
+|--------|--------------|-------------|
+| Ada    | Bram         | Chen        |
+
+## Explanation
+
+### Reading the ASCII-art arrows
+
+In a `MATCH` pattern, `nodeX-(edgeAlias)->nodeY` asserts that the edge row bound to `edgeAlias` has `$from_id` = `nodeX`'s `$node_id` and `$to_id` = `nodeY`'s `$node_id`. The pattern can be written in either direction on the page:
+
+```text
+s1-(m)->s2      and      s2<-(m)-s1      are the SAME assertion:
+                                          m.$from_id = s1, m.$to_id = s2
+```
+
+What matters is which node the arrowhead **points into** (`$to_id`) and which node the plain dash **leaves** (`$from_id`) — never left-to-right reading order. Every node and edge alias used in the pattern must also appear in the `FROM` clause (here in the old-style comma-separated form, which is what `MATCH` requires), and `MATCH` may only appear in `WHERE` (or in graph DML search conditions), combined with other predicates using `AND` — not `OR` or `NOT`.
+
+### Query 1 — two edges converging on one node
+
+`MATCH(s1-(sa1)->sess<-(sa2)-s2)` binds two *distinct aliases* of the `SpeaksAt` edge table so both arrows can point into the same session node: `sa1` goes `s1 -> sess` and `sa2` goes `s2 -> sess`. Enumerating:
+
+- `Graph Deep Dive` is spoken at by Ada and Bram.
+- `Vector Search` is spoken at by Ada and Chen.
+- `Edge AI` is spoken at by Dana alone.
+
+Without the `s1.SpeakerName < s2.SpeakerName` predicate this query returns **9 rows** (verified on the engine): each genuine pair appears twice, once per direction — `(Ada, Bram)` and `(Bram, Ada)` — and, more subtly, every speaker also pairs **with themselves** — `(Ada, Ada)`, `(Bram, Bram)`, `(Chen, Chen)`, and even `(Dana, Dana)` for the solo session — because nothing stops `sa1` and `sa2` from binding to the *same* edge row. The `<` predicate kills both problems at once: it removes self-pairs (a name is never `<` itself) and keeps exactly one orientation of each real pair. Two rows survive, ordered by session title: `(Ada, Graph Deep Dive, Bram)`, then `(Ada, Vector Search, Chen)`.
+
+### Query 2 — the directionality trap
+
+A hurried reader parses `MATCH(s2<-(m)-s1) AND s1.SpeakerName = N'Ada'` left to right as "s2 points at Ada", concludes the query finds **Ada's mentors**, and answers *empty result* — after all, nobody mentors Ada in the data (a query that genuinely asks for Ada's mentors, `MATCH(s1-(m)->s2) AND s2.SpeakerName = N'Ada'`, was run against this database and returned **0 rows**).
+
+But the arrow in `s2<-(m)-s1` leaves `s1` and enters `s2`. With `s1` fixed to Ada, the pattern asks for edges whose `$from_id` is Ada — the `Mentors` edge `Ada -> Bram`. So `s2` binds to Bram, the mentee, and the query returns one row: `Bram`.
+
+### Query 3 — a multi-hop chain
+
+`MATCH(a-(m1)->b-(m2)->c)` chains two hops: an edge from `a` to `b` and another edge from `b` to `c`, where `b` is the shared middle node. Only one composition exists in the data: `Ada -> Bram` followed by `Bram -> Chen`. `Dana -> Elif` has no outgoing edge from Elif to extend it, so no second row appears. Result: `(Ada, Bram, Chen)`.
+
+Note the multi-hop pattern needs *every* intermediate node and edge listed in `FROM` (five aliases here). For paths of arbitrary length, SQL Server offers `SHORTEST_PATH` with quantifiers such as `(-(m)->Speaker)+` inside `MATCH` — not tested here.
+
+### Why the queries never display $node_id, $from_id, or $edge_id
+
+Node tables get an implicit `$node_id` pseudo-column and edge tables get `$edge_id`, `$from_id`, `$to_id`. Their values are JSON strings containing internal object ids and graph ids that differ between databases and even between runs of the same script — they are **not** stable, portable values. That is why the `INSERT` statements populate `$from_id`/`$to_id` from subqueries that select `$node_id` by business key, and why the `SELECT` lists project only regular columns (`SpeakerName`, `Title`): only those make the output deterministic.
+
+### Equivalent alternatives
+
+- Query 2 rewritten as `WHERE MATCH(s1-(m)->s2) AND s1.SpeakerName = N'Ada'` is identical — same assertion, written left-to-right.
+- Query 1's pattern can be split as `MATCH(s1-(sa1)->sess AND s2-(sa2)->sess)` — two arcs combined with `AND` inside `MATCH` — with the same result.
+- Pre-2017-style equivalents joining on `$from_id = $node_id` by hand work but are exactly what `MATCH` exists to replace.
+
+## DP-800 Exam Rule to Remember
+
+SQL Graph in three lines of syntax:
+
+```text
+CREATE TABLE ... AS NODE;              -- gets $node_id
+CREATE TABLE ... AS EDGE;              -- gets $edge_id, $from_id, $to_id
+WHERE MATCH(a-(e)->b)                  -- e.$from_id = a, e.$to_id = b
+```
+
+Rules that decide exam answers:
+
+1. **The arrowhead marks `$to_id`; reading direction on the page is irrelevant.** `a-(e)->b` and `b<-(e)-a` are the same pattern. Always re-draw the pattern as `from -> to` before answering.
+2. Edges are **directed**; inserting `A -> B` does not imply `B -> A`.
+3. Edge rows are inserted by supplying `$node_id` values into `$from_id` and `$to_id` (typically via `SELECT $node_id ... WHERE <business key>`), never by typing literal ids — the pseudo-column values are nondeterministic JSON strings.
+4. Every node/edge alias in a `MATCH` pattern must be listed in the `FROM` clause; `MATCH` lives in `WHERE` and combines with other predicates only via `AND`.
+5. Two edge aliases in one pattern **can bind to the same edge row** — patterns like co-presenter queries return self-pairs and mirrored duplicates unless you add a tie-breaker predicate such as `a.Name < b.Name`.

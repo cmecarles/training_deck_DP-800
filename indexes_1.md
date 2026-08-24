@@ -1,0 +1,177 @@
+# SQL Server question — Nonclustered Indexes 1
+
+## Statement
+
+`PageTurner` is the database behind an online second-hand bookstore. Its search page is powered by the table below, which currently has **no index other than the clustered primary key**:
+
+```sql
+CREATE DATABASE PageTurner;
+GO
+USE PageTurner;
+GO
+CREATE SCHEMA Shop;
+GO
+CREATE TABLE Shop.Listings
+(
+    ListingID  INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_Listings PRIMARY KEY,
+    ISBN13     CHAR(13)      NOT NULL,
+    Title      NVARCHAR(120) NOT NULL,
+    CategoryID INT           NOT NULL,
+    Condition  NVARCHAR(12)  NOT NULL,
+    Price      DECIMAL(4,2)  NOT NULL,
+    ListedOn   DATE          NOT NULL,
+    IsSold     BIT           NOT NULL CONSTRAINT DF_Listings_IsSold DEFAULT (0)
+);
+GO
+-- 200,000 listings spread over 40 categories; prices run from 1.00 to 90.99
+;WITH N AS
+(
+    SELECT TOP (200000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+    FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b
+)
+INSERT Shop.Listings (ISBN13, Title, CategoryID, Condition, Price, ListedOn, IsSold)
+SELECT
+    RIGHT('9780000000000' + CAST(n AS varchar(13)), 13),
+    N'Used book #' + CAST(n AS nvarchar(10)),
+    (n % 40) + 1,
+    CASE n % 4 WHEN 0 THEN N'LikeNew' WHEN 1 THEN N'Good' WHEN 2 THEN N'Fair' ELSE N'Worn' END,
+    CAST(1 + (n % 9000) / 100.0 AS decimal(4,2)),
+    DATEADD(DAY, -(n % 900), '2026-08-01'),
+    CASE WHEN n % 5 = 0 THEN 1 ELSE 0 END
+FROM N;
+GO
+```
+
+The single hottest query is the "bargains in a category" search (here for category 7, which matches 805 of the 200,000 rows):
+
+```sql
+SELECT Title, Price, ListedOn
+FROM Shop.Listings
+WHERE CategoryID = 7
+  AND Price < 15.00
+ORDER BY Price;
+```
+
+You may create **exactly one** nonclustered index. The index must let the engine answer this exact query with a **single covering index seek**, meaning all three of the following, verifiable in the actual execution plan (for example with `SET STATISTICS PROFILE ON`):
+
+1. One `Index Seek` on the new index in which **both** `WHERE` conditions appear as **seek predicates** (`SEEK:(...)`), so the seek range contains only qualifying rows — no residual `WHERE:(...)` predicate discarding rows after they are read;
+2. **No access to the base table** — no `Key Lookup` into `PK_Listings`;
+3. **No `Sort` operator** — the seek must return the rows already ordered by `Price`.
+
+Which index definition meets all three requirements?
+
+### a.
+
+```sql
+CREATE NONCLUSTERED INDEX IX_Listings_Search
+    ON Shop.Listings (Price, CategoryID)
+    INCLUDE (Title, ListedOn);
+```
+
+### b.
+
+```sql
+CREATE NONCLUSTERED INDEX IX_Listings_Search
+    ON Shop.Listings (CategoryID, Price)
+    INCLUDE (Title, ListedOn);
+```
+
+### c.
+
+```sql
+CREATE NONCLUSTERED INDEX IX_Listings_Search
+    ON Shop.Listings (CategoryID)
+    INCLUDE (Price, Title, ListedOn);
+```
+
+### d.
+
+```sql
+CREATE NONCLUSTERED INDEX IX_Listings_Search
+    ON Shop.Listings (CategoryID, Price);
+```
+
+## Correct Answer
+
+**b**
+
+## Explanation
+
+The four options are deliberately built from the same ingredients — the two predicate columns and the two returned columns — and differ only in *where* each column sits: leading key, trailing key, or `INCLUDE`. That placement is the whole question:
+
+- **Key columns** define the sort order of the index and are the only columns the storage engine can *seek* on and the only order it can return rows in without sorting.
+- **`INCLUDE` (nonkey) columns** are stored in the leaf level only. They can make an index *covering* (requirement 2) and can be checked by a residual predicate, but they can never define a seek range and never contribute ordering.
+- Within the key, a **seek** can consume the leading equality columns plus **one** trailing range condition. A range on the *first* key column ends the usable seek chain immediately: everything after it degrades to a residual predicate.
+
+The canonical composite key for this query is therefore *equality column first, range column second*: `(CategoryID, Price)`. All four plans below were captured from actual runs against the script above on SQL Server 2025 (`SET STATISTICS PROFILE ON`, `SET STATISTICS IO ON`; three-part column names shortened, and `OPTION (RECOMPILE)` appended in the capture runs so literal values appear in the plan text instead of auto-parameterization markers — the plan shapes are identical either way).
+
+### Why option b is correct
+
+```text
+Index Seek(OBJECT:(IX_Listings_Search),
+           SEEK:(CategoryID=(7) AND Price < (15.00)) ORDERED FORWARD)
+```
+
+One operator, and it satisfies every requirement:
+
+1. Both conditions are inside `SEEK:(...)`. The seek descends to `(CategoryID = 7, Price = MIN)` and reads forward only while `Price < 15.00` within category 7 — exactly the 805 qualifying rows, no residual predicate.
+2. `Title` and `ListedOn` are in the leaf via `INCLUDE`, so the index covers the `SELECT` list; there is no `Key Lookup`.
+3. Within `CategoryID = 7`, rows are stored in `Price` order, so `ORDER BY Price` is satisfied by the seek itself (`ORDERED FORWARD`) — no `Sort`.
+
+Measured cost: **10 logical reads**.
+
+Equivalent correct alternatives (not offered as options): the same definition with the `INCLUDE` list written as `(ListedOn, Title)` — the order of included columns is irrelevant, they are unordered leaf payload; and the all-key variant `(CategoryID, Price, Title, ListedOn)`, which also produces the same covering seek but is inferior practice — `Title`/`ListedOn` would bloat the non-leaf levels and be subject to key-size and key-column restrictions for no benefit, which is precisely what `INCLUDE` exists to avoid.
+
+### Why option a is wrong
+
+`(Price, CategoryID) INCLUDE (Title, ListedOn)` — same columns, key order reversed. The actual plan:
+
+```text
+Index Seek(OBJECT:(IX_Listings_Search),
+           SEEK:(Price < (15.00)),
+           WHERE:(CategoryID=(7)) ORDERED FORWARD)
+```
+
+This is the subtle distractor: it *is* a covering `Index Seek` with no lookup and no `Sort` (the leading key is `Price`, so the output is already price-ordered). But the range condition sits on the **first** key column, so the seek range is `Price < 15.00` across **all 40 categories** — 32,199 rows — and `CategoryID = 7` is applied as a residual `WHERE:(...)` predicate that throws away 31,394 of them after reading. Requirement 1 explicitly fails. Measured cost: **238 logical reads**, about 24 times option b.
+
+### Why option c is wrong
+
+`(CategoryID) INCLUDE (Price, Title, ListedOn)` puts the range column in `INCLUDE`. Included columns cannot be seek predicates and carry no order, so the actual plan is:
+
+```text
+Sort(ORDER BY:(Price ASC))
+  |--Index Seek(OBJECT:(IX_Listings_Search),
+                SEEK:(CategoryID=(7)),
+                WHERE:(Price<(15.00)) ORDERED FORWARD)
+```
+
+Two failures: `Price < 15.00` is a residual predicate over all 5,000 category-7 rows (requirement 1), and an explicit `Sort` operator is needed for `ORDER BY Price` (requirement 3). It does cover the query — no lookup — but covering alone is not what was asked.
+
+### Why option d is wrong
+
+`(CategoryID, Price)` has the perfect key but no `INCLUDE`, so `Title` and `ListedOn` live only in the base table and the index does not cover the query. Left to itself, the optimizer refused the index entirely and produced:
+
+```text
+Sort(ORDER BY:(Price ASC))
+  |--Clustered Index Scan(OBJECT:(PK_Listings),
+                          WHERE:(CategoryID=(7) AND Price<(15.00)))
+```
+
+Forcing the index with `WITH (INDEX(IX_Listings_Search))` shows why it refused: a seek on the 805 qualifying rows followed by **805 `Key Lookup` executions** into `PK_Listings` (`Clustered Index Seek ... LOOKUP`, executed 805 times) — **2,480 logical reads** versus 10 for option b. Either way, requirement 2 fails.
+
+## DP-800 Exam Rule to Remember
+
+Placement inside a nonclustered index is a three-tier hierarchy, and each tier can do strictly less:
+
+```text
+KEY, leading equality columns   → seekable, ordered
+KEY, one trailing range column  → still seekable; ends the seek chain
+INCLUDE                         → covering payload only: no seek, no order
+```
+
+Design recipe for a covering seek: equality predicates first in the key, then the (single) range/`ORDER BY` column, then everything merely `SELECT`ed into `INCLUDE`. Verify with the plan, not with intuition: seek predicates appear under `SEEK:(...)`, residual filtering under `WHERE:(...)`, and a leftover `Sort` or `Key Lookup` names the tier you got wrong.
+
+Two adjacent facts the exam likes:
+
+- A **filtered index** (`CREATE INDEX ... WHERE IsSold = 0`) could shrink this index further because the shop only searches unsold books — but the query must then contain the filter predicate (`AND IsSold = 0`) for the optimizer to match it, and parameterized predicates on the filtered column may prevent matching.
+- A **`UNIQUE` nonclustered index** is both a constraint and an index: when a column really is unique, declaring it gives the optimizer free information for better plans. It would be wrong here — `(CategoryID, Price)` is obviously not unique — and remember that `INCLUDE` columns never participate in the uniqueness check; only key columns do.
