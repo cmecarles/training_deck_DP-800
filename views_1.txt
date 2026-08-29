@@ -99,39 +99,51 @@ Stmt | Outcome  | Detail
 -----+----------+----------------------------------------------------
 S1   | Succeeds | (1 rows affected) — row (110) inserted; Seats
      |          | filled by its default (30)
+-----+----------+----------------------------------------------------
 S2   | Fails    | Msg 550 — The attempted insert or update failed
      |          | because the target view either specifies WITH CHECK
      |          | OPTION or spans a view that specifies WITH CHECK
      |          | OPTION and one or more rows resulting from the
      |          | operation did not qualify under the CHECK OPTION
      |          | constraint.
+-----+----------+----------------------------------------------------
 S3   | Fails    | Msg 550 — same message: the updated row
      |          | (Credits = 5) would leave the view
+-----+----------+----------------------------------------------------
 S4   | Succeeds | (0 rows affected) — course 301 is not visible
      |          | through the view (6 credits), so nothing matches
+-----+----------+----------------------------------------------------
 S5   | Succeeds | (1 rows affected) — Credits = 2 still satisfies
      |          | the view's predicate
+-----+----------+----------------------------------------------------
 S6   | Fails    | Msg 5074 — The object 'CoreCatalog' is dependent
      |          | on column 'Title'. followed by Msg 4922 — ALTER
      |          | TABLE ALTER COLUMN Title failed because one or
      |          | more objects access this column.
+-----+----------+----------------------------------------------------
 S7   | Fails    | Msg 1033 — The ORDER BY clause is invalid in
      |          | views, inline functions, derived tables,
      |          | subqueries, and common table expressions, unless
      |          | TOP, OFFSET or FOR XML is also specified.
+-----+----------+----------------------------------------------------
 S8   | Fails    | Msg 4403 — Cannot update the view or function
      |          | 'Acad.DeptStats' because it contains aggregates,
      |          | or a DISTINCT or GROUP BY clause, or PIVOT or
      |          | UNPIVOT operator.
+
 
 Final contents of Acad.Course:
 
 CourseID | Dept | Title             | Credits | Seats
 ---------+------+-------------------+---------+------
 101      | CS   | Programming I     | 2       | 120
+---------+------+-------------------+---------+------
 102      | CS   | Databases         | 4       | 80
+---------+------+-------------------+---------+------
 110      | CS   | Operating Systems | 4       | 30
+---------+------+-------------------+---------+------
 205      | MATH | Linear Algebra    | 3       | 60
+---------+------+-------------------+---------+------
 301      | CS   | Compilers         | 6       | 40
 
 Only two DML statements changed data: S1 added course 110, and S5
