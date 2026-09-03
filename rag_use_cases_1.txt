@@ -1,0 +1,253 @@
+============================================================
+ SQL Server question — RAG use cases 1
+============================================================
+
+Statement
+---------
+
+A mid-sized law firm runs its practice-management data in an Azure
+SQL Database named LumenLegal. Relevant objects:
+
+CREATE SCHEMA Practice;
+GO
+CREATE TABLE Practice.Matter
+(
+    MatterId    int NOT NULL PRIMARY KEY,
+    ClientId    int NOT NULL,
+    BilledHours decimal(8,2) NOT NULL,
+    RatePerHour decimal(8,2) NOT NULL,
+    OpenedOn    date NOT NULL
+);
+
+CREATE TABLE Practice.ContractClause          -- ~50,000 rows, updated every day
+(
+    ClauseId    int NOT NULL PRIMARY KEY,
+    ContractNo  varchar(20) NOT NULL,
+    Heading     nvarchar(200) NOT NULL,
+    ClauseText  nvarchar(max) NOT NULL,
+    RevisedOn   datetime2(0) NOT NULL,
+    Embedding   vector(1536) NULL
+);
+
+CREATE TABLE Practice.IntakeForm
+(
+    FormId      int NOT NULL PRIMARY KEY,
+    SubmittedOn datetime2(0) NOT NULL,
+    FormText    nvarchar(max) NOT NULL          -- about two pages of text per form
+);
+
+The firm has an Azure OpenAI deployment with a chat model and an
+embeddings model, registered in the database as external models.
+The innovation team proposes four projects and asks the database
+team which one should be built as a RETRIEVAL-AUGMENTED GENERATION
+(RAG) pipeline — that is, retrieve relevant private data from
+LumenLegal at question time, place it in the prompt, and have the
+chat model answer from it.
+
+Constraints stated by the partners:
+
+- Answers about contracts must CITE THE EXACT CLAUSE (ContractNo,
+  ClauseId) they rely on, and must reflect revisions made THE SAME
+  DAY.
+- Anything that a deterministic query can answer must be answered
+  by the query; the firm does not want model cost or
+  non-determinism where none is needed.
+- Fine-tuning a model is acceptable only for STYLE/FORMAT goals,
+  never as a way to teach the model the firm's documents, because
+  documents change daily and fine-tuned knowledge cannot be cited
+  or revoked.
+
+Which project is the proper RAG use case?
+
+a.
+
+MONTHLY CLIENT STATEMENTS. For each client, compute total billed
+hours and total fees for the matters opened in the month
+(SUM(BilledHours), SUM(BilledHours * RatePerHour) grouped by
+ClientId), and produce the statement table.
+
+b.
+
+HOUSE-STYLE LETTER WRITER. Every outgoing letter drafted by
+associates must be rewritten in the firm's distinctive tone,
+structure and sign-off conventions; a curated set of 400 approved
+letters is available as examples. The letters do not reference the
+contract archive.
+
+c.
+
+CONTRACT-CLAUSE ASSISTANT. Attorneys ask free-text questions such
+as "Which of our supply contracts allow termination for
+convenience on less than 60 days' notice?" The assistant must
+answer from the firm's 50,000 private, daily-revised clauses in
+Practice.ContractClause and cite each clause it relied on.
+
+d.
+
+INTAKE-FORM SUMMARIZER. As each new Practice.IntakeForm row
+arrives, produce a five-line summary of that form's FormText for
+the intake coordinator. Each form is self-contained; nothing else
+needs to be consulted.
+
+Correct Answer
+--------------
+
+c
+
+Explanation
+-----------
+
+The correct answer is c.
+
+Identifying a RAG use case is an elimination exercise around one
+question: DOES ANSWERING REQUIRE KNOWLEDGE THAT IS (1) NOT IN THE
+MODEL, (2) TOO LARGE OR TOO VOLATILE TO PUT WHOLESALE IN EVERY
+PROMPT, AND (3) MUST BE TRACEABLE? If all three hold, you retrieve
+first and generate second. If the answer is deterministic, no
+model is needed; if the content fits in the prompt, no retrieval
+is needed; if the goal is how the model writes rather than what it
+knows, fine-tuning or few-shot prompting is the tool.
+
+Why option c is correct
+-----------------------
+
+- PRIVATE, PROPRIETARY KNOWLEDGE. The clauses are the firm's own
+  contracts; no foundation model has seen them. The only way the
+  model can answer accurately is to be handed the relevant clauses
+  at question time.
+- FRESHNESS. The archive is revised daily and answers must reflect
+  same-day revisions. Retrieval at query time (a vector search
+  over Embedding, optionally filtered by RevisedOn/ContractNo)
+  always reads the current row; a fine-tuned model would be stale
+  the moment a clause changed and cannot "unlearn" a revoked
+  clause.
+- CITATIONS AND GROUNDING. Because retrieval returns
+  ClauseId/ContractNo with each chunk, the prompt can instruct the
+  model to cite them and the application can verify the citation
+  against the database — the primary defence against
+  hallucination. Fine-tuned or prompt-only answers have nothing to
+  cite.
+- SCALE. Fifty thousand clauses cannot be placed in every prompt;
+  retrieval narrows them to the handful (top-k) that matter,
+  keeping token cost bounded.
+- NON-DETERMINISTIC QUESTION. "Allow termination for convenience
+  on less than 60 days' notice" is a semantic question over free
+  text; no SQL predicate expresses it. That is the gap RAG fills
+  between structured queries and generative answers.
+
+Why option a is wrong
+---------------------
+
+Monthly statements are a CLASSIC SQL REPORTING problem:
+SUM(BilledHours), SUM(BilledHours * RatePerHour), GROUP BY
+ClientId, filtered by OpenedOn. The answer is deterministic, must
+be exact to the cent, and is fully expressed by a query. Involving
+a language model adds cost, latency and the risk of arithmetic
+hallucination while providing nothing a GROUP BY does not. The
+partners' second constraint forbids it explicitly. (A model could
+later narrate the statement, but even then the numbers come from
+the query, not from retrieval.)
+
+Why option b is wrong
+---------------------
+
+The goal is STYLE AND FORMAT — tone, structure, sign-off — not
+knowledge. Nothing needs to be looked up: the letter's content is
+already in the associate's draft, and the archive is not involved.
+This is the textbook case for FINE-TUNING on the 400 approved
+letters (or, cheaper, few-shot prompting with several examples in
+the prompt). Building a RAG pipeline would retrieve "similar
+letters" that add tokens without adding facts, and the partners'
+third constraint reserves fine-tuning precisely for this kind of
+goal.
+
+Why option d is wrong
+---------------------
+
+This is the subtle distractor: it is legitimate generative-AI
+work, but it is PROMPT-ONLY, not RAG. Each form is self-contained
+and about two pages, so the entire input is simply placed in the
+prompt (FormText -> sp_invoke_external_rest_endpoint -> summary).
+There is nothing to retrieve: no search, no ranking, no external
+knowledge, no citation. Retrieval exists to select a small
+relevant subset from a large corpus; when the relevant text is
+already known and fits the context window, adding a vector index
+and a retrieval step is pure overhead. Watch for exam options that
+describe an LLM task and let you assume "LLM in the database"
+means RAG.
+
+The four projects side by side
+------------------------------
+
+Criterion    | a —          | b — house    | c — clause   | d — intake
+             | statements   | style        | assistant    | summary
+-------------+--------------+--------------+--------------+-------------
+Needs        | no (numbers  | no           | YES (private | no (text is
+knowledge    | come from    |              | contracts)   | in the
+the model    | rows)        |              |              | prompt)
+lacks?       |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+Knowledge    | n/a          | no           | YES (daily)  | n/a
+changes      |              |              |              |
+constantly?  |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+Must cite a  | no           | no           | YES          | no
+source row?  |              |              | (ContractNo, |
+             |              |              | ClauseId)    |
+-------------+--------------+--------------+--------------+-------------
+Input too    | n/a          | no           | YES (50,000  | no (two
+large for    |              |              | clauses)     | pages)
+one prompt?  |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+Deterministi | YES          | no           | no           | no
+c query      |              |              |              |
+answers it?  |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+Right tool   | T-SQL GROUP  | fine-tune /  | RAG          | prompt-only
+             | BY           | few-shot     |              |
+
+What the RAG pipeline for option c looks like in LumenLegal
+-----------------------------------------------------------
+
+-- 1. Embed the question with the registered embeddings model
+DECLARE @q vector(1536) = AI_GENERATE_EMBEDDINGS(
+    N'supply contracts that allow termination for convenience on less than 60 days notice'
+    USE MODEL ClauseEmbeddingModel);
+
+-- 2. Retrieve the top clauses (exact nearest-neighbour search; VECTOR_SEARCH for ANN)
+SELECT TOP (5) ClauseId, ContractNo, Heading, ClauseText,
+       VECTOR_DISTANCE('cosine', @q, Embedding) AS Distance
+FROM Practice.ContractClause
+WHERE RevisedOn >= DATEADD(year, -3, SYSUTCDATETIME())
+ORDER BY Distance;
+
+-- 3. Serialize the rows to JSON, build the chat payload with the clauses as grounding
+--    context and the instruction "cite ClauseId/ContractNo for every statement",
+--    call sys.sp_invoke_external_rest_endpoint, then extract $.result.choices[0].message.content.
+
+Because step 2 reads Practice.ContractClause at question time, a
+clause revised this morning (and re-embedded by the
+embedding-maintenance job) is already the version the model sees —
+no retraining, and every answer carries keys that the application
+can verify with a lookup.
+
+Conceptual question (Azure / architecture); not executed against
+an engine.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Can a deterministic query answer it exactly?        → SQL reporting, no model
+Is the goal HOW the model writes (tone, format)?    → fine-tune / few-shot prompt
+Is all the needed text already known and small?     → prompt-only (send it in the prompt)
+Is the knowledge private, large, changing, and must
+   the answer cite where it came from?              → RAG (retrieve → ground → generate)
+
+RAG's selling points are exactly the things fine-tuning and
+prompt-only cannot give: FRESHNESS (reads current rows),
+PROPRIETARY DATA (never trained on), CITATIONS/GROUNDING (return
+the key with the chunk), HALLUCINATION REDUCTION (answer only from
+supplied context) and BOUNDED COST (top-k instead of the whole
+corpus). When a scenario stresses "our documents", "updated
+daily", "must cite", it is RAG; when it stresses "our voice", it
+is fine-tuning; when it stresses "exact totals", it is SQL.

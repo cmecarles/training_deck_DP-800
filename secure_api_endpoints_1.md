@@ -1,0 +1,141 @@
+# SQL Server question — Secure API Endpoints 1
+
+## Statement
+
+A kayak-rental company exposes its Azure SQL Database `RiverRun` through **Data API builder (DAB) 2.0**, hosted in Azure Container Apps **without** the platform's built-in authentication feature; clients call DAB directly. The same DAB instance serves REST (`/api`), GraphQL (`/graphql`) and the MCP endpoint (`/mcp`), which an internal support agent uses.
+
+Two tables are exposed as entities:
+
+- `Fleet.Boats` → entity `Boat` (catalog; public information).
+- `Rental.Bookings` → entity `Booking`, with a column `CustomerOid UNIQUEIDENTIFIER` that stores the Microsoft Entra object id of the customer who made the booking.
+
+Requirements:
+
+1. Anyone, signed in or not, may **read** `Boat`. Nobody may modify boats through the API.
+2. A signed-in customer may read, update and delete **only their own** bookings, and create new ones. Identity must come from a **Microsoft Entra ID** access token validated by DAB in production.
+3. Staff with the Entra app role `support` may read **all** bookings.
+4. The MCP endpoint must let the support agent **read** bookings but must **never** create, update or delete anything, regardless of how a prompt is phrased.
+5. The configuration must run in `production` host mode.
+
+Which `dab-config.json` fragment satisfies every requirement?
+
+### a.
+
+```json
+{
+  "runtime": {
+    "host": {
+      "mode": "production",
+      "authentication": {
+        "provider": "EntraId",
+        "jwt": { "audience": "api://riverrun-api", "issuer": "https://login.microsoftonline.com/<tenant-id>/v2.0" }
+      }
+    },
+    "mcp": { "enabled": true, "path": "/mcp",
+             "dml-tools": { "describe-entities": true, "read-records": true, "aggregate-records": true,
+                            "create-record": false, "update-record": false, "delete-record": false, "execute-entity": false } }
+  },
+  "entities": {
+    "Boat": { "source": "Fleet.Boats",
+      "permissions": [ { "role": "anonymous", "actions": [ "read" ] } ] },
+    "Booking": { "source": "Rental.Bookings",
+      "permissions": [
+        { "role": "authenticated", "actions": [
+            "create",
+            { "action": "read",   "policy": { "database": "@item.CustomerOid eq @claims.oid" } },
+            { "action": "update", "policy": { "database": "@item.CustomerOid eq @claims.oid" } },
+            { "action": "delete", "policy": { "database": "@item.CustomerOid eq @claims.oid" } } ] },
+        { "role": "support", "actions": [ "read" ] } ] }
+  }
+}
+```
+
+### b.
+
+Same `entities` as option a, but with the host configured for local testing so that no identity provider has to be registered:
+
+```json
+"runtime": { "host": { "mode": "production", "authentication": { "provider": "Simulator" } },
+             "mcp": { "enabled": true } }
+```
+
+Clients select their role with the `X-MS-API-ROLE` header (`support` for staff), and customers send their object id in a custom header that the policy compares with `@item.CustomerOid`.
+
+### c.
+
+Same `runtime` as option a, but simpler entity permissions:
+
+```json
+"Boat":    { "source": "Fleet.Boats",
+             "permissions": [ { "role": "anonymous", "actions": [ "read" ] } ] },
+"Booking": { "source": "Rental.Bookings",
+             "permissions": [ { "role": "anonymous", "actions": [ "*" ] },
+                              { "role": "support",   "actions": [ "read" ] } ] }
+```
+
+The web front end filters bookings by the signed-in user before displaying them, and the MCP `dml-tools` default (`true`) is kept because the support agent's system prompt says "read-only".
+
+### d.
+
+Same `entities` and `mcp` section as option a, but with
+
+```json
+"runtime": { "host": { "mode": "production",
+                       "authentication": { "provider": "AppService",
+                                           "jwt": { "audience": "api://riverrun-api",
+                                                    "issuer": "https://login.microsoftonline.com/<tenant-id>/v2.0" } } } }
+```
+
+so that DAB reads the caller's identity from the `X-MS-CLIENT-PRINCIPAL` header that the client includes with each request.
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+DAB's security model has two layers that the question mixes on purpose: **authentication** (`runtime.host.authentication.provider`, which decides *who* the caller is) and **authorization** (each entity's `permissions`, which decide *what a role may do*, optionally narrowed by field lists and database policies). Every endpoint — REST, GraphQL and MCP — goes through the same two layers.
+
+### Why option a is correct
+
+- **Provider `EntraId` with `jwt`.** Requirement 2 asks DAB to validate Entra tokens itself. `EntraId` (formerly `AzureAD`; the old name still works) "Validates JWT tokens issued by Microsoft Entra ID"; the `jwt` object with **both** `audience` and `issuer` is required for the `EntraId`/`AzureAD`/`Custom` providers. In `production` mode this is a supported configuration.
+- **Roles.** A request with no valid bearer token runs as the system role `anonymous`; a valid token without `X-MS-API-ROLE` runs as `authenticated`; a token *plus* `X-MS-API-ROLE: support` runs as `support` **only if** the token's `roles` claim contains `support` (otherwise `403 Forbidden`). `Boat` grants `read` to `anonymous` — and with DAB 2.0 role inheritance (`named-role → authenticated → anonymous`), `authenticated` and `support` inherit that read. No `create`/`update`/`delete` is granted to anyone on `Boat`, and "By default, an entity has no permissions configured, which means no one can access the entity" — requirement 1.
+- **Item-level security through database policies.** `@item.CustomerOid eq @claims.oid` is translated into a predicate that the **database** evaluates; the `oid` claim comes from the validated token, so a customer cannot forge it. Policies are supported on `read`, `update` and `delete` — exactly the three actions the option restricts — and **not** on `create` (or `execute`), which is why `create` is listed without a policy. Requirement 2 satisfied.
+- **`support` reads everything.** The `support` role has an unconditional `read`; staff must send `X-MS-API-ROLE: support`, because DAB evaluates a request "in the context of exactly one effective role". Requirement 3.
+- **MCP tools are governed twice.** MCP requests carry the same bearer token and header, and the same entity permissions apply — but requirement 4 says *never*, "regardless of how a prompt is phrased". Turning `create-record`, `update-record`, `delete-record` and `execute-entity` **off** under `runtime.mcp.dml-tools` means those tools "never appear in the MCP `tools/list` response and can't be invoked, regardless of entity-level permissions". A prompt cannot call a tool that does not exist. Requirement 4.
+
+### Why option b is wrong
+
+`Simulator` "treats every request as authenticated" without validating any token — it is documented as **development-only**: "Never use it in production—it bypasses all real authentication", and "The Simulator provider only works when `runtime.host.mode` is `development`. DAB fails to start if Simulator is configured in production mode." So the fragment does not even start (requirement 5), and if the mode were changed it would let any caller claim `X-MS-API-ROLE: support` and read every booking. The custom-header idea is equally broken: `@claims.*` values come from the validated token, not from arbitrary request headers, and Simulator has "no custom claims" support at all.
+
+### Why option c is wrong
+
+`{"role": "anonymous", "actions": ["*"]}` on `Booking` grants create, read, update and delete to **unauthenticated** callers — and, through role inheritance, to every other role. Filtering in the front end is not security: anyone can call `GET /api/Booking` or the GraphQL endpoint directly and read, change or delete every booking. It also leaves the MCP `create_record`/`update_record`/`delete_record` tools enabled; a system prompt saying "read-only" is advice to the model, not enforcement, and prompt injection can override it. The only enforceable controls are the entity permissions, the database policies, and the `dml-tools` switches.
+
+### Why option d is wrong
+
+This is the subtle distractor. `AppService` is the **EasyAuth** provider: it "Trusts identity headers injected by Azure App Service EasyAuth" (`X-MS-CLIENT-PRINCIPAL`), on the assumption that the platform authenticated the caller *before* the request reached DAB and stripped any client-supplied copy of that header. The scenario explicitly hosts DAB **without** the built-in authentication feature, so the header is whatever the client sends — any caller can fabricate a principal with the `support` role and the `oid` of another customer. The `jwt` block does not rescue it: `AppService` does not validate bearer tokens; `jwt` is only consumed by the `EntraId`/`AzureAD`/`Custom` providers. Use `AppService` only when EasyAuth (App Service or Container Apps built-in auth) actually fronts the container.
+
+Conceptual question (Azure / tooling); not executed against an engine.
+
+## DP-800 Exam Rule to Remember
+
+```text
+runtime.host.authentication.provider
+  Unauthenticated (default) -> everyone is "anonymous"
+  StaticWebApps / AppService -> EasyAuth: trust X-MS-CLIENT-PRINCIPAL (ONLY behind the platform's auth)
+  EntraId (= AzureAD) / Custom -> validate Bearer JWT; "jwt": { "audience", "issuer" } REQUIRED
+  Simulator -> everyone authenticated, no token; development mode only, fails to start in production
+
+Effective role (exactly one per request):
+  no token -> anonymous | token -> authenticated | token + X-MS-API-ROLE: r -> r, iff r in token "roles" (else 403)
+  Inheritance (2.0): named-role -> authenticated -> anonymous.  No permissions = no access.
+
+entities.<E>.permissions[]: { "role", "actions": ["create","read","update","delete","execute","*"] }
+  fields.include/exclude = column-level;  policy.database = row-level predicate
+  "@item.<col> eq @claims.<claim>"  -> allowed on read/update/delete, NOT create/execute
+MCP (runtime.mcp): same auth + same entity permissions, plus hard switches
+  dml-tools.{describe-entities, read-records, aggregate-records, create-record, update-record, delete-record, execute-entity}
+  a disabled tool never appears in tools/list -> prompt injection cannot reach it
+"anonymous": ["*"] on a sensitive entity is never the answer; UI-side filtering is not security.
+```

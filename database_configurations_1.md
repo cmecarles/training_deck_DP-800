@@ -1,0 +1,143 @@
+# SQL Server question — Database Configurations 1
+
+## Statement
+
+An accounting SaaS runs about thirty customer databases on one SQL Server 2025 instance (Standard Developer Edition, 16 cores, instance-level `max degree of parallelism` = 0). One of them, `LedgerPulse`, was just migrated from a SQL Server 2014 server and, as part of the migration, upgraded to compatibility level 170:
+
+```sql
+CREATE DATABASE LedgerPulse;
+GO
+ALTER DATABASE LedgerPulse SET COMPATIBILITY_LEVEL = 170;
+GO
+USE LedgerPulse;
+GO
+SELECT configuration_id, name, value, is_value_default
+FROM sys.database_scoped_configurations
+WHERE name IN ('MAXDOP', 'LEGACY_CARDINALITY_ESTIMATION', 'PARAMETER_SNIFFING',
+               'OPTIMIZE_FOR_AD_HOC_WORKLOADS', 'PARAMETER_SENSITIVE_PLAN_OPTIMIZATION', 'DOP_FEEDBACK')
+ORDER BY configuration_id;
+```
+
+| configuration_id | name | value | is_value_default |
+|---|---|---|---|
+| 1 | MAXDOP | 0 | 1 |
+| 2 | LEGACY_CARDINALITY_ESTIMATION | 0 | 1 |
+| 3 | PARAMETER_SNIFFING | 1 | 1 |
+| 13 | OPTIMIZE_FOR_AD_HOC_WORKLOADS | 0 | 1 |
+| 28 | PARAMETER_SENSITIVE_PLAN_OPTIMIZATION | 1 | 1 |
+| 37 | DOP_FEEDBACK | 1 | 1 |
+
+After a week in production the team has collected four findings about `LedgerPulse`, and one hard constraint:
+
+1. The month-end consolidation query is 20x slower than on the old server. Comparing plans shows that the **new cardinality estimator** (the compatibility-level-170 model) badly misestimates a join in this query; the plan is the same for every parameter value, so it is not a parameter-sniffing problem. The other twenty-nine databases on the instance benefit from the new estimator and must keep it.
+2. The reporting tool used by this customer sends thousands of **single-use ad hoc statements**; `LedgerPulse` alone accounts for 2 GB of single-use plans in the plan cache.
+3. Dashboard **readers are blocked by writers** for seconds at a time. The application uses the default isolation level and cannot be changed (no `SET TRANSACTION ISOLATION LEVEL`, no hints).
+4. Report queries in `LedgerPulse` go parallel across all 16 cores and starve the other tenants; this customer's queries must be **limited to 4 cores**, while the other databases keep the instance default.
+5. Constraint: `LedgerPulse` must **stay at compatibility level 170** (its new stored procedures use `REGEXP_LIKE`), and **no instance-wide setting** may change.
+
+Which script addresses all four findings within the constraint?
+
+### a.
+
+```sql
+ALTER DATABASE LedgerPulse SET COMPATIBILITY_LEVEL = 120;
+EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'optimize for ad hoc workloads', 1; RECONFIGURE;
+EXEC sp_configure 'max degree of parallelism', 4; RECONFIGURE;
+ALTER DATABASE LedgerPulse SET ALLOW_SNAPSHOT_ISOLATION ON;
+```
+
+### b.
+
+```sql
+USE LedgerPulse;
+ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = ON;
+ALTER DATABASE SCOPED CONFIGURATION SET OPTIMIZE_FOR_AD_HOC_WORKLOADS = ON;
+ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4;
+ALTER DATABASE LedgerPulse SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+```
+
+### c.
+
+```sql
+DBCC TRACEON (9481, -1);
+USE LedgerPulse;
+ALTER DATABASE SCOPED CONFIGURATION SET OPTIMIZE_FOR_AD_HOC_WORKLOADS = ON;
+ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4;
+ALTER DATABASE LedgerPulse SET ALLOW_SNAPSHOT_ISOLATION ON;
+```
+
+### d.
+
+```sql
+USE LedgerPulse;
+ALTER DATABASE SCOPED CONFIGURATION SET PARAMETER_SNIFFING = OFF;
+ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4;
+ALTER DATABASE LedgerPulse SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON, CREATE_INDEX = ON);
+ALTER DATABASE LedgerPulse SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+```
+
+## Correct Answer
+
+**b**
+
+## Explanation
+
+The theme of this question is **scope**: every finding is about one database on a shared instance, so every knob must be a *database-scoped* one. SQL Server offers exactly that through `ALTER DATABASE SCOPED CONFIGURATION` (per-database optimizer and execution settings, visible in `sys.database_scoped_configurations`) and `ALTER DATABASE ... SET` (per-database options, visible in `sys.databases`). Instance-wide equivalents (`sp_configure`, global trace flags) exist for most of them and are the trap.
+
+### Why option b is correct
+
+Executed on SQL Server 2025; the catalog afterwards reads:
+
+| configuration_id | name | value | is_value_default |
+|---|---|---|---|
+| 1 | MAXDOP | 4 | 0 |
+| 2 | LEGACY_CARDINALITY_ESTIMATION | 1 | 0 |
+| 3 | PARAMETER_SNIFFING | 1 | 1 |
+| 13 | OPTIMIZE_FOR_AD_HOC_WORKLOADS | 1 | 0 |
+| 28 | PARAMETER_SENSITIVE_PLAN_OPTIMIZATION | 1 | 1 |
+| 37 | DOP_FEEDBACK | 1 | 1 |
+
+and `SELECT name, compatibility_level, is_read_committed_snapshot_on, snapshot_isolation_state_desc FROM sys.databases WHERE name = 'LedgerPulse'` returns `LedgerPulse | 170 | 1 | OFF`.
+
+- **Finding 1 — legacy CE for one database only.** `LEGACY_CARDINALITY_ESTIMATION = ON` makes the optimizer use the SQL Server 2012-era estimator for this database while the compatibility level stays 170, so `REGEXP_LIKE` and every other 170 feature keep working. The other databases keep the default (`0`) and the new estimator. (Per-query, the same effect is `OPTION (USE HINT ('FORCE_LEGACY_CARDINALITY_ESTIMATION'))` — but the scenario forbids touching the application.)
+- **Finding 2 — ad hoc plan bloat.** `OPTIMIZE_FOR_AD_HOC_WORKLOADS = ON` (a database-scoped option since SQL Server 2019) stores only a small compiled-plan stub on the first execution of a batch and the full plan only if it runs again. It is the per-database twin of the `sp_configure` option.
+- **Finding 3 — readers blocked by writers with no code change.** `READ_COMMITTED_SNAPSHOT ON` changes what the *default* isolation level (`READ COMMITTED`) does: readers get the last committed version of a row from the version store instead of waiting for the writer's X lock. The application keeps running at "read committed" and stops blocking. `WITH ROLLBACK IMMEDIATE` is needed because the option requires exclusive access to switch.
+- **Finding 4 — 4 cores for this database.** Database-scoped `MAXDOP = 4` caps parallelism for queries running in `LedgerPulse`; the instance value (`0`) still governs the others. (Values are validated: `SET MAXDOP = 100000` fails with `Msg 12108: '100000' is out of range for the database scoped configuration option 'MAXDOP'. See sp_configure option 'max degree of parallelism' for valid values.`)
+
+### Why option a is wrong
+
+It solves the CE problem by **dropping the compatibility level to 120** — the statement is accepted (SQL Server 2025 still supports level 120; `sys.databases` reports `120` afterwards) — but that violates constraint 5 outright: the database loses every 170 feature, including `REGEXP_LIKE`, and its procedures stop compiling. Both `sp_configure` changes are **instance-wide**, so `max degree of parallelism = 4` throttles all thirty tenants. And `ALLOW_SNAPSHOT_ISOLATION ON` only *permits* sessions that explicitly request `SNAPSHOT` isolation to use it; it does nothing for an application that stays at the default `READ COMMITTED`, so the readers keep blocking. Verified: after `ALLOW_SNAPSHOT_ISOLATION ON` the catalog shows `snapshot_isolation_state_desc = ON` but readers under default isolation still take shared locks.
+
+### Why option c is wrong
+
+This is the subtle distractor: trace flag 9481 does select the legacy cardinality estimator — but `DBCC TRACEON (9481, -1)` enables it **globally**, for every database on the instance, exactly what finding 1 forbids (and it is not persisted across restarts unless added as a startup parameter). The database-scoped configuration was introduced in SQL Server 2016 precisely to replace this trace flag with a per-database, persisted setting. Option c also repeats the `ALLOW_SNAPSHOT_ISOLATION` mistake of option a for finding 3.
+
+### Why option d is wrong
+
+- `PARAMETER_SNIFFING = OFF` makes every parameterized query optimize for the average density instead of the sniffed value. Finding 1 explicitly says the plan is the same for every parameter — the misestimate comes from the estimator model, not from sniffing — so this changes nothing for the report and can make other queries worse.
+- `AUTOMATIC_TUNING (... CREATE_INDEX = ON)` is not valid T-SQL on SQL Server: `CREATE_INDEX` and `DROP_INDEX` are **Azure SQL Database-only** automatic tuning options. Verified on SQL Server 2025: `Msg 102, Level 15, State 124: Incorrect syntax near 'CREATE_INDEX'.` Even the SQL Server-supported part, `FORCE_LAST_GOOD_PLAN`, fails on this edition — `Msg 15707: Automatic Tuning is available only in the Enterprise and Developer editions of SQL Server.` — and it requires Query Store to be on; on an eligible edition it would only revert *plan regressions detected by Query Store*, not fix a consistently bad estimate.
+- Nothing in option d addresses the ad hoc plan-cache bloat of finding 2.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+"One database on a shared instance" -> database-scoped, never instance-wide:
+
+ALTER DATABASE SCOPED CONFIGURATION SET ...   (sys.database_scoped_configurations)
+   MAXDOP | LEGACY_CARDINALITY_ESTIMATION | PARAMETER_SNIFFING | QUERY_OPTIMIZER_HOTFIXES
+   OPTIMIZE_FOR_AD_HOC_WORKLOADS | PARAMETER_SENSITIVE_PLAN_OPTIMIZATION | DOP_FEEDBACK
+   (+ FOR SECONDARY ... = PRIMARY for AG readable secondaries)
+
+ALTER DATABASE x SET ...                      (sys.databases)
+   COMPATIBILITY_LEVEL  -> feature surface + default CE model
+   READ_COMMITTED_SNAPSHOT ON  -> changes the DEFAULT level: no app change needed
+   ALLOW_SNAPSHOT_ISOLATION ON -> only enables explicit SNAPSHOT sessions
+   ACCELERATED_DATABASE_RECOVERY ON -> fast rollback/recovery, persistent version store
+   AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON)  -> needs Query Store
+                    (CREATE_INDEX / DROP_INDEX) -> Azure SQL Database only
+```
+
+Instance-wide look-alikes to rule out when the scenario says "this database only": `sp_configure 'max degree of parallelism'`, `sp_configure 'optimize for ad hoc workloads'`, `DBCC TRACEON (9481 / 4199, -1)`. And never buy "lower the compatibility level" as a fix when the scenario needs features of the current level — `LEGACY_CARDINALITY_ESTIMATION = ON` gives the old estimator without giving up the level.

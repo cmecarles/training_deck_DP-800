@@ -1,0 +1,163 @@
+# SQL Server question — Secrets and Branching 1
+
+## Statement
+
+A ride-sharing startup keeps the schema of its Azure SQL Database `FareSplit` in an SDK-style SQL Database Project in a GitHub repository. Deployments run from GitHub Actions with `azure/login` followed by `azure/sql-action`. The production database accepts Microsoft Entra authentication, and a user-assigned managed identity `id-faresplit-deploy` has been created in the subscription and granted `db_owner` on the database.
+
+The security review of the pipeline produced these requirements:
+
+1. The workflow must authenticate to Azure and to the database **without any long-lived credential** (no client secret, no SQL password) existing in GitHub or in the repository.
+2. Connection information must **never be committed** to the repository — not in the `.sqlproj`, not in a publish profile, not in the workflow YAML.
+3. Whatever secret material remains must be readable only by the job that deploys to production.
+4. Developers work on **feature branches** and merge into `main` through pull requests; the pipeline must deploy production only from `main`.
+
+While the review was in progress, two pull requests touched the same table. `main` already merged PR #41, which added a `SurgeMultiplier` column; PR #42 (branch `feature/tips`) adds a `TipAmount` column to the same table. GitHub reports that PR #42 **has conflicts that must be resolved**, and the file shows:
+
+```sql
+CREATE TABLE Fare.Trip
+(
+    TripId          INT           NOT NULL PRIMARY KEY,
+    BaseFare        DECIMAL(8,2)  NOT NULL,
+<<<<<<< HEAD
+    SurgeMultiplier DECIMAL(4,2)  NOT NULL CONSTRAINT DF_Trip_Surge DEFAULT (1.00)
+=======
+    TipAmount       DECIMAL(8,2)  NOT NULL CONSTRAINT DF_Trip_Tip DEFAULT (0)
+>>>>>>> feature/tips
+);
+```
+
+Which combination of pipeline configuration and conflict resolution satisfies all four requirements and lands **both** columns in `main`?
+
+### a.
+
+Create a service principal with a client secret, store its JSON in the repository secret `AZURE_CREDENTIALS`, and store the connection string in the repository secret `SQL_CONNECTION`:
+
+```yaml
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: azure/sql-action@v2.3
+        with:
+          connection-string: ${{ secrets.SQL_CONNECTION }}   # ...;User ID=deploy;Password=...;
+          path: ./FareSplit.sqlproj
+          action: publish
+```
+
+Resolve PR #42 by taking the version of the file from `main` (`git checkout main -- Fare/Tables/Trip.sql`), committing, and merging.
+
+### b.
+
+Configure a **federated identity credential** on `id-faresplit-deploy` trusting the repository's `production` environment (`subject = repo:faresplit/db:environment:production`), and store only identifiers as environment secrets:
+
+```yaml
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/sql-action@v2.3
+        with:
+          connection-string: ${{ secrets.SQL_CONNECTION }}
+          # Server=tcp:faresplit.database.windows.net,1433;Initial Catalog=FareSplit;Authentication=Active Directory Default;Encrypt=True;
+          path: ./FareSplit.sqlproj
+          action: publish
+```
+
+Resolve PR #42 on the feature branch by editing `Fare/Tables/Trip.sql` to keep both columns and remove the markers, running `dotnet build` to confirm the project still builds, committing, and pushing; the pull request checks re-run and the PR is merged when green.
+
+### c.
+
+Put the connection string, including the SQL login password, in `FareSplit.publish.xml` (`<TargetConnectionString>`) and reference the profile from the action, so no GitHub secret is needed at all; add the file to `.gitignore` afterwards:
+
+```yaml
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/sql-action@v2.3
+        with:
+          path: ./FareSplit.sqlproj
+          action: publish
+          arguments: /Profile:FareSplit.publish.xml
+```
+
+Resolve PR #42 by rebasing `feature/tips` onto `main`, dropping the conflicting commit from `main` during the rebase, and force-pushing `main`.
+
+### d.
+
+Use the same OpenID Connect login as option b, but store `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` and the connection string as repository **variables** (`${{ vars.SQL_CONNECTION }}`) so they are visible for troubleshooting, and trigger the deployment on `pull_request` so that reviewers see the production result before approving:
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+```
+
+Resolve PR #42 automatically with `git merge -X theirs main` on the feature branch.
+
+## Correct Answer
+
+**b**
+
+## Explanation
+
+The question combines the two "manage" bullets of the CI/CD epigraph: **secrets management** (how a workflow proves who it is and where connection details live) and **branching, pull requests and conflict resolution** (how changes reach `main`). Option b is the only one that is correct on both halves.
+
+### Why option b is correct
+
+- **No long-lived credential (requirement 1).** With OpenID Connect, GitHub issues a short-lived ID token to the job; `azure/login@v2` exchanges it for an Azure access token because a **federated identity credential** on the user-assigned managed identity (or an app registration) trusts tokens whose `subject` matches — here `repo:faresplit/db:environment:production`, so only jobs of that environment in that repository can use it (other subject forms: `...:ref:refs/heads/main`, `...:pull_request`). The workflow needs `permissions: id-token: write` to request the token. The values passed to `client-id`, `tenant-id` and `subscription-id` are identifiers, not secrets that grant access by themselves; there is no client secret to rotate or leak. The database connection then uses `Authentication=Active Directory Default`, which picks up the identity `azure/login` established — no `User ID`/`Password` in the connection string.
+- **Nothing committed (requirement 2).** The connection string lives in a GitHub secret, referenced as `${{ secrets.SQL_CONNECTION }}`; secrets are masked in logs and are never in the repository. The `.sqlproj` and any publish profile in git contain only schema settings.
+- **Scoped to the production job (requirement 3).** Secrets defined on the `production` **environment** are available only to jobs that declare `environment: production`, and environment secrets take precedence over repository and organization secrets of the same name. If the environment also has required reviewers, the job cannot even read them until it is approved.
+- **Only from `main`, via PRs (requirement 4).** `on: push: branches: [main]` deploys only when `main` changes, which — with branch protection requiring a pull request — happens only through reviewed merges; `workflow_dispatch` allows a deliberate manual re-run. This is the trunk-based flow: short-lived feature branches, pull request into `main`, `main` always deployable.
+- **Conflict resolution that keeps both changes.** A `.sql` object file in a SQL project is a declarative, whole-object definition, so a conflict is resolved like any source file: edit the file to the intended final state — both `SurgeMultiplier` and `TipAmount` — and delete the `<<<<<<< HEAD`, `=======` and `>>>>>>> feature/tips` markers (a leftover marker is a syntax error and the build fails, which is a useful safety net). Then `dotnet build` validates the merged object, the commit goes to the feature branch, and the PR's checks re-run before merge.
+
+### Why option a is wrong
+
+`azure/login` with `creds:` uses a service principal **client secret** stored in `AZURE_CREDENTIALS` — a long-lived credential that must be rotated and can be exfiltrated — and the connection string carries a **SQL password**; both violate requirement 1. Repository secrets are readable by any workflow in the repository, not only the production job (requirement 3). And the conflict "resolution" takes `main`'s version of the file wholesale: PR #42 merges, but `TipAmount` is silently gone.
+
+### Why option c is wrong
+
+This is the subtle distractor because it appears to remove secrets from GitHub entirely. It does so by **committing the password** inside `FareSplit.publish.xml`; adding the file to `.gitignore` afterwards does not remove it from the history, and the workflow needs it checked in to use it. That violates requirement 2 outright. `on: push` with no branch filter deploys production from *every* branch push (requirement 4). The rebase "resolution" **discards the `SurgeMultiplier` commit** and rewrites `main` with a force-push — which branch protection should forbid — losing PR #41's work.
+
+### Why option d is wrong
+
+Configuration **variables** (`vars` context) are not secrets: they are not masked in logs, so the connection string is printed in plain text in every run. Triggering production deployment on `pull_request` deploys **unreviewed** code from any open PR (requirement 4) — and for PRs from forks, secrets are not even passed to the workflow, so the design fails in both directions. `git merge -X theirs` resolves every conflicting hunk in favour of one side automatically; for this file it keeps `TipAmount` and drops `SurgeMultiplier` without anyone looking, which is exactly the outcome a conflict is meant to prevent.
+
+Conceptual question (Azure / tooling); not executed against an engine.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Authenticate without a stored secret:  federated identity credential + azure/login@v2 (client-id, tenant-id,
+    subscription-id) + permissions: id-token: write  ->  connection string with Authentication=Active Directory Default
+    (creds: JSON = client secret = long-lived; SQL password in the string = long-lived)
+Where things live:  secrets (masked; org < repo < environment precedence; environment secrets only for jobs with
+    environment: <name>; not passed to fork PRs)  vs  variables (vars: plain text, for non-sensitive config)
+    Never in git: connection strings, passwords, publish profiles with credentials.
+Branching:  feature branch -> pull request -> main (trunk); deploy on push to main / workflow_dispatch, never on pull_request.
+Conflict in a .sql object file:  edit to the intended final definition (usually both changes), remove <<<<<<< ======= >>>>>>>,
+    dotnet build to validate, commit to the feature branch, let checks re-run. Never -X theirs/ours or force-push main.
+```

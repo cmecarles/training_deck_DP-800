@@ -1,0 +1,244 @@
+============================================================
+ SQL Server question — JSON Type and Indexes 1
+============================================================
+
+Statement
+---------
+
+GadgetSpecs is the product-catalog database of an electronics
+retailer running SQL SERVER 2025 (compatibility level 170). Device
+specifications arrive as JSON documents with a variable set of
+keys, so the team compares the new native JSON data type with the
+classic nvarchar(max) + ISJSON approach, and then tries the
+indexing options.
+
+CREATE DATABASE GadgetSpecs;
+GO
+USE GadgetSpecs;
+GO
+CREATE SCHEMA Cat;
+GO
+CREATE TABLE Cat.Device
+(
+    DeviceID INT  NOT NULL PRIMARY KEY,
+    Spec     JSON NOT NULL
+);
+CREATE TABLE Cat.DeviceLegacy
+(
+    DeviceID INT           NOT NULL PRIMARY KEY,
+    Spec     NVARCHAR(MAX) NOT NULL CONSTRAINT CK_DeviceLegacy_Spec CHECK (ISJSON(Spec) = 1)
+);
+INSERT INTO Cat.Device (DeviceID, Spec) VALUES
+  (1, N'{"brand":"Axo","ram":8,"ports":["usb-c","hdmi"]}'),
+  (2, N'{"brand":"Brill","ram":16,"ports":["usb-c"]}'),
+  (3, N'{"brand":"Axo","ram":32}');
+GO
+
+The session runs with the default SET QUOTED_IDENTIFIER ON. The
+following ten statements are then executed IN ORDER, EACH IN ITS
+OWN BATCH:
+
+-- S1
+INSERT INTO Cat.Device (DeviceID, Spec) VALUES (4, N'{"brand":"Cobalt","ram":8');
+
+-- S2
+INSERT INTO Cat.DeviceLegacy (DeviceID, Spec) VALUES (4, N'{"brand":"Cobalt","ram":8');
+
+-- S3
+CREATE NONCLUSTERED INDEX IX_Device_Spec ON Cat.Device (Spec);
+
+-- S4
+CREATE JSON INDEX JX_Device_Spec ON Cat.Device (Spec);
+
+-- S5
+CREATE JSON INDEX JX_Device_Brand ON Cat.Device (Spec) FOR ('$.brand');
+
+-- S6
+CREATE JSON INDEX JX_DeviceLegacy_Spec ON Cat.DeviceLegacy (Spec);
+
+-- S7
+ALTER TABLE Cat.Device ADD Brand AS CAST(JSON_VALUE(Spec, '$.brand') AS NVARCHAR(40));
+CREATE NONCLUSTERED INDEX IX_Device_Brand ON Cat.Device (Brand);
+
+-- S8
+ALTER TABLE Cat.Device ADD RamGB AS CAST(JSON_VALUE(Spec, '$.ram') AS INT) PERSISTED;
+
+-- S9
+UPDATE Cat.Device SET Spec = JSON_MODIFY(Spec, '$.ram', 64) WHERE DeviceID = 3;
+UPDATE Cat.Device SET Spec = JSON_MODIFY(Spec, 'append $.ports', 'sd') WHERE DeviceID = 1;
+
+-- S10
+SELECT DeviceID FROM Cat.Device WHERE Spec = N'{"brand":"Axo","ram":64}';
+
+For each statement S1–S10, state whether it SUCCEEDS OR RAISES AN
+ERROR. Then give the exact result of these final queries:
+
+SELECT DeviceID, Spec, Brand, RamGB FROM Cat.Device ORDER BY DeviceID;
+
+SELECT name, type_desc FROM sys.indexes WHERE object_id = OBJECT_ID('Cat.Device') ORDER BY index_id;
+
+Correct Answer
+--------------
+
+Per-statement outcomes (all error numbers and messages are the
+engine's actual output):
+
+Stmt | Outcome  | Detail
+-----+----------+-----------------------------------------------------
+S1   | FAILS    | Msg 13609 — JSON text is not properly formatted.
+     |          | Unexpected character '.' is found at position 25. —
+     |          | the json type validates on assignment
+-----+----------+-----------------------------------------------------
+S2   | FAILS    | Msg 547 — The INSERT statement conflicted with the
+     |          | CHECK constraint "CK_DeviceLegacy_Spec". The
+     |          | conflict occurred in database "GadgetSpecs", table
+     |          | "Cat.DeviceLegacy", column 'Spec'.
+-----+----------+-----------------------------------------------------
+S3   | FAILS    | Msg 1978 — Column 'Spec' in table 'Cat.Device' is of
+     |          | a type that is invalid for use as a key column in an
+     |          | index or statistics.
+-----+----------+-----------------------------------------------------
+S4   | SUCCEEDS | JSON index created on the whole document (path $)
+-----+----------+-----------------------------------------------------
+S5   | FAILS    | Msg 13681 — A JSON index 'JX_Device_Spec' already
+     |          | exists on column 'Spec' on table 'Device', and
+     |          | multiple JSON indexes per column are not allowed.
+-----+----------+-----------------------------------------------------
+S6   | FAILS    | Msg 13680 — Column 'Spec' on table
+     |          | 'Cat.DeviceLegacy' is not of JSON data type, which
+     |          | is required to create a JSON index on it.
+-----+----------+-----------------------------------------------------
+S7   | SUCCEEDS | Computed column Brand plus a regular B-tree index on
+     |          | it
+-----+----------+-----------------------------------------------------
+S8   | SUCCEEDS | PERSISTED computed column (JSON_VALUE is
+     |          | deterministic)
+-----+----------+-----------------------------------------------------
+S9   | SUCCEEDS | Both updates affect 1 row; JSON_MODIFY accepts and
+     |          | returns json
+-----+----------+-----------------------------------------------------
+S10  | FAILS    | Msg 402 — The data types json and nvarchar are
+     |          | incompatible in the equal to operator.
+
+Final table contents:
+
+DeviceID | Spec                                        | Brand | RamGB
+---------+---------------------------------------------+-------+------
+1        | {"brand":"Axo","ram":8,"ports":["usb-c","hd | Axo   | 8
+         | mi","sd"]}                                  |       |
+---------+---------------------------------------------+-------+------
+2        | {"brand":"Brill","ram":16,"ports":["usb-c"] | Brill | 16
+         | }                                           |       |
+---------+---------------------------------------------+-------+------
+3        | {"brand":"Axo","ram":64}                    | Axo   | 64
+
+Indexes on Cat.Device:
+
+name                         | type_desc
+-----------------------------+-------------
+PK__Device__49E123314AFA9A0B | CLUSTERED
+IX_Device_Brand              | NONCLUSTERED
+JX_Device_Spec               | JSON
+
+(The system-generated PK name differs per run.)
+sys.json_index_paths lists one path, $, for JX_Device_Spec.
+
+Explanation
+-----------
+
+The session contrasts the two ways of storing JSON and the three
+ways of indexing it. Verified against SQL Server 2025 (RTM
+17.0.1000.7); every message above is the engine's literal output.
+CREATE JSON INDEX ran with PREVIEW_FEATURES = 0 on this build
+(Microsoft Learn labels the feature preview in SQL Server 2025),
+and it requires SET QUOTED_IDENTIFIER ON — with it off the
+statement fails with error 1934 like any index on a computed
+column.
+
+S1 versus S2 — validation is built into the json type
+-----------------------------------------------------
+
+A json column rejects malformed text at assignment time (error
+13609), whereas an nvarchar(max) column only rejects it if you add
+a CHECK (ISJSON(col) = 1) constraint, in which case the failure is
+an ordinary constraint violation (error 547). The native type also
+stores the document in an internal binary form that avoids
+re-parsing on every function call; the text is reconstructed when
+you SELECT it (for these tiny documents DATALENGTH was 109 bytes
+as json versus 88 as nvarchar, so the win is parsing, not size).
+
+S3, S10 — a json value is not a scalar
+--------------------------------------
+
+Like xml, json is a large-object type: it cannot be an index key
+column (error 1978) and cannot be compared with = (error 402) — to
+compare, extract scalars with JSON_VALUE or cast the document to
+nvarchar(max). JSON_QUERY, JSON_VALUE, JSON_MODIFY, OPENJSON,
+ISJSON and JSON_CONTAINS all accept the json type directly.
+
+S4, S5, S6 — the JSON index (SQL Server 2025)
+---------------------------------------------
+
+CREATE JSON INDEX name ON table (json_column) [FOR ('$.path',
+...)] builds a specialized index over the keys and values of the
+document. Its rules, all confirmed here or in the documentation:
+
+- the column must be of type JSON (error 13680 for nvarchar);
+- ONE JSON INDEX PER COLUMN (error 13681), although a table may
+  have up to 249 JSON indexes on different columns;
+- the table needs a CLUSTERED PRIMARY KEY; the index is built
+  offline and cannot be used in index hints;
+- with no FOR clause the default path $ indexes the whole document
+  recursively; FOR paths may not overlap ($.a and $.a.b).
+
+Per Microsoft Learn the optimizer can use it for JSON_VALUE(...) =
+value, JSON_CONTAINS(...) and JSON_PATH_EXISTS(...) predicates. In
+this test the optimizer still chose a clustered index scan for
+those predicates (with 3 rows and again with 50,000 rows), which
+is consistent with the feature's preview status — so treat it as a
+cost-based option, not a guaranteed seek.
+
+S7, S8 — the classic pattern still works and is what the optimizer picked
+-------------------------------------------------------------------------
+
+A computed column CAST(JSON_VALUE(Spec, '$.brand') AS
+NVARCHAR(40)) with a regular nonclustered index gives a B-tree
+seek for WHERE Brand = 'Axo' (the actual plan shows an INDEX SEEK
+on IX_Device_Brand). The CAST matters: without it JSON_VALUE
+returns nvarchar(4000) and the index gets the 1700-byte key
+warning. The column need not be persisted to be indexed, because
+JSON_VALUE is deterministic; PERSISTED (S8) is only needed when
+you want the value materialized or when a non-precise float
+conversion is involved.
+
+S9 — JSON_MODIFY on the native type
+-----------------------------------
+
+JSON_MODIFY returns the same type it receives, so SET Spec =
+JSON_MODIFY(Spec, ...) works without conversion. '$.ram' replaces
+a scalar, 'append $.ports' adds an array element, and the computed
+columns Brand/RamGB reflect the new document immediately (RamGB =
+64 for device 3).
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+json type (SQL 2025 / Azure SQL)   nvarchar(max) + CHECK (ISJSON(c) = 1)
+  validates on write (13609)         validates only via the constraint (547)
+  binary storage, no re-parse        text, parsed on every call
+  no = comparison (402)              ordinary string comparison
+  not an index key (1978)            not an index key either (LOB)
+
+Indexing JSON
+  1. computed column CAST(JSON_VALUE(c,'$.k') AS <narrow type>) + CREATE INDEX -> B-tree seek
+  2. CREATE JSON INDEX x ON t (jsoncol) [FOR ('$.a','$.b')]   -> json type only,
+     one per column, clustered PK required, offline, preview in SQL Server 2025,
+     QUOTED_IDENTIFIER ON; targets JSON_VALUE / JSON_CONTAINS / JSON_PATH_EXISTS
+  3. full-text index on the text for word search
+
+When the question says "a known key is queried with equality" the
+safe, portable answer is the computed column + B-tree; when it
+says "arbitrary keys / paths, SQL Server 2025, json column" the
+answer is CREATE JSON INDEX — and any option that puts a JSON
+index on nvarchar, creates two on the same column, or indexes the
+json column directly is wrong.

@@ -1,0 +1,168 @@
+# SQL Server question — RAG structured data to JSON 1
+
+## Statement
+
+A bank's loan-advisor assistant runs on an Azure SQL Database named `LoanAdvisor`. The retrieval step has already selected two loan products for a customer; the next step must turn those rows into JSON, embed them in a chat-completions request and send it to Azure OpenAI.
+
+```sql
+CREATE DATABASE LoanAdvisor;
+GO
+USE LoanAdvisor;
+GO
+CREATE SCHEMA Advice;
+GO
+CREATE TABLE Advice.LoanProduct
+(
+    ProductId  INT           NOT NULL PRIMARY KEY,
+    Name       NVARCHAR(60)  NOT NULL,
+    RateApr    DECIMAL(5,2)  NOT NULL,
+    MaxTermMo  SMALLINT      NOT NULL,
+    Notes      NVARCHAR(200) NULL
+);
+INSERT INTO Advice.LoanProduct VALUES
+ (1, N'GreenHome 5', 3.25, 60, N'Requires an "A" energy certificate'),
+ (2, N'FlexCash',    7.90, 36, NULL),
+ (3, N'AutoDrive',   5.10, 84, N'New vehicles only; 10% down');
+GO
+```
+
+Note that product 1's `Notes` contains **double quotation marks**. The retrieved rows are serialized once, and the request is sent with the existing credential (`WITH IDENTITY = 'HTTPEndpointHeaders', SECRET = '{"api-key":"..."}'`):
+
+```sql
+DECLARE @rows NVARCHAR(MAX) =
+  (SELECT ProductId, Name, RateApr, MaxTermMo, Notes
+   FROM Advice.LoanProduct WHERE ProductId IN (1, 3) ORDER BY ProductId FOR JSON PATH);
+
+DECLARE @payload NVARCHAR(MAX) = /* ---- differs per option ---- */ ;
+
+DECLARE @ret INT, @response NVARCHAR(MAX);
+EXEC @ret = sys.sp_invoke_external_rest_endpoint
+    @url        = N'https://loanadvisor-ai.openai.azure.com/openai/deployments/advisor-gpt/chat/completions?api-version=2024-10-21',
+    @method     = N'POST',
+    @headers    = N'{"x-ms-client-request-id":"loan-1001"}',
+    @credential = [https://loanadvisor-ai.openai.azure.com],
+    @payload    = @payload,
+    @timeout    = 60,
+    @response   = @response OUTPUT;
+SELECT @ret AS ReturnCode, JSON_VALUE(@response, '$.response.status.http.code') AS HttpStatus;
+```
+
+Requirements for `@payload`:
+
+1. It must be a **valid JSON document** with a `messages` array (a `system` message and a `user` message), `temperature` 0.2 and `max_tokens` 300.
+2. The `user` message's `content` must be a **JSON string** whose text is `Products: ` followed by the retrieved rows **exactly as `FOR JSON PATH` produced them** (so the model reads `[{"ProductId":1,...}]`, quotation marks and all), followed by ` Question: Which product suits a 5-year car purchase?`.
+
+Which expression for `@payload` is correct?
+
+### a.
+
+```sql
+JSON_OBJECT(
+  'messages': JSON_ARRAY(
+     JSON_OBJECT('role':'system', 'content':'You are a loan advisor. Use only the products provided.'),
+     JSON_OBJECT('role':'user',   'content': N'Products: ' + @rows
+                                            + N' Question: Which product suits a 5-year car purchase?')),
+  'temperature': 0.2,
+  'max_tokens': 300)
+```
+
+### b.
+
+```sql
+JSON_OBJECT(
+  'messages': JSON_ARRAY(
+     JSON_OBJECT('role':'system', 'content':'You are a loan advisor. Use only the products provided.'),
+     JSON_OBJECT('role':'user',   'content': JSON_QUERY(@rows))),
+  'temperature': 0.2,
+  'max_tokens': 300)
+```
+
+### c.
+
+```sql
+N'{"messages":[{"role":"system","content":"You are a loan advisor. Use only the products provided."},'
++ N'{"role":"user","content":"Products: ' + @rows
++ N' Question: Which product suits a 5-year car purchase?"}],"temperature":0.2,"max_tokens":300}'
+```
+
+### d.
+
+```sql
+JSON_OBJECT(
+  'messages': JSON_ARRAY(
+     JSON_OBJECT('role':'system', 'content':'You are a loan advisor. Use only the products provided.'),
+     JSON_OBJECT('role':'user',   'content': N'Products: ' + STRING_ESCAPE(@rows, 'json')
+                                            + N' Question: Which product suits a 5-year car purchase?')),
+  'temperature': 0.2,
+  'max_tokens': 300)
+```
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+The step "convert structured data to JSON and send it to the model" has one recurring trap: a JSON fragment that must travel **inside a JSON string** has to be escaped exactly once. Escape it zero times and the document breaks; escape it twice and the model receives backslashes. The JSON constructors do the single escaping for you — as long as you hand them a *string*.
+
+`@rows` (engine output of the `FOR JSON PATH` query):
+
+```json
+[{"ProductId":1,"Name":"GreenHome 5","RateApr":3.25,"MaxTermMo":60,"Notes":"Requires an \"A\" energy certificate"},{"ProductId":3,"Name":"AutoDrive","RateApr":5.10,"MaxTermMo":84,"Notes":"New vehicles only; 10% down"}]
+```
+
+`FOR JSON` already escaped the inner quotation marks once (`\"A\"`), which is what makes `@rows` valid JSON on its own.
+
+### Why option a is correct
+
+`JSON_OBJECT` receives `'content'` as an ordinary `nvarchar` expression and therefore **serializes it as a JSON string, escaping every `"` and `\`**. The engine produced exactly (line-wrapped here):
+
+```json
+{"messages":[{"role":"system","content":"You are a loan advisor. Use only the products provided."},
+{"role":"user","content":"Products: [{\"ProductId\":1,\"Name\":\"GreenHome 5\",\"RateApr\":3.25,\"MaxTermMo\":60,\"Notes\":\"Requires an \\\"A\\\" energy certificate\"},{\"ProductId\":3,\"Name\":\"AutoDrive\",\"RateApr\":5.10,\"MaxTermMo\":84,\"Notes\":\"New vehicles only; 10% down\"}] Question: Which product suits a 5-year car purchase?"}],
+"temperature":0.2,"max_tokens":300}
+```
+
+`ISJSON(@payload)` = `1`, and reading the string back with `JSON_VALUE(@payload, '$.messages[1].content')` returns `Products: [{"ProductId":1,...,"Notes":"Requires an \"A\" energy certificate"},...] Question: ...` — byte-for-byte the `FOR JSON` text with the question around it, which is what the model will see (requirement 2). Numbers stay numbers (`0.2`, `300`) because they were passed as numeric literals.
+
+The call itself is complete: `@url` (`nvarchar(4000)`, required), `@method` `POST` (also the default), `@headers` adds a custom header as a flat JSON object of string values — the `api-key` header comes from the `HTTPEndpointHeaders` credential and `content-type: application/json` is injected automatically — `@credential` names the database scoped credential, `@timeout` (seconds, default 30) and `@response nvarchar(max) OUTPUT`. The procedure's **return code** is `0` on HTTP success and non-zero otherwise, while `@response` always carries the envelope `{"response":{"status":{"http":{"code":...}}},"result":{...}}`; reading `$.response.status.http.code` is the reliable way to check the HTTP status.
+
+Equivalent accepted forms: `JSON_ARRAYAGG(JSON_OBJECT('id':ProductId,'name':Name,'apr':RateApr,'notes':Notes) ORDER BY ProductId)` instead of `FOR JSON PATH` (engine output `[{"id":1,"name":"GreenHome 5","apr":3.25,"notes":"Requires an \"A\" energy certificate"},{"id":3,...}]`; remember `JSON_OBJECT` defaults to `NULL ON NULL`, so a `NULL` `Notes` becomes `"notes":null` unless you write `ABSENT ON NULL`), or a plain-text context built with `STRING_AGG(CONCAT(Name, N' (', RateApr, N'% APR, up to ', MaxTermMo, N' months)'), N'; ')` when the model does not need JSON.
+
+### Why option b is wrong
+
+`JSON_QUERY(@rows)` tells `JSON_OBJECT` "this value is already JSON — embed it **unescaped**". The engine produced:
+
+```json
+{"messages":[{"role":"system",...},{"role":"user","content":[{"ProductId":1,"Name":"GreenHome 5",...},{"ProductId":3,...}]}],...}
+```
+
+The document is valid JSON (`ISJSON` = `1`) but `content` is now a **JSON array of product objects**, not a string: `JSON_VALUE(@payload,'$.messages[0].content')` returns `NULL` and `JSON_QUERY` returns the array. The chat-completions API accepts `content` only as a string or as an array of typed content parts (`{"type":"text","text":...}`), so the service rejects the request with HTTP 400. Requirement 2 ("must be a JSON string") is violated. `JSON_QUERY` is the right tool only when you *want* nested JSON — for example a `tools`/`response_format` object — never for prose the model should read.
+
+### Why option c is wrong
+
+Raw concatenation splices `@rows` between the quotation marks of the `content` string with **no escaping**. The first `"` inside `@rows` terminates the string early:
+
+```json
+{"messages":[...,{"role":"user","content":"Products: [{"ProductId":1,"Name":"GreenHome 5", ...
+```
+
+The engine reports `ISJSON(@payload) = 0`. `sp_invoke_external_rest_endpoint` requires a valid JSON document (or XML/text) as the payload with the JSON content type, so the batch fails before any model is reached. This is the "zero escapes" side of the trap.
+
+### Why option d is wrong
+
+The "two escapes" side, and the subtle one: it runs, the payload is valid, and the model even answers — but wrongly grounded. `STRING_ESCAPE(@rows,'json')` escapes the fragment once, then `JSON_OBJECT` escapes the resulting string **again**. The engine output shows `content` starting with `"Products: [{\\\"ProductId\\\":1,...` — the model receives the literal text `[{\"ProductId\":1,\"Name\":\"GreenHome 5\",...,\"Notes\":\"Requires an \\\"A\\\" energy certificate\"}...]`, i.e. backslashes everywhere. `JSON_VALUE(@payload,'$.messages[1].content')` returns that backslash-laden text, so requirement 2 ("exactly as `FOR JSON PATH` produced them") fails. `STRING_ESCAPE` belongs with *manual* string concatenation (as in option c fixed); combined with the constructors it double-encodes.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every payload above is the engine's literal output. The REST call itself is conceptual (endpoint not reachable from the test instance).
+
+## DP-800 Exam Rule to Remember
+
+```text
+rows → JSON text     : FOR JSON PATH | JSON_ARRAYAGG(JSON_OBJECT(...)) | STRING_AGG for prose
+JSON text → prompt   : JSON_OBJECT('content': <string expr>)   → escaped ONCE  (correct)
+                       JSON_OBJECT('content': JSON_QUERY(x))   → nested JSON, content not a string
+                       '"content":"' + x + '"'                 → escaped ZERO times → ISJSON = 0
+                       JSON_OBJECT('content': STRING_ESCAPE(x,'json')) → escaped TWICE → backslashes
+```
+
+`sp_invoke_external_rest_endpoint`: `@url` (required), `@method` (default POST), `@headers` (flat JSON of strings; `content-type` and credential headers are injected), `@payload` (valid JSON), `@credential`, `@timeout` (seconds, default 30), `@response nvarchar(max) OUTPUT`; return code `0` = HTTP success, and the body is under `$.result`, the status under `$.response.status.http.code`. Rule of thumb: **strings for the model, `JSON_QUERY` only for structure**.

@@ -1,0 +1,278 @@
+============================================================
+ SQL Server question — Table-Valued Functions 1
+============================================================
+
+Statement
+---------
+
+ShiftPlanner is the rostering database of a hospital. Nurses
+belong to a ward and work shifts of 8 or 12 hours. The planners
+want reusable, parameterized "views" of the data and write
+TABLE-VALUED FUNCTIONS:
+
+CREATE DATABASE ShiftPlanner;
+GO
+USE ShiftPlanner;
+GO
+CREATE SCHEMA Roster;
+GO
+CREATE TABLE Roster.Nurse
+(
+    NurseID INT          NOT NULL PRIMARY KEY,
+    Name    NVARCHAR(30) NOT NULL,
+    Ward    CHAR(3)      NOT NULL
+);
+CREATE TABLE Roster.Shift
+(
+    ShiftID  INT     NOT NULL PRIMARY KEY,
+    NurseID  INT     NOT NULL REFERENCES Roster.Nurse (NurseID),
+    ShiftDay DATE    NOT NULL,
+    Hours    TINYINT NOT NULL
+);
+INSERT INTO Roster.Nurse (NurseID, Name, Ward)
+VALUES (1, N'Ines', 'ICU'), (2, N'Joel', 'ICU'), (3, N'Kara', 'ER'), (4, N'Liam', 'ER');
+INSERT INTO Roster.Shift (ShiftID, NurseID, ShiftDay, Hours) VALUES
+  (10, 1, '2026-09-01', 12), (11, 1, '2026-09-02', 8), (12, 1, '2026-09-04', 12),
+  (13, 2, '2026-09-01', 8),
+  (14, 3, '2026-09-03', 12), (15, 3, '2026-09-05', 12);
+GO
+
+Three function definitions are attempted, then six queries are
+run, IN ORDER, EACH IN ITS OWN BATCH:
+
+-- F1
+CREATE FUNCTION Roster.LastShifts (@NurseID INT, @N INT)
+RETURNS TABLE
+AS
+RETURN
+    SELECT TOP (@N) ShiftID, ShiftDay, Hours
+    FROM Roster.Shift
+    WHERE NurseID = @NurseID
+    ORDER BY ShiftDay DESC;
+
+-- F2
+CREATE FUNCTION Roster.AllShifts (@NurseID INT)
+RETURNS TABLE
+AS
+RETURN
+    SELECT ShiftID, ShiftDay, Hours
+    FROM Roster.Shift
+    WHERE NurseID = @NurseID
+    ORDER BY ShiftDay DESC;
+
+-- F3
+CREATE FUNCTION Roster.HoursSummary (@Ward CHAR(3))
+RETURNS @t TABLE (NurseID INT, Name NVARCHAR(30), TotalHours INT, Band CHAR(1))
+AS
+BEGIN
+    INSERT INTO @t (NurseID, Name, TotalHours)
+    SELECT n.NurseID, n.Name, ISNULL(SUM(s.Hours), 0)
+    FROM Roster.Nurse AS n
+    LEFT JOIN Roster.Shift AS s ON s.NurseID = n.NurseID
+    WHERE n.Ward = @Ward
+    GROUP BY n.NurseID, n.Name;
+
+    UPDATE @t SET Band = CASE WHEN TotalHours >= 24 THEN 'H' WHEN TotalHours > 0 THEN 'M' ELSE 'L' END;
+    RETURN;
+END;
+
+-- Q1
+SELECT n.Name, ls.ShiftDay, ls.Hours
+FROM Roster.Nurse AS n
+CROSS APPLY Roster.LastShifts(n.NurseID, 2) AS ls
+ORDER BY n.Name, ls.ShiftDay;
+
+-- Q2
+SELECT n.Name, ls.ShiftDay, ls.Hours
+FROM Roster.Nurse AS n
+OUTER APPLY Roster.LastShifts(n.NurseID, 1) AS ls
+ORDER BY n.Name;
+
+-- Q3
+SELECT n.Name, ls.ShiftDay
+FROM Roster.Nurse AS n
+INNER JOIN Roster.LastShifts(n.NurseID, 2) AS ls ON 1 = 1;
+
+-- Q4
+SELECT NurseID, Name, TotalHours, Band FROM Roster.HoursSummary('ER') ORDER BY NurseID;
+
+-- Q5
+UPDATE Roster.LastShifts(1, 3) SET Hours = 9 WHERE ShiftID = 11;
+
+-- Q6
+UPDATE Roster.HoursSummary('ICU') SET Band = 'X';
+
+For F1–F3 and Q1–Q6, state whether each SUCCEEDS OR RAISES AN
+ERROR, and give the exact result set of every query that returns
+one. Then give the result of:
+
+SELECT ShiftID, Hours FROM Roster.Shift WHERE NurseID = 1 ORDER BY ShiftID;
+
+Correct Answer
+--------------
+
+Stmt | Outcome  | Detail
+-----+----------+-----------------------------------------------------
+F1   | SUCCEEDS | Inline TVF (sys.objects.type = 'IF',
+     |          | SQL_INLINE_TABLE_VALUED_FUNCTION)
+-----+----------+-----------------------------------------------------
+F2   | FAILS    | Msg 1033 — The ORDER BY clause is invalid in views,
+     |          | inline functions, derived tables, subqueries, and
+     |          | common table expressions, unless TOP, OFFSET or FOR
+     |          | XML is also specified.
+-----+----------+-----------------------------------------------------
+F3   | SUCCEEDS | Multi-statement TVF (type = 'TF',
+     |          | SQL_TABLE_VALUED_FUNCTION)
+-----+----------+-----------------------------------------------------
+Q1   | SUCCEEDS | 5 rows (below)
+-----+----------+-----------------------------------------------------
+Q2   | SUCCEEDS | 4 rows (below)
+-----+----------+-----------------------------------------------------
+Q3   | FAILS    | Msg 4104 — The multi-part identifier "n.NurseID"
+     |          | could not be bound.
+-----+----------+-----------------------------------------------------
+Q4   | SUCCEEDS | 2 rows (below)
+-----+----------+-----------------------------------------------------
+Q5   | SUCCEEDS | 1 row updated in Roster.Shift through the inline TVF
+-----+----------+-----------------------------------------------------
+Q6   | FAILS    | Msg 270 — Object 'Roster.HoursSummary' cannot be
+     |          | modified.
+
+Q1 — CROSS APPLY, two most recent shifts per nurse:
+
+Name | ShiftDay   | Hours
+-----+------------+------
+Ines | 2026-09-02 | 8
+Ines | 2026-09-04 | 12
+Joel | 2026-09-01 | 8
+Kara | 2026-09-03 | 12
+Kara | 2026-09-05 | 12
+
+Q2 — OUTER APPLY, latest shift per nurse, nurses without shifts
+kept:
+
+Name | ShiftDay   | Hours
+-----+------------+------
+Ines | 2026-09-04 | 12
+Joel | 2026-09-01 | 8
+Kara | 2026-09-05 | 12
+Liam | NULL       | NULL
+
+Q4:
+
+NurseID | Name | TotalHours | Band
+--------+------+------------+-----
+3       | Kara | 24         | H
+4       | Liam | 0          | L
+
+Final query:
+
+ShiftID | Hours
+--------+------
+10      | 12
+11      | 9
+12      | 12
+
+Explanation
+-----------
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
+
+F1 versus F2 — an inline TVF is a parameterized view
+----------------------------------------------------
+
+An inline table-valued function has RETURNS TABLE and a body that
+is a SINGLE RETURN (SELECT ...); its column list is inferred from
+the SELECT. Because it is expanded into the calling query exactly
+like a view, it inherits the view rules: ORDER BY is only allowed
+together with TOP, OFFSET or FOR XML (F1 uses TOP (@N), F2 has
+neither -> error 1033). Even with TOP, the ORDER BY inside the
+function only chooses which rows to return; it does not guarantee
+the order of the outer result — that is why Q1/Q2 add their own
+ORDER BY. Wrapping the body in BEGIN ... END is also invalid for
+an inline TVF (error 178, "A RETURN statement with a return value
+cannot be used in this context").
+
+F3 — a multi-statement TVF builds a table variable
+--------------------------------------------------
+
+A multi-statement TVF declares RETURNS @t TABLE (...), fills the
+variable with any procedural logic (here an INSERT ... SELECT and
+an UPDATE) and ends with a bare RETURN. It is opaque to the
+optimizer: the plan contains a Table-valued function operator that
+materializes @t. Historically that operator carried a FIXED
+CARDINALITY GUESS OF 100 ROWS; since SQL Server 2017
+(compatibility level 140+), INTERLEAVED EXECUTION pauses
+optimization, executes the function, and re-optimizes with the
+real count. Verified on this build: the plan for a join on
+Roster.HoursSummary('ICU') shows IsInterleavedExecuted="1" with
+EstimateRows="2" (the actual count); the same query with OPTION
+(USE HINT('DISABLE_INTERLEAVED_EXECUTION_TVF')) estimates 100.
+
+Q1, Q2, Q3 — APPLY is the join for correlated TVFs
+--------------------------------------------------
+
+A TVF whose argument comes from another table (n.NurseID) is a
+correlated table expression: it must appear on the right side of
+CROSS APPLY (rows of the left table without a match are dropped,
+like an inner join) or OUTER APPLY (kept with NULLs, like a left
+join). A regular JOIN cannot reference columns of the left input
+in its right operand, so Q3 fails to bind n.NurseID (error 4104) —
+it is not a runtime error but a compile-time one, regardless of
+the ON 1 = 1.
+
+Working through Q1: Ines has three shifts, so TOP (2) ... ORDER BY
+ShiftDay DESC gives 09-04 and 09-02; Joel has one; Kara has two;
+Liam has none and disappears under CROSS APPLY. Q2 asks for one
+shift per nurse and keeps Liam with NULLs. Inline TVFs expand
+fully: the actual plan for Q1 touches Roster.Shift directly with a
+TopN Sort per nurse and contains no function operator.
+
+Q4 — the procedural result
+--------------------------
+
+For ward ER, Kara's LEFT JOIN sums 12 + 12 = 24 (band H), and
+Liam, who has no shifts, keeps the ISNULL(SUM(...), 0) of 0 (band
+L). The band is computed by the second statement of the function —
+something an inline TVF could only do with a CASE inside its
+SELECT.
+
+Q5 versus Q6 — updatability
+---------------------------
+
+Because an inline TVF is expanded like a view, it is UPDATABLE
+under the same rules as a view (one base table, direct column
+mapping): Q5 changes shift 11 from 8 to 9 hours in Roster.Shift,
+which is why the final query shows 11 | 9. A multi-statement TVF
+returns a table variable that vanishes after the call, so DML
+against it is rejected (error 270).
+
+Equivalent alternatives
+-----------------------
+
+- Q1 could be written with ROW_NUMBER() OVER (PARTITION BY NurseID
+  ORDER BY ShiftDay DESC) and a filter rn <= 2; CROSS APPLY + TOP
+  is the idiomatic TVF form.
+- Q3 becomes valid by replacing INNER JOIN ... ON 1 = 1 with CROSS
+  APPLY.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Inline TVF (IF)                         Multi-statement TVF (TF)
+  RETURNS TABLE, single RETURN (SELECT)   RETURNS @t TABLE (...), BEGIN ... RETURN END
+  expanded like a view -> optimizer       opaque: Table-valued function operator,
+  sees base tables, uses their stats      fixed 100-row guess unless interleaved
+  ORDER BY only with TOP/OFFSET/FOR XML   execution (compat 140+) fixes the estimate
+  updatable like a view (Q5)              never updatable (Msg 270)
+  prefer whenever one SELECT will do      only for real procedural logic
+
+Correlated call : CROSS APPLY (inner) / OUTER APPLY (outer); JOIN cannot see n.col (4104)
+Call by name    : always schema.fn(args), like scalar UDFs
+
+If a question asks "which function type gives the best plan / lets
+the optimizer use base-table statistics", the answer is the inline
+TVF; if it shows RETURNS @t TABLE with poor estimates, the fix is
+either rewriting as inline or relying on interleaved execution at
+compatibility level 140 or higher.

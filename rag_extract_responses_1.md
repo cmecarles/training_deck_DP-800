@@ -1,0 +1,144 @@
+# SQL Server question — RAG extract responses 1
+
+## Statement
+
+A consumer-electronics maker runs a warranty-support assistant on an Azure SQL Database named `RepairPilot`. The RAG pipeline calls Azure OpenAI chat completions through `sys.sp_invoke_external_rest_endpoint` with `response_format` set to a **JSON schema**, so the model's answer is itself a JSON document. The procedure returned the following into `@response` (this is a literal, realistic value; the same text was stored in a variable to verify the queries):
+
+```sql
+DECLARE @response NVARCHAR(MAX) = N'{
+  "response": {
+    "status": { "http": { "code": 200, "description": "OK" } },
+    "headers": { "Content-Type": "application/json", "x-ms-region": "West Europe" }
+  },
+  "result": {
+    "id": "chatcmpl-9x1RepairPilot",
+    "object": "chat.completion",
+    "created": 1756900000,
+    "model": "gpt-4o-2024-08-06",
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": "stop",
+        "message": {
+          "role": "assistant",
+          "content": "{\"eligible\":true,\"reason\":\"Purchased 14 months ago; the 24-month warranty is still active.\",\"claim_steps\":[\"Register the serial number\",\"Ship the unit to the service centre\"]}",
+          "refusal": null
+        },
+        "logprobs": null
+      }
+    ],
+    "usage": { "prompt_tokens": 812, "completion_tokens": 57, "total_tokens": 869 }
+  }
+}';
+```
+
+Predict the exact output of each of the following statements, run in order in the same batch (`@content` is declared in S4 and reused later). Where a statement raises an error, give the error number.
+
+```sql
+-- S1
+SELECT JSON_VALUE(@response, '$.response.status.http.code')          AS http_code,
+       JSON_VALUE(@response, '$.result.choices[0].finish_reason')     AS finish_reason,
+       JSON_VALUE(@response, '$.result.usage.prompt_tokens')          AS prompt_tokens,
+       JSON_VALUE(@response, '$.result.usage.completion_tokens')      AS completion_tokens,
+       JSON_VALUE(@response, '$.result.choices[0].message.refusal')   AS refusal;
+
+-- S2
+SELECT JSON_QUERY(@response, '$.result.choices[0].message.content')  AS content_query,
+       JSON_QUERY(@response, '$.result.usage')                        AS usage_obj;
+
+-- S3
+SELECT JSON_VALUE(@response, '$.result.choices[0].message.content.eligible') AS eligible_direct,
+       JSON_VALUE(@response, '$.choices[0].message.content')                 AS no_envelope;
+
+-- S4
+DECLARE @content NVARCHAR(MAX) = JSON_VALUE(@response, '$.result.choices[0].message.content');
+SELECT ISJSON(@content) AS content_isjson;
+SELECT eligible, reason, claim_steps
+FROM OPENJSON(@content)
+WITH (eligible BIT '$.eligible', reason NVARCHAR(200) '$.reason', claim_steps NVARCHAR(MAX) '$.claim_steps' AS JSON);
+SELECT [key], value FROM OPENJSON(@content, '$.claim_steps');
+
+-- S5: a second response whose content is 4,100 characters long
+DECLARE @long NVARCHAR(MAX) = REPLICATE(CAST(N'x' AS NVARCHAR(MAX)), 4100);
+DECLARE @resp2 NVARCHAR(MAX) = JSON_OBJECT('result': JSON_OBJECT('choices': JSON_ARRAY(
+    JSON_OBJECT('message': JSON_OBJECT('content': @long), 'finish_reason': 'length'))));
+SELECT JSON_VALUE(@resp2, '$.result.choices[0].message.content') AS jv_lax;
+SELECT LEN(answer) AS openjson_len
+FROM OPENJSON(@resp2, '$.result.choices[0].message') WITH (answer NVARCHAR(MAX) '$.content');
+SELECT JSON_VALUE(@resp2, 'strict $.result.choices[0].message.content') AS jv_strict;
+```
+
+## Correct Answer
+
+| Stmt | Output |
+| --- | --- |
+| S1 | one row: `http_code = 200`, `finish_reason = stop`, `prompt_tokens = 812`, `completion_tokens = 57`, `refusal = NULL` (all columns are `nvarchar`) |
+| S2 | `content_query = NULL`; `usage_obj = { "prompt_tokens": 812, "completion_tokens": 57, "total_tokens": 869 }` (the original text, whitespace preserved) |
+| S3 | `eligible_direct = NULL`; `no_envelope = NULL` — no error |
+| S4 | `content_isjson = 1`; then one row `eligible = 1`, `reason = Purchased 14 months ago; the 24-month warranty is still active.`, `claim_steps = ["Register the serial number","Ship the unit to the service centre"]`; then two rows `(0, Register the serial number)`, `(1, Ship the unit to the service centre)` |
+| S5 | `jv_lax = NULL`; `openjson_len = 4100`; the strict query **fails**: `Msg 13625` — `String value in the specified JSON path would be truncated.` |
+
+## Explanation
+
+Extracting a language-model answer is three separate skills: navigating the **envelope** that `sp_invoke_external_rest_endpoint` adds, choosing **`JSON_VALUE` versus `JSON_QUERY` versus `OPENJSON`** by the type of the target, and remembering that a *structured-output* answer is a **string that contains JSON** and needs a second parse.
+
+### S1 — scalars come out of `JSON_VALUE`, as `nvarchar`
+
+`@response` is the envelope: HTTP metadata under `$.response`, the service's body under `$.result`. `http.code`, `finish_reason` and the two token counts are scalars, so `JSON_VALUE` returns them — always as `nvarchar(4000)`, which is why `200` and `812` display as text (`SQL_VARIANT_PROPERTY(..., 'BaseType')` = `nvarchar`; cast them before arithmetic: `CAST(JSON_VALUE(...) AS int)`). `refusal` exists but holds JSON `null`, and `JSON_VALUE` maps JSON null to SQL `NULL` — indistinguishable from a missing path, which S3 will exploit.
+
+### S2 — `JSON_QUERY` is for objects/arrays, and it preserves the original text
+
+`content` is a scalar **string** (it merely *looks* like an object because the model was told to emit JSON). In lax mode `JSON_QUERY` on a scalar returns `NULL` rather than an error; `OPENJSON(@response, '$.result.choices[0].message')` confirms the type: `content` is `type 1` (string), `refusal` is `type 0` (null). `$.result.usage` is a real object, so `JSON_QUERY` returns it verbatim, including the spaces of the original document — useful for storing the usage block for billing.
+
+### S3 — wrong paths are silent in lax mode
+
+`$.result.choices[0].message.content.eligible` tries to step *into* the string; strings have no properties, so the lax path yields `NULL`. `$.choices[0].message.content` forgets the `result` envelope; the top-level keys are only `response` and `result` (`OPENJSON(@response)` lists exactly those two, both `type 5` = object), so it is also `NULL`. Neither raises an error — the classic "answer is `NULL` but nothing failed" symptom.
+
+### S4 — structured output is parsed twice
+
+The first `JSON_VALUE` unescapes the string, so `@content` becomes `{"eligible":true,"reason":"...","claim_steps":[...]}` and `ISJSON(@content) = 1`. Now `OPENJSON ... WITH` maps it to typed columns: `eligible BIT` gives `1`, `reason` gives the text, and `claim_steps ... AS JSON` keeps the array as JSON text (without `AS JSON`, an array target in `WITH` returns `NULL`). A second `OPENJSON(@content, '$.claim_steps')` with the default schema explodes the array into `key`/`value` rows, `key` being the zero-based index as a string. Equivalent: `JSON_VALUE(JSON_VALUE(@response, '$.result.choices[0].message.content'), '$.eligible')` returns `true` (as text).
+
+### S5 — the 4,000-character trap
+
+`JSON_VALUE` returns `nvarchar(4000)`. When the scalar is longer, lax mode returns **`NULL`** (silently — a long model answer simply disappears) and strict mode raises **error 13625** `String value in the specified JSON path would be truncated.` Both were reproduced with a 4,100-character `content`. The fixes: `OPENJSON ... WITH (answer NVARCHAR(MAX) '$.content')` returned the full 4,100 characters, as did `JSON_VALUE(CAST(@resp2 AS json), '$...' RETURNING NVARCHAR(MAX))` — the `RETURNING` clause is available only on **json**-typed input in SQL Server 2025. Note also `finish_reason = "length"` in `@resp2`: that is the API telling you the answer was cut off by `max_tokens`, which you should check before trusting `content`.
+
+### Equivalent alternatives
+
+- S1 as a single `OPENJSON ... WITH` over the body instead of five `JSON_VALUE` calls — verified to return one typed row (`model = gpt-4o-2024-08-06`, `finish_reason = stop`, `answer = {"eligible":true,...}`, `prompt_tokens = 812`, `total_tokens = 869`):
+
+  ```sql
+  SELECT * FROM OPENJSON(@response, '$.result')
+  WITH (model         NVARCHAR(40)  '$.model',
+        finish_reason NVARCHAR(20)  '$.choices[0].finish_reason',
+        answer        NVARCHAR(MAX) '$.choices[0].message.content',
+        prompt_tokens INT           '$.usage.prompt_tokens',
+        total_tokens  INT           '$.usage.total_tokens');
+  ```
+
+  This form also sidesteps the 4,000-character limit for `answer` and yields real `int` columns for the token counts.
+
+- S4's first parse can be written `JSON_VALUE(JSON_VALUE(@response, '$.result.choices[0].message.content'), '$.eligible')`, which returns `true` as text; use `OPENJSON ... WITH (eligible BIT ...)` when you need a typed column.
+
+- A defensive production pattern combines the checks: read the HTTP status and `finish_reason` first, and only then parse `content`:
+
+  ```sql
+  IF JSON_VALUE(@response, '$.response.status.http.code') <> '200'
+      THROW 50001, 'Model call failed', 1;
+  IF JSON_VALUE(@response, '$.result.choices[0].finish_reason') = 'length'
+      THROW 50002, 'Answer truncated by max_tokens; increase max_tokens or shorten context', 1;
+  ```
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+@response = { "response": { "status": { "http": { "code" }}, "headers" }, "result": { <API body> } }
+
+scalar (text/number/bool) → JSON_VALUE   nvarchar(4000): > 4000 chars → NULL (lax) / Msg 13625 (strict)
+object / array            → JSON_QUERY   returns NULL on a scalar (lax)
+many fields or long text  → OPENJSON ... WITH (col NVARCHAR(MAX) '$.path', arr NVARCHAR(MAX) '$.a' AS JSON)
+long scalar, json type    → JSON_VALUE(CAST(x AS json), path RETURNING NVARCHAR(MAX))
+```
+
+Chat-completions paths: answer `$.result.choices[0].message.content`, stop reason `$.result.choices[0].finish_reason` (`stop` | `length` | `content_filter`), tokens `$.result.usage.prompt_tokens` / `completion_tokens` / `total_tokens`, HTTP status `$.response.status.http.code`. With `response_format` = `json_schema`, `content` is a **string containing JSON**: extract it with `JSON_VALUE`/`OPENJSON`, then parse *that* with `OPENJSON ... WITH`. A `NULL` with no error means a wrong path, a wrong function for the type, or a value over 4,000 characters — never assume the model returned nothing.

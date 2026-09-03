@@ -1,0 +1,270 @@
+============================================================
+ SQL Server question — DAB GraphQL relationships 1
+============================================================
+
+Statement
+---------
+
+A hiking-app company stores its trail catalog in an Azure SQL
+database named TrailGuide. The schema was created and populated
+with this script (verified against SQL Server 2025 — the same DDL
+runs unchanged in Azure SQL Database):
+
+CREATE DATABASE TrailGuide;
+GO
+USE TrailGuide;
+GO
+CREATE SCHEMA Outdoors;
+GO
+CREATE TABLE Outdoors.Region
+(
+    RegionId INT          NOT NULL PRIMARY KEY,
+    Name     NVARCHAR(60) NOT NULL
+);
+CREATE TABLE Outdoors.Trail
+(
+    TrailId   INT          NOT NULL PRIMARY KEY,
+    Name      NVARCHAR(80) NOT NULL,
+    LengthKm  DECIMAL(5,1) NOT NULL,
+    IsOpen    BIT          NOT NULL,
+    RegionId  INT          NOT NULL
+        CONSTRAINT FK_Trail_Region REFERENCES Outdoors.Region (RegionId)
+);
+CREATE TABLE Outdoors.Tag
+(
+    TagId INT          NOT NULL PRIMARY KEY,
+    Label NVARCHAR(30) NOT NULL
+);
+CREATE TABLE Outdoors.TrailTag           -- linking table (many-to-many)
+(
+    TrailId INT NOT NULL CONSTRAINT FK_TrailTag_Trail REFERENCES Outdoors.Trail (TrailId),
+    TagId   INT NOT NULL CONSTRAINT FK_TrailTag_Tag   REFERENCES Outdoors.Tag (TagId),
+    CONSTRAINT PK_TrailTag PRIMARY KEY (TrailId, TagId)
+);
+GO
+INSERT INTO Outdoors.Region VALUES (1, N'Pyrenees'), (2, N'Dolomites');
+INSERT INTO Outdoors.Trail VALUES
+  (10, N'Ordesa Canyon', 17.5, 1, 1),
+  (11, N'Aneto Summit',  22.0, 0, 1),
+  (12, N'Tre Cime Loop',  9.8, 1, 2);
+INSERT INTO Outdoors.Tag VALUES (1, N'family'), (2, N'alpine'), (3, N'waterfalls');
+INSERT INTO Outdoors.TrailTag VALUES (10,1), (10,3), (11,2), (12,1), (12,2);
+GO
+CREATE VIEW Outdoors.OpenTrails AS
+SELECT t.TrailId, t.Name, t.LengthKm, r.Name AS RegionName
+FROM Outdoors.Trail AS t JOIN Outdoors.Region AS r ON r.RegionId = t.RegionId
+WHERE t.IsOpen = 1;
+GO
+CREATE PROCEDURE Outdoors.GetTrailsByRegion @RegionId INT AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT TrailId, Name, LengthKm FROM Outdoors.Trail WHERE RegionId = @RegionId ORDER BY TrailId;
+END;
+GO
+
+sys.foreign_keys confirms three foreign keys: FK_Trail_Region
+(Trail.RegionId -> Region.RegionId), FK_TrailTag_Trail
+(TrailTag.TrailId -> Trail.TrailId) and FK_TrailTag_Tag
+(TrailTag.TagId -> Tag.TagId). There is NO foreign key between
+Trail and Tag; they are related only through Outdoors.TrailTag.
+
+The team exposes the database with DATA API BUILDER (DAB). The
+entities Region, Trail and Tag (tables), OpenTrails (view) and
+GetTrailsByRegion (stored procedure) all exist in dab-config.json
+with anonymous read (or execute) permission. The mobile app must
+be able to run this SINGLE GRAPHQL QUERY and receive the response
+shown:
+
+{
+  region_by_pk(RegionId: 1) {
+    Name
+    trails {
+      items {
+        TrailId Name LengthKm
+        tags { items { Label } }
+      }
+    }
+  }
+}
+
+{ "data": { "region_by_pk": { "Name": "Pyrenees", "trails": { "items": [
+  { "TrailId": 10, "Name": "Ordesa Canyon", "LengthKm": 17.5,
+    "tags": { "items": [ { "Label": "family" }, { "Label": "waterfalls" } ] } },
+  { "TrailId": 11, "Name": "Aneto Summit",  "LengthKm": 22.0,
+    "tags": { "items": [ { "Label": "alpine" } ] } } ] } } } }
+
+Additionally, trail_by_pk(TrailId: 10) { region { Name } } must
+return the trail's single region. Which relationships
+configuration should you add?
+
+a.
+
+"Region": { "relationships": { "trails": {
+    "cardinality": "many", "target.entity": "Trail",
+    "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] } } },
+"Trail": { "relationships": {
+    "region": { "cardinality": "one", "target.entity": "Region",
+                "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] },
+    "tags":   { "cardinality": "many", "target.entity": "Tag",
+                "source.fields": [ "TrailId" ], "target.fields": [ "TagId" ],
+                "linking.object": "Outdoors.TrailTag",
+                "linking.source.fields": [ "TrailId" ], "linking.target.fields": [ "TagId" ] } } }
+
+b.
+
+"Region": { "relationships": { "trails": {
+    "cardinality": "many", "target.entity": "Trail",
+    "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] } } },
+"Trail": { "relationships": {
+    "region": { "cardinality": "one", "target.entity": "Region",
+                "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] },
+    "tags":   { "cardinality": "many", "target.entity": "Tag",
+                "source.fields": [ "TrailId" ], "target.fields": [ "TagId" ],
+                "linking.object": "Outdoors.TrailTag",
+                "linking.source.fields": [ "TagId" ], "linking.target.fields": [ "TrailId" ] } } }
+
+c.
+
+"Region": { "relationships": { "trails": {
+    "cardinality": "many", "target.entity": "Trail",
+    "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] } } },
+"Trail": { "relationships": {
+    "region": { "cardinality": "one", "target.entity": "Region",
+                "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] },
+    "tags":   { "cardinality": "many", "target.entity": "Tag",
+                "source.fields": [ "TrailId" ], "target.fields": [ "TagId" ] } } }
+
+d.
+
+"Region": { "relationships": { "trails": {
+    "cardinality": "one", "target.entity": "Trail",
+    "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] } } },
+"Trail": { "relationships": {
+    "region": { "cardinality": "many", "target.entity": "Region",
+                "source.fields": [ "RegionId" ], "target.fields": [ "RegionId" ] },
+    "tags":   { "cardinality": "many", "target.entity": "Tag",
+                "source.fields": [ "TrailId" ], "target.fields": [ "TagId" ],
+                "linking.object": "Outdoors.TrailTag",
+                "linking.source.fields": [ "TrailId" ], "linking.target.fields": [ "TagId" ] } } }
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+DAB relationships exist ONLY IN GRAPHQL (REST has no nested
+navigation) and are declared per entity under
+entities.<name>.relationships.<relationship-name>. The
+relationship name becomes the GraphQL field (trails, region,
+tags). Three keys drive the shape: cardinality decides whether the
+field is a single object (one) or a paginated connection with
+items (many); target.entity names the other ENTITY (not the
+table); source.fields/target.fields name the join columns. A
+many-to-many relationship adds linking.object (the join table,
+which need not be an entity) plus
+linking.source.fields/linking.target.fields (the linking table's
+columns that point back to the source and target).
+
+Why option a is correct
+-----------------------
+
+- Region.trails is one-to-many: cardinality: "many" produces
+  trails: [TrailConnection]!, so the query navigates trails {
+  items { ... } }. source.fields: ["RegionId"] / target.fields:
+  ["RegionId"] reproduces FK_Trail_Region.
+- Trail.region is many-to-one: cardinality: "one" produces region:
+  Region, queried as region { Name } without items.
+- Trail.tags is many-to-many through Outdoors.TrailTag:
+  linking.source.fields: ["TrailId"] is the linking column that
+  points to the SOURCE (Trail.TrailId), linking.target.fields:
+  ["TagId"] the one that points to the TARGET (Tag.TagId). The SQL
+  DAB generates is equivalent to the engine-verified query below,
+  whose result is exactly the expected response (ordered by
+  primary key, which is DAB's default order for items):
+
+SELECT r.Name AS region, t.TrailId, t.Name AS trail,
+       STRING_AGG(g.Label, ',') WITHIN GROUP (ORDER BY g.TagId) AS tags
+FROM Outdoors.Region r JOIN Outdoors.Trail t ON t.RegionId = r.RegionId
+JOIN Outdoors.TrailTag tt ON tt.TrailId = t.TrailId JOIN Outdoors.Tag g ON g.TagId = tt.TagId
+WHERE r.RegionId = 1 GROUP BY r.Name, t.TrailId, t.Name ORDER BY t.TrailId;
+
+region    TrailId  trail          tags
+Pyrenees  10       Ordesa Canyon  family,waterfalls
+Pyrenees  11       Aneto Summit   alpine
+
+The CLI equivalent of the many-to-many entry is dab update Trail
+--relationship tags --target.entity Tag --cardinality many
+--relationship.fields "TrailId:TagId" --linking.object
+Outdoors.TrailTag --linking.source.fields TrailId
+--linking.target.fields TagId.
+
+Why option b is wrong
+---------------------
+
+This is the subtle distractor: every key is present, but
+linking.source.fields and linking.target.fields are SWAPPED (TagId
+/ TrailId). DAB would join Trail.TrailId = TrailTag.TagId and
+TrailTag.TrailId = Tag.TagId. With the data above, trail 10 would
+look for linking rows whose TagId = 10 — none exist — so
+tags.items comes back empty for every trail, silently.
+linking.source.fields must always be the linking-table column that
+references the SOURCE entity.
+
+Why option c is wrong
+---------------------
+
+The tags relationship has no linking.object. Without it, DAB
+treats the relationship as a direct one and joins Trail.TrailId =
+Tag.TagId, which is meaningless (there is no such foreign key;
+trail 10 would pair with a non-existent tag 10). The docs'
+validation stage states it plainly: "linking.object must exist for
+many-to-many."
+
+Why option d is wrong
+---------------------
+
+The cardinalities of the region/trail pair are reversed.
+Region.trails with cardinality: "one" generates trails: Trail — a
+single object, so trails { items { ... } } is a GraphQL validation
+error (items does not exist on Trail). Trail.region with
+cardinality: "many" becomes region: [RegionConnection]!, so region
+{ Name } fails too. Cardinality describes the TARGET SIDE: "one
+region per trail", "many trails per region".
+
+Views and stored procedures in the same picture
+-----------------------------------------------
+
+- OpenTrails is a view: DAB cannot discover a primary key, so the
+  entity needs source.key-fields: ["TrailId"] (or, in DAB 2.0,
+  fields[].primary-key: true) before openTrails_by_pk(TrailId: 10)
+  or REST /api/OpenTrails/TrailId/10 can work. sys.key_constraints
+  lists PKs only for the four tables — none for the view.
+- GetTrailsByRegion is a stored procedure: it appears as
+  executeGetTrailsByRegion(RegionId: 1), under Mutation unless
+  graphql.operation: "query" is set; only the FIRST RESULT SET is
+  returned; PAGINATION, FILTERING, ORDERING AND RELATIONSHIPS ARE
+  NOT SUPPORTED, and it cannot be fetched by key. You could not
+  hang tags off it.
+
+Conceptual question (Azure / tooling); the schema, foreign keys
+and the join result were verified against SQL Server 2025 (RTM
+17.0.1000.7), the DAB configuration itself was not executed.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+cardinality "one"  → field is a single object   (trail.region { Name })
+cardinality "many" → field is a connection      (region.trails { items { ... } })
+one-to-many / many-to-one → source.fields + target.fields (mirror the FK)
+many-to-many              → + linking.object (join table)
+                            + linking.source.fields  (join column → SOURCE entity)
+                            + linking.target.fields  (join column → TARGET entity)
+
+Relationships are GraphQL-only, must be declared on the entity
+that owns the field, and the relationship name is the field name.
+A VIEW needs key-fields to be addressable by key; a STORED
+PROCEDURE is executeXXX, returns one result set, defaults to
+Mutation, and can never be the source or target of a relationship.

@@ -1,0 +1,269 @@
+============================================================
+ SQL Server question — Always Encrypted 1
+============================================================
+
+Statement
+---------
+
+A consumer-lending company keeps borrower records in a SQL Server
+2025 database named LoanLedger (Windows host, compatibility level
+170). The DBA team administers the instance but is NOT ALLOWED TO
+SEE two columns: the borrower's tax identifier and the salary.
+
+The security team has provisioned the Always Encrypted key
+metadata and the table:
+
+CREATE DATABASE LoanLedger;
+GO
+USE LoanLedger;
+GO
+-- Column master key: lives OUTSIDE the engine (Windows certificate store of the app servers).
+CREATE COLUMN MASTER KEY CMK_Loans
+WITH (KEY_STORE_PROVIDER_NAME = 'MSSQL_CERTIFICATE_STORE',
+      KEY_PATH = 'CurrentUser/My/2A6F3B9C1D4E5F60718293A4B5C6D7E8F9A0B1C2');
+GO
+-- Column encryption key: stored in the database, but only as a value ENCRYPTED BY the CMK.
+CREATE COLUMN ENCRYPTION KEY CEK_Loans
+WITH VALUES (COLUMN_MASTER_KEY = CMK_Loans, ALGORITHM = 'RSA_OAEP',
+             ENCRYPTED_VALUE = 0x016E000001630075007200720065006E00740075 /* ... */);
+GO
+CREATE TABLE dbo.Borrowers
+(
+    BorrowerID INT NOT NULL PRIMARY KEY,
+    TaxID  CHAR(11) COLLATE Latin1_General_BIN2
+           ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = CEK_Loans, ENCRYPTION_TYPE = DETERMINISTIC,
+                           ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256') NOT NULL,
+    Salary DECIMAL(10,2)
+           ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = CEK_Loans, ENCRYPTION_TYPE = RANDOMIZED,
+                           ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256') NULL
+);
+GO
+
+The application team must now build the loan-origination service
+against this table. The requirements are:
+
+1. The service must find a borrower by EXACT TaxID (point lookup)
+   and must be able to JOIN dbo.Borrowers to a second table on
+   TaxID.
+2. An underwriting report must filter borrowers with WHERE Salary
+   BETWEEN @lo AND @hi and sort by Salary, INSIDE THE DATABASE
+   (the report cannot pull every row to the client and filter
+   there).
+3. Neither the plaintext values nor the column encryption key may
+   ever be available IN PLAINTEXT TO THE DATABASE ENGINE OUTSIDE A
+   TRUSTED EXECUTION ENVIRONMENT; DBAs with sysadmin must keep
+   seeing only ciphertext.
+4. The existing plaintext Salary data in a legacy table must be
+   encrypted WITHOUT EXPORTING IT to a client tool and
+   re-importing it.
+
+Which approach satisfies all four requirements?
+
+a.
+
+Keep the table exactly as created. In the application connection
+string set Column Encryption Setting=Enabled. Implement
+requirement 2 with parameterized queries such as SELECT ... FROM
+dbo.Borrowers WHERE Salary BETWEEN @lo AND @hi ORDER BY Salary,
+because the driver transparently encrypts the parameters and
+rewrites the query; for requirement 4 run ALTER TABLE ... ALTER
+COLUMN Salary ... ENCRYPTED WITH (...) from SSMS.
+
+b.
+
+Change Salary to ENCRYPTION_TYPE = DETERMINISTIC so that the
+engine can compare ciphertexts, keep TaxID deterministic, and set
+Column Encryption Setting=Enabled in the application. Range
+predicates and ORDER BY then work on the deterministic ciphertext,
+and the DBA still sees only ciphertext.
+
+c.
+
+Enable a SECURE ENCLAVE for the instance (sp_configure 'column
+encryption enclave type', 1 for a VBS enclave, then restart),
+re-create CMK_Loans WITH ENCLAVE_COMPUTATIONS and a signed
+metadata value, re-create CEK_Loans encrypted by that
+enclave-enabled CMK, keep TaxID DETERMINISTIC and Salary
+RANDOMIZED. In the application connection string set Column
+Encryption Setting=Enabled plus the enclave attestation settings
+of the driver. Encrypt the legacy Salary column in place with
+ALTER TABLE ... ALTER COLUMN ... ENCRYPTED WITH (...).
+
+d.
+
+Replace Always Encrypted with Transparent Data Encryption on
+LoanLedger plus Dynamic Data Masking (MASKED WITH (FUNCTION =
+'default()')) on TaxID and Salary, and grant UNMASK only to the
+application user. TDE encrypts the data files, so DBAs cannot read
+the columns, and the engine can evaluate every predicate normally.
+
+Correct Answer
+--------------
+
+c
+
+Explanation
+-----------
+
+Always Encrypted is CLIENT-SIDE encryption: the driver encrypts
+parameters and decrypts results, the engine stores ciphertext and
+never holds the keys in plaintext. That is why plain T-SQL against
+encrypted columns fails, and it is exactly what makes requirements
+2 and 4 impossible WITHOUT a secure enclave. The following
+statements were executed on SQL Server 2025 (RTM 17.0.1000.7)
+against the key metadata above (no client driver involved, so the
+engine sees every value as plaintext T-SQL); every message is the
+engine's literal output.
+
+INSERT INTO dbo.Borrowers VALUES (1, '123-45-6789', 52000.00);
+Msg 206  Operand type clash: varchar is incompatible with varchar(8000) encrypted with
+         (encryption_type = 'DETERMINISTIC', ... column_encryption_key_name = 'CEK_Loans' ...)
+
+SELECT BorrowerID FROM dbo.Borrowers WHERE TaxID LIKE '123%';
+Msg 402  The data types char(11) encrypted with (encryption_type = 'DETERMINISTIC' ...) and varchar
+         are incompatible in the like operator.
+
+SELECT BorrowerID FROM dbo.Borrowers WHERE Salary > 50000;
+Msg 33277  Encryption scheme mismatch for columns/variables '@1', 'Salary'. ... the expression near
+         line '1' expects it to be RANDOMIZED, a BIN2 collation for string data types, and an
+         enclave-enabled column encryption key, or PLAINTEXT.
+
+SELECT Salary * 12 FROM dbo.Borrowers;
+Msg 206  Operand type clash: decimal(10,2) encrypted with (encryption_type = 'RANDOMIZED' ...)
+         is incompatible with int
+
+SELECT TaxID, COUNT(*) FROM dbo.Borrowers GROUP BY TaxID;          -- succeeds (deterministic)
+SELECT Salary, COUNT(*) FROM dbo.Borrowers GROUP BY Salary;        -- Msg 33277 (randomized)
+SELECT ... FROM dbo.Borrowers a JOIN dbo.Borrowers b ON a.TaxID = b.TaxID;   -- succeeds
+SELECT BorrowerID FROM dbo.Borrowers ORDER BY TaxID;               -- Msg 33277 (needs enclave)
+CREATE INDEX IX_TaxID  ON dbo.Borrowers (TaxID);                   -- succeeds (deterministic)
+CREATE INDEX IX_Salary ON dbo.Borrowers (Salary);
+Msg 33573  Column 'dbo.Borrowers.Salary' is encrypted using randomized encryption with a non
+         enclave-enabled column encryption key and is therefore not valid for use as a key column
+         in a constraint, index, or statistics.
+
+ALTER TABLE dbo.Borrowers ALTER COLUMN Salary DECIMAL(10,2) NULL;  -- try to decrypt in place
+Msg 33543  Cannot alter column 'Salary'. The statement attempts to encrypt, decrypt or re-encrypt
+         the column in-place using a secure enclave, but the current and/or the target column
+         encryption key for the column is not enclave-enabled.
+
+Two more facts the engine confirmed: a deterministic string column
+MUST use a _BIN2 collation (Msg 33289 ... Character strings that
+do not use a _BIN2 collation cannot be encrypted using
+deterministic encryption.), and the new vector type cannot be
+encrypted at all (Msg 33280 ... data type 'vector(3)' is not
+supported for encryption.). sys.columns exposes only
+encryption_type_desc, encryption_algorithm_name and the CEK id;
+sys.column_master_keys stores the *location of the CMK
+(MSSQL_CERTIFICATE_STORE, CurrentUser/My/...), never the key.
+
+Why option c is correct
+-----------------------
+
+- REQUIREMENT 1 — point lookups, equality joins, GROUP BY,
+  DISTINCT, IN and B-tree indexes are exactly the operations
+  DETERMINISTIC encryption supports, because the same plaintext
+  always yields the same ciphertext. Keeping TaxID deterministic
+  (with its mandatory _BIN2 collation) is right.
+- REQUIREMENT 2 — range comparisons (BETWEEN, >), LIKE, ORDER BY
+  and (since SQL Server 2022) JOIN/GROUP BY on encrypted data are
+  ONLY available through Always Encrypted WITH SECURE ENCLAVES,
+  and those confidential queries require the column to be
+  RANDOMIZED and encrypted with an ENCLAVE-ENABLED CEK (a CEK
+  protected by a CMK created with ENCLAVE_COMPUTATIONS). The
+  database must be at compatibility level 160 or higher (170
+  here). Msg 33277 above literally lists those three conditions.
+- REQUIREMENT 3 — the enclave is a protected memory region inside
+  the engine process; the driver sends the CEK to the enclave over
+  a secure channel, and plaintext exists only inside it.
+  Everything outside the enclave, including sysadmin sessions,
+  keeps seeing ciphertext. SQL Server 2019+ on Windows supports
+  VBS enclaves (Intel SGX is not supported on SQL Server; in Azure
+  SQL Database SGX comes with DC-series hardware and requires
+  Microsoft Azure Attestation, while VBS enclaves there use no
+  attestation). The driver side is Column Encryption
+  Setting=Enabled plus the attestation protocol configuration
+  (Host Guardian Service, or no attestation for VBS on SQL Server
+  2019+).
+- REQUIREMENT 4 — in-place encryption (ALTER TABLE ... ALTER
+  COLUMN ... ENCRYPTED WITH) is an enclave feature: it works for
+  encrypting a plaintext column, rotating a CEK, changing
+  deterministic↔randomized, or decrypting, AS LONG AS THE KEYS
+  INVOLVED ARE ENCLAVE-ENABLED. Without an enclave the data has to
+  be moved out of the database by SSMS/PowerShell/SqlPackage,
+  which is what Msg 33543 refuses.
+
+Why option a is wrong
+---------------------
+
+Option a is the tempting one because the first half is true: with
+Column Encryption Setting=Enabled the driver does encrypt
+parameters and rewrite the query, and a parameterized WHERE TaxID
+= @id works on a deterministic column. But a driver cannot make
+the engine compare RANDOMIZED ciphertexts: BETWEEN/ORDER BY on
+Salary need an enclave, and this option never enables one. Its
+second half fails the same way — ALTER TABLE ... ENCRYPTED WITH
+from SSMS on a non-enclave-enabled key raises Msg 33543; SSMS
+would instead have to download, encrypt and re-upload the data
+(the very thing requirement 4 forbids).
+
+Why option b is wrong
+---------------------
+
+Deterministic encryption preserves EQUALITY, nothing else:
+ciphertexts sort by ciphertext value, not by plaintext, so
+BETWEEN/ORDER BY on a deterministic Salary do not work (the engine
+rejects the range predicate; even an enclave only supports rich
+computations on RANDOMIZED columns — "Deterministic encryption
+isn't supported" for them). Worse, it weakens confidentiality: a
+low-cardinality column such as a salary band leaks patterns
+because equal plaintexts produce equal ciphertexts, which is why
+the documentation recommends randomized encryption for anything
+not used for lookups.
+
+Why option d is wrong
+---------------------
+
+TDE and DDM protect against different adversaries. TDE encrypts
+data files and backups at rest; the engine decrypts pages in
+memory, and any principal with SELECT — including every sysadmin,
+who is dbo in every database — reads plaintext. DDM is a
+presentation-layer mask that CONTROL/UNMASK holders bypass and
+that predicates ignore; a DBA can brute-force values with WHERE
+Salary BETWEEN .... Neither removes plaintext from the DBA's
+reach, so requirement 3 fails; and a masked column cannot even be
+an Always Encrypted column. Only client-side encryption with keys
+held outside the engine separates those who manage the data from
+those who can see it.
+
+The messages quoted above were verified against SQL Server 2025
+(RTM 17.0.1000.7) using key metadata only; the enclave and
+client-driver behaviour is taken from the official documentation
+and was not executed against an engine.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Always Encrypted = CLIENT-side encryption.  Engine stores ciphertext, never sees keys.
+  Column master key (CMK)      -> outside SQL: Azure Key Vault, Windows cert store, HSM
+  Column encryption key (CEK)  -> inside the DB, but only as a value encrypted by the CMK
+  Driver: Column Encryption Setting=Enabled  -> encrypts parameters, decrypts results
+
+DETERMINISTIC : same plaintext -> same ciphertext.  = , IN, GROUP BY, DISTINCT, equality
+                JOIN, indexes.  Strings need a _BIN2 collation.  Leaks equality patterns.
+RANDOMIZED    : no computations at all ... UNLESS a secure enclave is used.
+
+Without enclave, ALL of these fail (Msg 206 / 402 / 33277):
+  literals or T-SQL variables against encrypted columns, LIKE, < > BETWEEN, arithmetic,
+  ORDER BY, INSERT..SELECT between plaintext and encrypted, computed columns, FOR JSON/XML.
+
+Secure enclaves (VBS on SQL Server 2019+/Azure SQL; Intel SGX on Azure SQL DC-series):
+  need CMK WITH ENCLAVE_COMPUTATIONS -> enclave-enabled CEK -> RANDOMIZED column, compat >= 160
+  give: LIKE, comparisons, BETWEEN, ORDER BY, JOIN/GROUP BY (2022+), indexes on randomized
+        columns, and IN-PLACE encryption / key rotation via ALTER TABLE ... ALTER COLUMN.
+
+If the scenario says "DBA must not see the data" -> Always
+Encrypted (not TDE, not DDM). If it also says "range/LIKE/sort in
+the database" or "encrypt existing data without moving it" ->
+Always Encrypted WITH SECURE ENCLAVES, randomized encryption,
+enclave-enabled keys.

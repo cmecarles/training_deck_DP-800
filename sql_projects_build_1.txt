@@ -1,0 +1,248 @@
+============================================================
+ SQL Server question — SQL Projects Build 1
+============================================================
+
+Statement
+---------
+
+A charity manages grants in a SQL Server 2025 database. A
+developer has just created an SDK-style SQL Database Project named
+GrantTracker in Visual Studio Code, committed it to a new GitHub
+repository, and wired up a GitHub Actions workflow whose first
+step is dotnet build GrantTracker.sqlproj.
+
+The project file:
+
+<Project DefaultTargets="Build">
+  <Sdk Name="Microsoft.Build.Sql" Version="1.0.0" />
+  <PropertyGroup>
+    <Name>GrantTracker</Name>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql170DatabaseSchemaProvider</DSP>
+    <ModelCollation>1033, CI</ModelCollation>
+  </PropertyGroup>
+</Project>
+
+Two of the objects in the project are:
+
+-- Ops/Stored Procedures/usp_NotifyGrantOfficer.sql
+CREATE PROCEDURE Ops.usp_NotifyGrantOfficer @GrantId INT
+AS
+DECLARE @body NVARCHAR(400) = CONCAT(N'Grant ', @GrantId, N' needs review.');
+EXEC msdb.dbo.sp_send_dbmail @profile_name = 'GrantMail',
+                             @recipients   = 'officers@example.org',
+                             @subject      = N'Grant review',
+                             @body         = @body;
+GO
+-- Rep/Views/vw_DonorSummary.sql   (Crm.Donors lives in the DonorHub database on the same server)
+CREATE VIEW Rep.vw_DonorSummary
+AS
+SELECT g.GrantId, g.Amount, d.DonorName
+FROM Grants.Grant AS g
+JOIN [$(DonorHub)].Crm.Donors AS d ON d.DonorId = g.DonorId;
+GO
+
+The build fails. Trimmed, the output contains errors of this form
+(and no warnings):
+
+Ops/Stored Procedures/usp_NotifyGrantOfficer.sql(5,6): Build error SQL71501:
+   Procedure: [Ops].[usp_NotifyGrantOfficer] has an unresolved reference to object [msdb].[dbo].[sp_send_dbmail].
+Rep/Views/vw_DonorSummary.sql(6,6): Build error SQL71501:
+   View: [Rep].[vw_DonorSummary] has an unresolved reference to object [$(DonorHub)].[Crm].[Donors].
+Build FAILED.
+
+The DonorHub team publishes their own SQL project as the NuGet
+package Charity.DonorHub (version 3.2.0) to the organization's
+Azure Artifacts feed, which the build agent already has as a
+package source.
+
+You must make dotnet build succeed and produce a valid
+GrantTracker.dacpac, keep the model validated (no suppressed
+errors), and keep the repository clean (no build outputs under
+source control). Which set of changes should you make?
+
+a.
+
+Add package references for the system database and for the other
+database, declare the SQLCMD variable, and ignore build output:
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SqlServer.Dacpacs.Msdb" Version="170.0.3" />
+    <PackageReference Include="Charity.DonorHub" Version="3.2.0">
+      <DatabaseSqlCmdVariable>DonorHub</DatabaseSqlCmdVariable>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <SqlCmdVariable Include="DonorHub">
+      <DefaultValue>DonorHub</DefaultValue>
+      <Value>$(SqlCmdVar__1)</Value>
+    </SqlCmdVariable>
+  </ItemGroup>
+
+# .gitignore
+bin/
+obj/
+
+b.
+
+Build the DonorHub project locally, commit DonorHub.dacpac (and
+the msdb.dacpac shipped with Visual Studio) into a lib/ folder of
+the GrantTracker repository, and reference them:
+
+  <ItemGroup>
+    <ArtifactReference Include="lib\msdb.dacpac" />
+    <ArtifactReference Include="lib\DonorHub.dacpac">
+      <DatabaseSqlCmdVariable>DonorHub</DatabaseSqlCmdVariable>
+    </ArtifactReference>
+  </ItemGroup>
+
+Also commit bin/Debug/GrantTracker.dacpac so the deployment job
+can pick it up without rebuilding.
+
+c.
+
+Keep the project as is and stop the two diagnostics from failing
+the build:
+
+  <PropertyGroup>
+    <SuppressTSqlWarnings>71501</SuppressTSqlWarnings>
+    <TreatTSqlWarningsAsErrors>false</TreatTSqlWarningsAsErrors>
+  </PropertyGroup>
+
+d.
+
+Switch the target platform to Azure SQL Database, which has no
+msdb, so the mail reference is no longer validated, and replace
+the SQLCMD variable with the real database name so the view
+resolves on the server:
+
+    <DSP>Microsoft.Data.Tools.Schema.Sql.SqlAzureV12DatabaseSchemaProvider</DSP>
+
+JOIN DonorHub.Crm.Donors AS d ON d.DonorId = g.DonorId;
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+A SQL project build does two things: it validates the T-SQL SYNTAX
+AGAINST THE TARGET PLATFORM (DSP) and it validates EVERY REFERENCE
+BETWEEN OBJECTS — a procedure may only call objects, and a view
+may only read tables, that exist in the project's model. SQL71501
+... has an unresolved reference to object ... is the build ERROR
+(not a warning) raised when a reference cannot be resolved. The
+model does not know msdb, and it does not know another database,
+until you tell it about them through DATABASE REFERENCES. Warnings
+(for example code-analysis rules or inconsistent casing) do not
+fail a build; unresolved-reference errors do.
+
+Why option a is correct
+-----------------------
+
+- SYSTEM DATABASE REFERENCE. msdb.dbo.sp_send_dbmail is an object
+  of the msdb system database. Microsoft publishes the system
+  databases as NuGet packages —
+  Microsoft.SqlServer.Dacpacs.Master,
+  Microsoft.SqlServer.Dacpacs.Msdb (and
+  Microsoft.SqlServer.Dacpacs.Azure.Master for Azure SQL Database)
+  — versioned by SQL Server major version (170.x for SQL Server
+  2025, matching the Sql170 target platform). A <PackageReference>
+  to Microsoft.SqlServer.Dacpacs.Msdb makes sp_send_dbmail part of
+  the model, so the reference resolves. Package references are the
+  recommended reference type for SDK-style projects, and NuGet
+  restores them on any build agent without Visual Studio.
+- DIFFERENT DATABASE, SAME SERVER. The view uses a THREE-PART NAME
+  through the SQLCMD variable $(DonorHub). A package reference to
+  Charity.DonorHub with
+  <DatabaseSqlCmdVariable>DonorHub</DatabaseSqlCmdVariable> tells
+  the build that objects in that package belong to a different
+  database on the same server whose name is supplied by the
+  variable (a reference to a different server would add
+  <ServerSqlCmdVariable> too; a reference to the same database
+  uses neither element). The <SqlCmdVariable Include="DonorHub">
+  item declares the variable with a default value; at deployment
+  time sqlpackage /Action:Publish ... /v:DonorHub=DonorHub (or the
+  publish profile) sets it per environment.
+- SOURCE CONTROL HYGIENE. dotnet build writes the model and the
+  .dacpac to obj/ and bin/Debug/ (or bin/Release/). Those are
+  build outputs, regenerated by CI from the sources, so they are
+  ignored with .gitignore; the repository holds
+  GrantTracker.sqlproj, the .sql object files (SDK-style projects
+  include every .sql file under the project folder by default
+  globbing, so no per-file <Build Include> list is needed),
+  pre/post-deployment scripts, and publish profiles that contain
+  no credentials.
+
+Why option b is wrong
+---------------------
+
+It "works" on the developer's machine and is wrong for source
+control and for the SDK-style format. Committing .dacpac files —
+both the referenced ones and the project's own bin/Debug output —
+puts BUILD ARTIFACTS into git: binary, unreviewable, immediately
+stale relative to the .sql sources, and a merge-conflict magnet.
+Direct <ArtifactReference> items are the legacy mechanism of
+original (non-SDK) projects; the documentation says not to use
+them for new development in SDK-style projects, and they require
+the file to be present at the same relative path on every build
+agent. The DonorHub team already publishes a NuGet package
+precisely so that consumers get a versioned reference restored at
+build time — the CI-friendly path. A committed msdb.dacpac also
+pins the reference to whatever Visual Studio version happened to
+ship it, instead of the versioned Microsoft.SqlServer.Dacpacs.Msdb
+package.
+
+Why option c is wrong
+---------------------
+
+This is the subtle distractor: SuppressTSqlWarnings and
+TreatTSqlWarningsAsErrors are real project properties. But
+SQL71501 is a build ERROR, not a warning, so neither property
+applies to it — the build still fails. And even if a reference
+error could be silenced, the result would be a model that has not
+been validated: the whole point of a SQL project build is that a
+view over a table that does not exist, or a procedure that calls a
+procedure that does not exist, fails at build time rather than at
+deployment time in production. The requirement "keep the model
+validated (no suppressed errors)" rules this out explicitly.
+
+Why option d is wrong
+---------------------
+
+Changing DSP to SqlAzureV12DatabaseSchemaProvider does not make
+the reference disappear — the model still contains a call to
+[msdb].[dbo].[sp_send_dbmail] and still cannot resolve it (Azure
+SQL Database has no Database Mail and no msdb, so the procedure is
+simply wrong for that platform). Hard-coding DonorHub.Crm.Donors
+replaces a SQLCMD variable with a literal three-part name that is
+still unresolved without a database reference, and it removes the
+ability to point at DonorHub_Test in the test environment. Worse,
+the .dacpac now carries the Azure target platform: deploying it to
+the SQL Server 2025 target is refused as a platform mismatch
+unless /p:AllowIncompatiblePlatform=true is passed, which defeats
+the validation the target platform provides. (Note also that
+DatabaseVariableLiteralValue exists for the rare case where a
+literal database name is genuinely wanted in a reference — but it
+is set in the reference, not by editing the view.)
+
+Conceptual question (Azure / tooling); not executed against an
+engine.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+SDK-style project:  <Sdk Name="Microsoft.Build.Sql" Version="..." />  (or <Project Sdk="Microsoft.Build.Sql/1.0.0">)
+                    <DSP> = target platform:  Sql160 (2022) | Sql170 (2025) | SqlAzureV12 (Azure SQL DB) | SqlDbFabric ...
+                    default globbing: every *.sql in the folder is built; output -> bin/<Config>/<Name>.dacpac
+Build validates:    syntax for the platform + every object reference.  Unresolved reference = SQL71501 (ERROR).
+                    Warnings (code analysis, casing) do not fail the build; errors cannot be "suppressed" away.
+Database references (fix unresolved references):
+   system db  -> <PackageReference Include="Microsoft.SqlServer.Dacpacs.Master|Msdb|Azure.Master" Version="1x0.x.x" />
+   same database (split project)                     -> reference, no variables; deploy with /p:IncludeCompositeObjects=true
+   different database, same server                   -> <DatabaseSqlCmdVariable> + <SqlCmdVariable>; [$(Var)].schema.object
+   different database, different server              -> + <ServerSqlCmdVariable>; [$(Srv)].[$(Var)].schema.object
+   prefer PackageReference/ProjectReference; ArtifactReference (.dacpac path) is the legacy form
+Reverse-engineer an existing DB: sqlpackage /Action:Extract /p:ExtractTarget=SqlProject /TargetFile:<folder>
+Git:  commit .sqlproj, *.sql, pre/post-deploy scripts, publish profiles without secrets;  ignore bin/ obj/ *.dacpac

@@ -1,0 +1,273 @@
+============================================================
+ SQL Server question — External Models Evaluate 1
+============================================================
+
+Statement
+---------
+
+GlobalBazaar is a cross-border marketplace whose catalog lives in
+an Azure SQL Database. Listings are written by sellers in TWELVE
+LANGUAGES (Spanish, German, Japanese, English, …). The catalog
+table is:
+
+CREATE TABLE Market.Listings
+(
+    ListingId   INT            NOT NULL PRIMARY KEY,
+    SellerLang  CHAR(2)        NOT NULL,
+    Title       NVARCHAR(200)  NOT NULL,
+    Description NVARCHAR(MAX)  NOT NULL,
+    Embedding   VECTOR(1536)   NULL      -- 10 million rows already embedded with text-embedding-ada-002
+);
+
+Ten million rows already carry an ada-002 embedding; thirty
+million more rows are still to be embedded. Two features must be
+delivered:
+
+- FEATURE 1 — CROSS-LANGUAGE SEMANTIC SEARCH. A buyer typing an
+  English query must find listings written in Japanese or German,
+  and vice versa. The team evaluates embedding models on
+  multilingual retrieval (the MIRACL benchmark). NO EXTRA MODEL
+  CALL MAY BE ADDED TO THE QUERY PATH (one embedding call for the
+  query text, then a VECTOR_DISTANCE search).
+- FEATURE 2 — STRUCTURED ATTRIBUTE EXTRACTION. A chat model must
+  turn each free-text Description into a JSON document with
+  exactly the properties brand, colour, size (all strings, no
+  extras). Downstream code deserializes it without validation, so
+  the model output must be GUARANTEED TO CONFORM TO THE SCHEMA,
+  not merely be valid JSON.
+
+Constraints:
+
+1. Every vector stored in one vector column must come from the
+   SAME MODEL AND THE SAME DIMENSION COUNT, otherwise similarity
+   between rows is meaningless.
+2. The vector column must stay at 1,536 DIMENSIONS OR FEWER
+   (storage budget: 4 bytes × dimensions + 8 bytes per row).
+3. The SQL vector type is limited to 1,998 DIMENSIONS. On SQL
+   Server 2025 this limit is enforced at declaration time; for
+   example DECLARE @v VECTOR(1999); fails with the engine's
+   literal message:
+
+text Msg 2717, Level 15, State 3 The size (1999) given to the type
+'vector' exceeds the maximum allowed (1998).
+
+The candidate Azure OpenAI models (from the Azure OpenAI model
+reference) are:
+
+Model           | Output          | dimensions      | Max input tokens
+                | dimensions      | parameter       |
+----------------+-----------------+-----------------+-----------------
+text-embedding- | 1,536 (fixed)   | not supported   | 8,192
+ada-002 (v2)    |                 |                 |
+----------------+-----------------+-----------------+-----------------
+text-embedding- | 1,536           | supported       | 8,192
+3-small         |                 | (shorten)       |
+----------------+-----------------+-----------------+-----------------
+text-embedding- | 3,072           | supported       | 8,192
+3-large         |                 | (shorten)       |
+----------------+-----------------+-----------------+-----------------
+gpt-4o          | chat model      | structured      | 128,000
+(2024-08-06 or  |                 | outputs         |
+later)          |                 |                 |
+
+Which choice of models and settings satisfies both features and
+all constraints?
+
+a.
+
+Deploy text-embedding-3-large with its default output and write
+the new vectors into the existing Embedding VECTOR(1536) column
+next to the ada-002 vectors, re-embedding only the thirty million
+rows that have no embedding yet. For Feature 2 call gpt-4o with
+JSON mode ("response_format": {"type": "json_object"}) and a
+system prompt that lists the three properties.
+
+b.
+
+Deploy text-embedding-3-large and request "dimensions": 1536 on
+every embedding call (in PARAMETERS of the external model or in
+the request body). Re-embed ALL FORTY MILLION listings into
+Embedding VECTOR(1536), discarding the ada-002 vectors. For
+Feature 2 call gpt-4o (2024-08-06) with "response_format":
+{"type": "json_schema", "json_schema": {"name": "attrs", "strict":
+true, "schema": {...}}} where the schema declares the three string
+properties, marks all three as required, and sets
+"additionalProperties": false.
+
+c.
+
+Keep text-embedding-ada-002 for all rows (no re-embedding cost).
+To make Feature 1 work across languages, first send every buyer
+query to gpt-4o to translate it into English, then embed the
+translation with ada-002 and search. For Feature 2 use gpt-4o with
+structured outputs (json_schema, strict: true).
+
+d.
+
+Deploy text-embedding-3-large at its full 3,072 dimensions for
+maximum quality, add a new column EmbeddingLarge VECTOR(3072) and
+re-embed all forty million rows into it, keeping the old column
+untouched. For Feature 2 use gpt-4o with structured outputs
+(json_schema, strict: true).
+
+Correct Answer
+--------------
+
+b
+
+Explanation
+-----------
+
+Why option b is correct
+-----------------------
+
+- MULTILINGUAL QUALITY. The Azure OpenAI model documentation
+  states that "both the large and small third generation
+  embeddings models offer better average multi-language retrieval
+  performance with the MIRACL benchmark" than ada-002.
+  text-embedding-3-large is the strongest candidate for Feature 1
+  and needs no translation step, so the query path stays at one
+  embedding call.
+- FITTING THE COLUMN. The third-generation models "support
+  reducing the size of the embedding via a new dimensions
+  parameter". Asking for 1,536 dimensions keeps the storage at
+  1,536 × 4 + 8 = 6,152 bytes per row and stays far below the
+  1,998-dimension cap of the vector type. Microsoft also notes
+  that even when the third-generation model's dimensions are
+  reduced below 1,536, "performance remains slightly better" than
+  ada-002.
+- ONE MODEL PER COLUMN. The documentation is explicit: "You can't
+  upgrade between embedding models. To move from
+  text-embedding-ada-002 to text-embedding-3-large, you need to
+  generate new embeddings." Re-embedding the ten million existing
+  rows is the price of switching models — it is unavoidable, and
+  option b pays it.
+- SCHEMA-GUARANTEED EXTRACTION. Structured outputs "make a model
+  follow a JSON Schema definition that you provide as part of your
+  inference API call", set through response_format with type:
+  json_schema and strict: true. Azure's rules for the schema are
+  exactly what option b applies: all properties listed as
+  required, additionalProperties: false, and a supported model
+  such as gpt-4o version 2024-08-06.
+
+Why option a is wrong
+---------------------
+
+Two independent failures:
+
+1. DIMENSION MISMATCH AND MODEL MIXING. The default output of
+   text-embedding-3-large is 3,072 values. Storing it in
+   VECTOR(1536) fails — on SQL Server 2025 a mismatched assignment
+   raises Msg 42204 The vector dimensions 1536 and 3072 do not
+   match. Even if the dimensions matched, mixing ada-002 vectors
+   and 3-large vectors in one column violates constraint 1: the
+   two models produce unrelated vector spaces, so a distance
+   between an old row and a new row means nothing.
+2. JSON MODE IS NOT SCHEMA ENFORCEMENT. The structured-outputs
+   documentation contrasts it with "the older JSON mode feature,
+   which guaranteed valid JSON but couldn't ensure strict
+   adherence to the supplied schema". A prompt that "lists the
+   three properties" can still yield missing keys, extra keys, or
+   non-string values; Feature 2 requires a guarantee.
+
+Why option c is wrong
+---------------------
+
+This is the subtle distractor: it avoids the re-embedding bill and
+its Feature 2 design is correct. It fails Feature 1 on two counts:
+
+- It ADDS A CHAT-MODEL CALL TO THE QUERY PATH (translate, then
+  embed), which the scenario forbids, and it adds that model's
+  latency and cost to every search.
+- Translating the query does nothing for the listings: a Japanese
+  description is still embedded by ada-002, the weakest of the
+  three on multilingual retrieval. Cross-language recall is
+  decided by the embedding model, not by preprocessing one side of
+  the comparison.
+
+Why option d is wrong
+---------------------
+
+VECTOR(3072) cannot be declared: the vector type allows at most
+1,998 dimensions (the engine's message for the smallest illegal
+size is quoted in the statement). Even if it could, 3,072 × 4 + 8
+= 12,296 bytes per row doubles the storage budget, violating
+constraint 2. The only way to use text-embedding-3-large in SQL is
+to shorten it with the dimensions parameter, which is what option
+b does. (Keeping the old column "untouched" is harmless but
+pointless once the new column is the one searched.)
+
+Where the dimensions choice is wired in
+---------------------------------------
+
+The shortening is a request-body parameter, so in SQL it lives on
+the external model (or is overridden per call) and the column must
+be declared to match:
+
+CREATE EXTERNAL MODEL ListingEmbedder
+WITH (
+    LOCATION   = 'https://globalbazaar-oai.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-02-01',
+    API_FORMAT = 'Azure OpenAI',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL      = 'text-embedding-3-large',
+    CREDENTIAL = [https://globalbazaar-oai.openai.azure.com/],
+    PARAMETERS = '{"dimensions": 1536}'          -- every request asks for 1,536 values
+);
+-- Embedding VECTOR(1536): the column width equals the requested dimension count
+UPDATE Market.Listings
+SET Embedding = AI_GENERATE_EMBEDDINGS(CONCAT_WS(N' | ', Title, Description) USE MODEL ListingEmbedder)
+WHERE Embedding IS NULL;
+
+Storage arithmetic for the three candidate widths (4 bytes per
+float32 element plus an 8-byte header):
+
+vector(n) | Bytes per row              | 40 million rows
+----------+----------------------------+----------------
+1,024     | 4,104                      | ≈ 164 GB
+1,536     | 6,152                      | ≈ 246 GB
+3,072     | not declarable (max 1,998) | —
+
+Cost, latency, and quality move together: fewer dimensions mean
+cheaper storage and faster distance computations at a small
+quality cost, which is why the dimensions parameter — not a
+different, weaker model — is the lever to pull when the budget is
+tight.
+
+Beyond text — multimodal and multilanguage models
+-------------------------------------------------
+
+The skills outline also expects you to recognize when a text-only
+model is the wrong evaluation target. If the marketplace later
+needs IMAGE SEARCH (find listings whose photo looks like the
+buyer's photo), a text embedding model cannot help; the Azure
+model catalog lists multimodal embedding models such as Cohere
+embed-v-4-0, which takes "text (512 tokens) and images" as input
+and can emit vectors of 256, 512, 1,024 or 1,536 dimensions in ten
+languages. The same rules then apply: pick one model, pick one
+dimension count that fits vector(n), and never mix its vectors
+with another model's in the same column.
+
+Conceptual question (Azure / tooling); not executed against an
+engine, except the VECTOR(1999) limit check quoted in the
+statement, which is the engine's literal output on SQL Server 2025
+(RTM 17.0.1000.7).
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Evaluate an external model on four axes, in this order:
+
+1. Modality    — text-only embedding vs multimodal (text + image) vs chat/completions
+2. Language    — third-generation OpenAI embeddings (3-small / 3-large) beat ada-002
+                 on multilingual retrieval; ada-002 has no `dimensions` parameter
+3. Size        — 3-large = 3072 dims (must be shortened: SQL vector max = 1998,
+                 storage = 4 bytes × dims + 8); 3-small / ada-002 = 1536
+                 → one column = one model = one dimension count; switching models
+                   means re-embedding everything
+4. Output shape — JSON mode = valid JSON only; structured outputs
+                 (response_format: json_schema, strict: true, all fields required,
+                 additionalProperties: false) = schema-guaranteed
+
+If an option stores two models' vectors in one column, declares
+vector(3072), or "guarantees" a schema with JSON mode or a prompt,
+it is wrong regardless of how much re-embedding cost it saves.

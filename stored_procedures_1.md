@@ -1,0 +1,213 @@
+# SQL Server question — Stored Procedures 1
+
+## Statement
+
+`WarrantyDesk` is the database behind a home-appliance warranty call centre. Claims are opened and, when the refund is small enough, closed in bulk by product. The team writes several **stored procedures** and then exercises parameter passing, return codes, execution context and result-set behaviour:
+
+```sql
+CREATE DATABASE WarrantyDesk;
+GO
+USE WarrantyDesk;
+GO
+CREATE SCHEMA Claims;
+GO
+CREATE TABLE Claims.Claim
+(
+    ClaimID INT          NOT NULL PRIMARY KEY,
+    Product NVARCHAR(40) NOT NULL,
+    Status  VARCHAR(10)  NOT NULL,
+    Amount  DECIMAL(8,2) NOT NULL
+);
+INSERT INTO Claims.Claim (ClaimID, Product, Status, Amount) VALUES
+  (1, N'Kettle',  'OPEN',   40.00),
+  (2, N'Toaster', 'OPEN',   25.00),
+  (3, N'Blender', 'CLOSED', 90.00),
+  (4, N'Kettle',  'OPEN',   42.00),
+  (5, N'Kettle',  'OPEN',   75.00);
+GO
+CREATE PROCEDURE Claims.CloseClaims
+    @Product   NVARCHAR(40),
+    @MaxAmount DECIMAL(8,2) = 50.00,
+    @Closed    INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    UPDATE Claims.Claim SET Status = 'CLOSED'
+    WHERE Product = @Product AND Status = 'OPEN' AND Amount <= @MaxAmount;
+    SET @Closed = @@ROWCOUNT;
+    IF @Closed = 0 RETURN 1;
+    RETURN 0;
+END;
+GO
+CREATE PROCEDURE Claims.OpenReport
+AS
+    SELECT ClaimID FROM Claims.Claim WHERE Status = 'OPEN';
+    UPDATE Claims.Claim SET Amount = Amount WHERE Product = N'Kettle';
+GO
+CREATE PROCEDURE Claims.Peek
+AS
+    SELECT USER_NAME() AS Ctx, COUNT(*) AS Claims FROM Claims.Claim;
+GO
+CREATE PROCEDURE Claims.PeekAsOwner
+WITH EXECUTE AS OWNER
+AS
+    SELECT USER_NAME() AS Ctx, COUNT(*) AS Claims FROM Claims.Claim;
+GO
+CREATE PROCEDURE Claims.TwoSets
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT ClaimID FROM Claims.Claim WHERE Status = 'OPEN';
+    DECLARE @c INT = @@ROWCOUNT;
+    SELECT @c AS OpenCount;
+    SELECT ClaimID FROM Claims.Claim WHERE Status = 'CLOSED';
+END;
+GO
+CREATE USER Intern WITHOUT LOGIN;
+GRANT EXECUTE ON SCHEMA::Claims TO Intern;
+GO
+```
+
+The following eleven statements are then executed **in order, each in its own batch**, by the database owner (`dbo`). S5, S6 and S9 contain an internal `GO` because `CREATE PROCEDURE` must be the first statement of a batch:
+
+```sql
+-- S1
+DECLARE @n INT = -1, @rc INT;
+EXEC @rc = Claims.CloseClaims N'Toaster', 50.00, @n;
+SELECT @rc AS rc, @n AS n;
+
+-- S2
+DECLARE @n INT = -1, @rc INT;
+EXEC @rc = Claims.CloseClaims @Product = N'Kettle', @Closed = @n OUTPUT;
+SELECT @rc AS rc, @n AS n;
+
+-- S3
+DECLARE @n INT = -1, @rc INT;
+EXEC @rc = Claims.CloseClaims @Product = N'Blender', @Closed = @n OUTPUT;
+SELECT @rc AS rc, @n AS n;
+
+-- S4
+DECLARE @n INT;
+EXEC Claims.CloseClaims @MaxAmount = 10.00, @Closed = @n OUTPUT;
+
+-- S5
+CREATE PROCEDURE Claims.Ping AS RETURN NULL;
+GO
+DECLARE @rc INT = 99;
+EXEC @rc = Claims.Ping;
+SELECT @rc AS rc;
+
+-- S6
+CREATE PROCEDURE dbo.sp_help AS SELECT 'WarrantyDesk' AS Src;
+GO
+EXEC sp_help;
+
+-- S7
+EXEC Claims.OpenReport;
+
+-- S8
+EXECUTE AS USER = 'Intern';
+EXEC Claims.Peek;
+EXEC Claims.PeekAsOwner;
+REVERT;
+
+-- S9
+CREATE PROCEDURE Claims.ByStatus @Status VARCHAR(10)
+WITH RECOMPILE
+AS
+    SELECT COUNT(*) AS N FROM Claims.Claim WHERE Status = @Status;
+GO
+EXEC Claims.ByStatus 'OPEN';
+SELECT COUNT(*) AS CachedEntries FROM sys.dm_exec_procedure_stats
+WHERE object_id = OBJECT_ID('Claims.ByStatus');
+
+-- S10
+EXEC Claims.TwoSets;
+
+-- S11
+CREATE TABLE #Ids (ClaimID INT);
+INSERT INTO #Ids EXEC Claims.TwoSets;
+SELECT COUNT(*) AS Captured FROM #Ids;
+```
+
+For each statement S1–S11, state whether it **succeeds or raises an error**, and give the exact result sets and informational messages it produces. Then give the final contents of `Claims.Claim` ordered by `ClaimID`.
+
+## Correct Answer
+
+| Stmt | Outcome | Result / message |
+|------|---------|------------------|
+| S1 | **Succeeds** | `rc = 0`, `n = -1` — claim 2 closed, but `@n` is unchanged because the call omitted `OUTPUT` |
+| S2 | **Succeeds** | `rc = 0`, `n = 2` — claims 1 and 4 closed; claim 5 (75.00) exceeds the default `@MaxAmount` 50.00 |
+| S3 | **Succeeds** | `rc = 1`, `n = 0` — claim 3 was already closed, nothing to do |
+| S4 | **Fails** | `Msg 201` — `Procedure or function 'CloseClaims' expects parameter '@Product', which was not supplied.` |
+| S5 | **Succeeds** | Informational message (severity 10): `The 'Ping' procedure attempted to return a status of NULL, which is not allowed. A status of 0 will be returned instead.` then `rc = 0` |
+| S6 | **Succeeds** | The **system** `sp_help` runs and lists the database objects; the `'WarrantyDesk'` row is never returned (same for `EXEC dbo.sp_help` and `EXEC WarrantyDesk.dbo.sp_help`) |
+| S7 | **Succeeds** | Result set `ClaimID = 5`, followed by `(1 rows affected)` and `(3 rows affected)` |
+| S8 | **Succeeds** | `Peek` → `Ctx = Intern, Claims = 5`; `PeekAsOwner` → `Ctx = dbo, Claims = 5` |
+| S9 | **Succeeds** | `N = 1`; `CachedEntries = 0` |
+| S10 | **Succeeds** | Three result sets: `ClaimID = 5`; `OpenCount = 1`; `ClaimID = 1, 2, 3, 4` |
+| S11 | **Succeeds** | `(6 rows affected)`; `Captured = 6` |
+
+Final contents of `Claims.Claim`:
+
+| ClaimID | Product | Status | Amount |
+|---------|---------|--------|--------|
+| 1 | Kettle | CLOSED | 40.00 |
+| 2 | Toaster | CLOSED | 25.00 |
+| 3 | Blender | CLOSED | 90.00 |
+| 4 | Kettle | CLOSED | 42.00 |
+| 5 | Kettle | OPEN | 75.00 |
+
+## Explanation
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output (sqlcmd displays error 201 as `HResult 0xC9`).
+
+### S1, S2, S3 — OUTPUT must be stated on both sides; defaults fill omitted parameters
+
+A parameter declared `OUTPUT` in the procedure only writes back to the caller's variable if the **call** also says `OUTPUT`. S1 passes `@n` positionally without the keyword: the procedure runs, closes claim 2 and sets its local `@Closed = 1`, but the caller's `@n` stays `-1` — silently. S2 uses named parameters with `OUTPUT`, skips `@MaxAmount` (so the default 50.00 applies) and gets `n = 2`. S3 finds nothing to close and the procedure's `RETURN 1` surfaces as `rc = 1`. Named and positional arguments can be mixed only while the positional ones come first.
+
+### S4 — no default, no value
+
+`@Product` has no default, so the call fails before executing with error 201. A parameter with a default may be omitted or passed as the keyword `DEFAULT`.
+
+### S5 — RETURN codes are integers, and NULL becomes 0
+
+`RETURN` in a procedure accepts only an integer expression: a string raises error 245 (conversion failure), a decimal is truncated (`RETURN 2.7` yields 2), and `RETURN NULL` is replaced by 0 with informational message 282. The default return code of a procedure that reaches its end is 0; by convention non-zero means failure, which is why `EXEC @rc = ...` and `IF @rc <> 0` are the classic pattern. Data belongs in `OUTPUT` parameters or result sets, never in the return code.
+
+### S6 — the `sp_` prefix resolves to system procedures first
+
+A name beginning with `sp_` is looked up first among the **system stored procedures** (physically in the Resource database, exposed through `master`/`sys`). Because a system `sp_help` exists, the user-defined `dbo.sp_help` in `WarrantyDesk` is never reached — not even with a two- or three-part name. Only when no system procedure has that name does resolution fall back to the current database. This is the documented reason to avoid the `sp_` prefix for user procedures: a future system procedure with the same name breaks the application silently. (Even for non-conflicting `sp_` names the lookup costs an extra probe of `master`.)
+
+### S7 — SET NOCOUNT ON suppresses "rows affected" messages
+
+`Claims.OpenReport` does not set `NOCOUNT`, so the client receives a `DONE_IN_PROC` message for every statement: `(1 rows affected)` for the `SELECT` (only claim 5 is still open after S1–S3) and `(3 rows affected)` for the `UPDATE` that touches the three kettles without changing values. `SET NOCOUNT ON` removes those messages (reducing network traffic) but **does not** affect `@@ROWCOUNT`, which `CloseClaims` and `TwoSets` rely on.
+
+### S8 — EXECUTE AS OWNER changes the execution context
+
+Under `EXECUTE AS USER = 'Intern'`, `Claims.Peek` runs as the caller (`USER_NAME() = Intern`); it can still read the table thanks to **ownership chaining** (procedure and table share the owner `dbo`), so no `SELECT` grant is needed. `Claims.PeekAsOwner` switches the context to the procedure's owner (`dbo`) for the duration of the call, which is what you use when the body needs permissions ownership chaining does not cover (dynamic SQL, `TRUNCATE`, DDL, cross-schema objects with a different owner). Other options are `CALLER` (default), `SELF` and a named user.
+
+### S9 — WITH RECOMPILE means no cached plan
+
+A procedure created `WITH RECOMPILE` is compiled on every execution and its plan is never cached, so `sys.dm_exec_procedure_stats` has no entry (`CachedEntries = 0`; an ordinary procedure such as `Peek` shows 1 after one execution). Use it when parameter sniffing makes a single cached plan harmful; a lighter alternative is `EXEC ... WITH RECOMPILE` for one call or `OPTION (RECOMPILE)` on the one problematic statement.
+
+### S10, S11 — multiple result sets and INSERT ... EXEC
+
+A procedure returns one result set per `SELECT` it executes: `TwoSets` returns three. `@@ROWCOUNT` is captured immediately after the `SELECT` (`DECLARE @c INT = @@ROWCOUNT` on the very next statement — a `PRINT` or `SET` in between would reset it), giving `OpenCount = 1`. `INSERT INTO #Ids EXEC Claims.TwoSets` captures **all** result sets into the table, so the single-column `#Ids` receives 1 + 1 + 4 = 6 rows; every result set must match the target column list, otherwise the insert fails.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Parameters : defaults fill omitted args (else Msg 201); OUTPUT needed in the CALL too
+             positional first, then named; DEFAULT keyword allowed
+RETURN     : integer only (string -> 245, decimal truncated, NULL -> 0 + msg 282);
+             0 = success by convention; EXEC @rc = proc
+Context    : EXECUTE AS CALLER (default) | OWNER | SELF | 'user'
+             ownership chaining already covers same-owner SELECT/DML
+Plans      : WITH RECOMPILE -> never cached; EXEC ... WITH RECOMPILE / OPTION (RECOMPILE)
+Messages   : SET NOCOUNT ON hides "(n rows affected)", keeps @@ROWCOUNT;
+             read @@ROWCOUNT on the very next statement
+sp_ prefix : system procedure wins, even with schema/database qualifiers - do not use it
+Result sets: one per SELECT; INSERT ... EXEC captures all of them (same shape required)
+```
+
+When an option "passes `@x` to an OUTPUT parameter" and the caller's variable stays unchanged, the missing `OUTPUT` keyword at the call site is the bug; when a procedure named `sp_something` returns unexpected data, the system procedure with that name is what actually ran.
