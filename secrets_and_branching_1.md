@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       - uses: azure/sql-action@v2.3
@@ -71,7 +71,7 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -128,7 +128,7 @@ The question combines the two "manage" bullets of the CI/CD epigraph: **secrets 
 
 ### Why option b is correct
 
-- **No long-lived credential (requirement 1).** With OpenID Connect, GitHub issues a short-lived ID token to the job; `azure/login@v2` exchanges it for an Azure access token because a **federated identity credential** on the user-assigned managed identity (or an app registration) trusts tokens whose `subject` matches — here `repo:faresplit/db:environment:production`, so only jobs of that environment in that repository can use it (other subject forms: `...:ref:refs/heads/main`, `...:pull_request`). The workflow needs `permissions: id-token: write` to request the token. The values passed to `client-id`, `tenant-id` and `subscription-id` are identifiers, not secrets that grant access by themselves; there is no client secret to rotate or leak. The database connection then uses `Authentication=Active Directory Default`, which picks up the identity `azure/login` established — no `User ID`/`Password` in the connection string.
+- **No long-lived credential (requirement 1).** With OpenID Connect, GitHub issues a short-lived ID token to the job; `azure/login@v3` exchanges it for an Azure access token because a **federated identity credential** on the user-assigned managed identity (or an app registration) trusts tokens whose `subject` matches — here `repo:faresplit/db:environment:production`, so only jobs of that environment in that repository can use it (other subject forms: `...:ref:refs/heads/main`, `...:pull_request`). The workflow needs `permissions: id-token: write` to request the token. The values passed to `client-id`, `tenant-id` and `subscription-id` are identifiers, not secrets that grant access by themselves; there is no client secret to rotate or leak. The database connection then uses `Authentication=Active Directory Default`, which picks up the identity `azure/login` established — no `User ID`/`Password` in the connection string.
 - **Nothing committed (requirement 2).** The connection string lives in a GitHub secret, referenced as `${{ secrets.SQL_CONNECTION }}`; secrets are masked in logs and are never in the repository. The `.sqlproj` and any publish profile in git contain only schema settings.
 - **Scoped to the production job (requirement 3).** Secrets defined on the `production` **environment** are available only to jobs that declare `environment: production`, and environment secrets take precedence over repository and organization secrets of the same name. If the environment also has required reviewers, the job cannot even read them until it is approved.
 - **Only from `main`, via PRs (requirement 4).** `on: push: branches: [main]` deploys only when `main` changes, which — with branch protection requiring a pull request — happens only through reviewed merges; `workflow_dispatch` allows a deliberate manual re-run. This is the trunk-based flow: short-lived feature branches, pull request into `main`, `main` always deployable.
@@ -151,7 +151,7 @@ Conceptual question (Azure / tooling); not executed against an engine.
 ## DP-800 Exam Rule to Remember
 
 ```text
-Authenticate without a stored secret:  federated identity credential + azure/login@v2 (client-id, tenant-id,
+Authenticate without a stored secret:  federated identity credential + azure/login@v3 (client-id, tenant-id,
     subscription-id) + permissions: id-token: write  ->  connection string with Authentication=Active Directory Default
     (creds: JSON = client secret = long-lived; SQL password in the string = long-lived)
 Where things live:  secrets (masked; org < repo < environment precedence; environment secrets only for jobs with

@@ -110,7 +110,7 @@ DAB's security model has two layers that the question mixes on purpose: **authen
 
 ### Why option c is wrong
 
-`{"role": "anonymous", "actions": ["*"]}` on `Booking` grants create, read, update and delete to **unauthenticated** callers — and, through role inheritance, to every other role. Filtering in the front end is not security: anyone can call `GET /api/Booking` or the GraphQL endpoint directly and read, change or delete every booking. It also leaves the MCP `create_record`/`update_record`/`delete_record` tools enabled; a system prompt saying "read-only" is advice to the model, not enforcement, and prompt injection can override it. The only enforceable controls are the entity permissions, the database policies, and the `dml-tools` switches.
+`{"role": "anonymous", "actions": ["*"]}` on `Booking` grants create, read, update and delete to **unauthenticated** callers — and, through role inheritance, to `authenticated` and to every named role that is not configured on the entity (`support` is configured, so it keeps only `read`). Filtering in the front end is not security: anyone can call `GET /api/Booking` or the GraphQL endpoint directly and read, change or delete every booking. It also leaves the MCP `create_record`/`update_record`/`delete_record` tools enabled; a system prompt saying "read-only" is advice to the model, not enforcement, and prompt injection can override it. The only enforceable controls are the entity permissions, the database policies, and the `dml-tools` switches.
 
 ### Why option d is wrong
 

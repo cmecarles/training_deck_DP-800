@@ -133,7 +133,7 @@ Azure SQL Database does not support cross-database queries with three- or four-p
 
 ### Why option c is wrong
 
-This is the subtle distractor: it is valid **SQL Server 2019+ PolyBase** syntax — the generic `sqlserver://` connector, `PUSHDOWN = ON`, and an external table whose `LOCATION` names the remote `database.schema.table`. PolyBase is a SQL Server feature that must be installed and enabled (`SERVERPROPERTY('IsPolyBaseInstalled')`, `sp_configure 'polybase enabled'`); it does not exist in Azure SQL Database, whose `CREATE EXTERNAL DATA SOURCE` grammar knows only `TYPE = RDBMS`, `SHARD_MAP_MANAGER` and `BLOB_STORAGE` — there is no `sqlserver://` connector, no `PUSHDOWN` option and no `EXTERNAL FILE FORMAT`. Of those three types, and `BLOB_STORAGE` serves only `BULK INSERT` / `OPENROWSET(BULK ...)` over files in Azure Storage — a way to load or read *files*, not to query another database's table.
+This is the subtle distractor: it is valid **SQL Server 2019+ PolyBase** syntax — the generic `sqlserver://` connector, `PUSHDOWN = ON`, and an external table whose `LOCATION` names the remote `database.schema.table`. PolyBase is a SQL Server feature that must be installed and enabled (`SERVERPROPERTY('IsPolyBaseInstalled')`, `sp_configure 'polybase enabled'`); it does not exist in Azure SQL Database, whose `CREATE EXTERNAL DATA SOURCE` grammar knows only `TYPE = RDBMS`, `SHARD_MAP_MANAGER` and `BLOB_STORAGE` (plus type-less `abs://` / `adls://` locations) — there is no `sqlserver://` connector and no `PUSHDOWN` option, so the statements in option c fail. Azure SQL Database's *data virtualization* (preview) does accept `CREATE EXTERNAL FILE FORMAT` and `CREATE EXTERNAL TABLE` over `abs://` / `adls://` data sources, but only for read-only access to Parquet/CSV/Delta **files** in Azure Storage, and `BLOB_STORAGE` serves only `BULK INSERT` / `OPENROWSET(BULK ...)` — both are ways to read *files*, not to query another database's table.
 
 ### Why option d is wrong
 
@@ -149,6 +149,8 @@ Azure SQL Database, table in ANOTHER database
       read-only, predicates pushed down, all tiers; sp_execute_remote for ad hoc T-SQL
    TYPE = SHARD_MAP_MANAGER + DISTRIBUTION = SHARDED/REPLICATED -> sharded, same schema
    TYPE = BLOB_STORAGE -> files for BULK INSERT / OPENROWSET(BULK), not tables
+   abs:// | adls:// (no TYPE) -> data virtualization (preview): OPENROWSET / EXTERNAL TABLE +
+      EXTERNAL FILE FORMAT over Parquet/CSV/Delta files in Azure Storage, read-only, files only
    Three-part names / linked servers / OPENQUERY -> not supported (Msg 40515)
 
 SQL Server (2019+)

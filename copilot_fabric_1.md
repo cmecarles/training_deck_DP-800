@@ -112,8 +112,8 @@ Copilot in Fabric (admin portal > Tenant settings > Copilot and AI)
   "Data sent to Azure OpenAI can be processed outside your capacity's geographic region..."  OFF by default;
        REQUIRED outside US / EU data boundary (else Copilot is disabled there)
   "...can be stored outside..."  OFF by default; only for notebooks / data agents (conversation history)
-  Paid capacity only: F2+ or P1+; trial SKUs and Pro/PPU workspaces do NOT support Copilot; settings can be
-  delegated to capacity admins.
+  Paid capacity only: F2+ or P1+; trial SKUs do NOT support Copilot; settings can be managed at tenant or
+  capacity level (delegated to capacity admins).
 Copilot for SQL database in Fabric sees: schema, your prompt, chat history, executed query text + errors.
   It never reads table data; prompts are not used to train models; portal Copilot never runs queries by itself.
 GitHub Copilot + MSSQL extension (VS Code): needs GitHub Copilot + Copilot Chat + subscription + a connection.
