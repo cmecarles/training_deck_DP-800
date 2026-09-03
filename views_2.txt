@@ -1,0 +1,94 @@
+.
+============================================================
+ SQL Server question — Views 2 (MCQ)
+============================================================
+
+---------
+Statement
+---------
+A university stores its course-registration catalog in a SQL Server
+database named CampusReg. The registrar's office exposes the
+Computer Science part of the catalog to advisors through a view,
+and advisors modify data ONLY THROUGH THAT VIEW.
+
+The complete setup is:
+
+CREATE DATABASE CampusReg;
+GO
+
+USE CampusReg;
+GO
+
+CREATE SCHEMA Acad;
+GO
+
+CREATE TABLE Acad.Course
+(
+    CourseID INT          NOT NULL PRIMARY KEY,
+    Dept     CHAR(4)      NOT NULL,
+    Title    NVARCHAR(60) NOT NULL,
+    Credits  TINYINT      NOT NULL,
+    Seats    SMALLINT     NOT NULL CONSTRAINT DF_Course_Seats DEFAULT (30)
+);
+GO
+
+INSERT INTO Acad.Course (CourseID, Dept, Title, Credits, Seats) VALUES
+  (101, 'CS',   N'Programming I',  3, 120),
+  (102, 'CS',   N'Databases',      4,  80),
+  (205, 'MATH', N'Linear Algebra', 3,  60),
+  (301, 'CS',   N'Compilers',      6,  40);
+GO
+
+CREATE VIEW Acad.CoreCatalog
+WITH SCHEMABINDING
+AS
+SELECT CourseID, Dept, Title, Credits
+FROM Acad.Course
+WHERE Dept = 'CS' AND Credits <= 4
+WITH CHECK OPTION;
+GO
+
+CREATE VIEW Acad.DeptStats
+AS
+SELECT Dept, COUNT(*) AS CourseCount
+FROM Acad.Course
+GROUP BY Dept;
+GO
+
+-- S1
+INSERT INTO Acad.CoreCatalog (CourseID, Dept, Title, Credits)
+VALUES (110, 'CS', N'Operating Systems', 4);
+
+Choose the option with the highest count of wrong statements.
+
+-----------------
+Statement.Options
+-----------------
+(A) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to OFF. That applies through a view and a base table. Running 'SET IDENTITY_INSERT Acad.Course ON' first on the base table would avoid the problem. 
+
+(B) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to OFF. That applies through a view and a base table. Leaving CourseID out of the column list and letting the engine generate it would avoid the problem.
+
+(C) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to ON. That applies through a view and a base table. Running 'SET IDENTITY_INSERT Acad.CoreCatalog ON' first on the view would avoid the problem.
+
+(D) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to ON. That applies through a view and a base table. Leaving CourseID out of the column list and letting the engine generate it would avoid the problem.
+
+------
+Answer
+------
+(C) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to ON. That applies through a view and a base table. Running 'SET IDENTITY_INSERT Acad.CoreCatalog ON' first on the view would avoid the problem.
+
+-------------------
+Answer.Explanation
+-------------------
+WRONG OPTION. (A) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to OFF. That applies through a view and a base table. Running 'SET IDENTITY_INSERT Acad.Course ON' first on the base table would avoid the problem.
+- NO ERRORS. THE STATEMENT IS TRUE.
+
+WRONG OPTION. (B) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when IDENTITY_INSERT is set to OFF. That applies through a view and a base table. Leaving CourseID out of the column list and letting the engine generate it would avoid the problem.
+- NO ERRORS. THE STATEMENT IS TRUE.
+
+RIGHT OPTION. (C) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when ERROR(1){{IDENTITY_INSERT is set to ON}}. That applies through a view and a base table. ERROR(2){{Running 'SET IDENTITY_INSERT Acad.CoreCatalog ON' first on the view}} would avoid the problem.
+- ERROR(1): IDENTITY_INSERT is set to OFF
+- ERROR(2): IDENTITY_INSERT can only be set on a table. Against the view the statement itself fails with error 8105 — 'Acad.CoreCatalog' is not a user table. Cannot perform SET operation. The fix is running 'SET IDENTITY_INSERT Acad.Course ON' first on the base table.
+
+WRONG OPTION. (D) If the table had been defined as 'CourseID INT IDENTITY(1,1) PRIMARY KEY', S1 would fail with error 544 because it is not possible to insert an explicit value for an identity column in table 'Course' when ERROR(1){{IDENTITY_INSERT is set to ON}}. That applies through a view and a base table. Leaving CourseID out of the column list and letting the engine generate it would avoid the problem.
+- ERROR(1): IDENTITY_INSERT is set to OFF
