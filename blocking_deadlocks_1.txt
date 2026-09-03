@@ -1,0 +1,239 @@
+============================================================
+ SQL Server question — Blocking and Deadlocks 1
+============================================================
+
+Statement
+---------
+
+A logistics hub tracks its loading bays in a SQL Server 2025
+database named WarehouseDock:
+
+CREATE DATABASE WarehouseDock;
+GO
+USE WarehouseDock;
+GO
+CREATE SCHEMA Dock;
+GO
+CREATE TABLE Dock.Bays
+(
+    BayId    INT         NOT NULL PRIMARY KEY,
+    Status   VARCHAR(10) NOT NULL,
+    TruckRef VARCHAR(20) NULL
+);
+INSERT INTO Dock.Bays (BayId, Status) VALUES (1, 'FREE'), (2, 'FREE');
+GO
+
+Two workflows reserve both bays for a double-length truck. The
+dispatch screen reserves bay 1 and then bay 2; the yard tablet was
+written by another team and reserves bay 2 and then bay 1. To
+reproduce the production incident, the DBA runs the two workflows
+in TWO SESSIONS, using WAITFOR to recreate the timing (session B
+starts one second after A; B's priority mimics the tablet's
+low-priority connection setting):
+
+-- Session A (spid 66)                                -- Session B (spid 68)
+BEGIN TRAN;                                           SET DEADLOCK_PRIORITY LOW;
+UPDATE Dock.Bays SET Status = 'BUSY', TruckRef = 'TRK-A'   BEGIN TRAN;
+    WHERE BayId = 1;                                  UPDATE Dock.Bays SET Status = 'BUSY', TruckRef = 'TRK-B'
+WAITFOR DELAY '00:00:08';                                 WHERE BayId = 2;
+UPDATE Dock.Bays SET Status = 'BUSY', TruckRef = 'TRK-A'   WAITFOR DELAY '00:00:03';
+    WHERE BayId = 2;                                  UPDATE Dock.Bays SET Status = 'BUSY', TruckRef = 'TRK-B'
+COMMIT;                                                   WHERE BayId = 1;
+                                                      COMMIT;
+
+Five seconds in, a third session captures the blocking chain:
+
+SELECT session_id, blocking_session_id, wait_type, wait_resource, status, command
+FROM sys.dm_exec_requests WHERE session_id IN (66, 68);
+
+session_id | blocking_ses | wait_type | wait_resourc | status    | command
+           | sion_id      |           | e            |           |
+-----------+--------------+-----------+--------------+-----------+--------
+66         | 0            | WAITFOR   |              | suspended | WAITFOR
+-----------+--------------+-----------+--------------+-----------+--------
+68         | 66           | LCK_M_X   | KEY: 17:7205 | suspended | UPDATE
+           |              |           | 759404723404 |           |
+           |              |           | 8 (819444328 |           |
+           |              |           | 4a0)         |           |
+
+sys.dm_os_waiting_tasks shows the same edge (session_id 68,
+blocking_session_id 66, wait_type LCK_M_X, wait_duration_ms 2073),
+and sys.dm_tran_locks shows session 66 holding KEY X on bay 1
+(GRANT) plus PAGE IX/OBJECT IX, and session 68 holding KEY X on
+bay 2 (GRANT) while its request for KEY X on bay 1 is in WAIT.
+
+Three seconds later session A's WAITFOR ends and it asks for bay
+2. Session B's batch terminates with:
+
+Msg 1205, Level 13, State 51, Line 8
+Transaction (Process ID 68) was deadlocked on lock resources with another process and has been
+chosen as the deadlock victim. Rerun the transaction.
+
+Session A prints A committed; Dock.Bays ends with both rows BUSY /
+TRK-A. The xml_deadlock_report event in the system_health session
+confirms: victim = the process with priority = -5 (spid 68), the
+other process has priority = 0, and both resources are keylock
+entries on WarehouseDock.Dock.Bays (index PK__Bays__...), each
+owned in mode X by one process and requested in mode X by the
+other.
+
+The company wants the deadlock ELIMINATED — not just a different
+victim — and the application's isolation semantics must not
+change. Which change achieves that?
+
+a.
+
+Add SET DEADLOCK_PRIORITY HIGH; at the start of the
+dispatch-screen workflow (session A's code) so that the dispatch
+transaction always wins.
+
+b.
+
+Enable row versioning for the database so that the two updates no
+longer block each other:
+
+ALTER DATABASE WarehouseDock SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+
+c.
+
+Prevent the lock from being escalated to the table by disabling
+lock escalation on the table:
+
+ALTER TABLE Dock.Bays SET (LOCK_ESCALATION = DISABLE);
+
+d.
+
+Make both workflows update the bays in the SAME ORDER (ascending
+BayId), keep each transaction as short as possible (no user
+interaction or delays between the two updates), and make the
+client retry the whole transaction when it receives error 1205.
+
+Correct Answer
+--------------
+
+d
+
+Explanation
+-----------
+
+A deadlock is a cycle: A holds bay 1's KEY X lock and wants bay 2;
+B holds bay 2's and wants bay 1. X is incompatible with X (and
+with S and U), so neither can proceed. The lock monitor detects
+the cycle (it wakes every 5 seconds, faster once a deadlock has
+been seen), picks a VICTIM, rolls the victim's transaction back
+and returns error 1205 to it. Everything in the scenario is the
+engine's literal behaviour: the wait type LCK_M_X, the KEY
+resource, the 1205 text, and the victim choice.
+
+Why option d is correct
+-----------------------
+
+- CONSISTENT ACCESS ORDER REMOVES THE CYCLE. If both workflows
+  update bay 1 first and bay 2 second, B's first statement waits
+  on A's KEY X for bay 1 — plain blocking, resolved the moment A
+  commits — and B then proceeds to bay 2, which A has already
+  released. There is never a moment when each holds what the other
+  wants. This is the fix that the deadlock graph (resource-list
+  with two keylock entries owned crosswise) points to.
+- SHORT TRANSACTIONS SHRINK THE WINDOW. Holding an X lock across
+  WAITFOR DELAY '00:00:08' (or, in the real application, across a
+  user's screen interaction) is what turned a sub-millisecond
+  conflict into a certain deadlock. Locks are held until
+  COMMIT/ROLLBACK; the less time between the first lock and the
+  commit, the smaller the chance of overlap.
+- RETRY ON 1205 HANDLES THE RESIDUAL CASE. The message itself says
+  "Rerun the transaction": 1205 rolls back the victim's
+  transaction and is a transient error, so the client (or a
+  TRY...CATCH with ERROR_NUMBER() = 1205 around a fresh BEGIN
+  TRAN) should re-execute the transaction. Combined with ordered
+  access, retries become rare instead of routine.
+
+Why option a is wrong
+---------------------
+
+SET DEADLOCK_PRIORITY only changes WHICH SESSION LOSES. Priorities
+range from LOW (-5) through NORMAL (0) to HIGH (10), or any
+integer from -10 to 10; the lowest-priority session is chosen as
+victim, and among equal priorities the engine picks the
+transaction that is CHEAPEST TO ROLL BACK (fewest log records). In
+the scenario B already runs at LOW (priority = -5 in the deadlock
+report) and is duly the victim; making A HIGH changes nothing
+about the outcome and nothing about the cycle. The deadlock still
+occurs every time the timing overlaps, and the yard tablet keeps
+receiving 1205. Victim selection is a policy, not a cure.
+
+Why option b is wrong
+---------------------
+
+This is the subtle distractor. Read committed snapshot isolation
+(RCSI) is a genuine blocking fix — for READERS VERSUS WRITERS:
+SELECTs read the last committed version instead of waiting for a
+writer's X lock. It does nothing for WRITER VERSUS WRITER: an
+UPDATE must still acquire an X lock on the row (and U while
+locating it) under RCSI, exactly as before, because two
+uncommitted versions of the same row cannot coexist. Both
+statements in the scenario are UPDATEs, so the lock graph is
+identical with RCSI on and the deadlock reproduces unchanged.
+(SNAPSHOT isolation would not "fix" it either — it turns the
+second writer's wait into update-conflict error 3960 after the
+first commits.) The option also changes the database's default
+isolation semantics, which the requirement forbids.
+
+Why option c is wrong
+---------------------
+
+Lock escalation is irrelevant to this deadlock: each transaction
+holds ONE KEY lock (verified in sys.dm_tran_locks: KEY X GRANT
+plus intent locks PAGE IX and OBJECT IX). Escalation to a
+table-level X lock is attempted only when a single statement
+accumulates roughly 5,000 locks on one object (and again every
+1,250 further locks) or when lock memory exceeds its threshold.
+Verified on the same database with a 10,000-row table
+Dock.Pallets:
+
+Statement                         | Locks held by the transaction
+----------------------------------+-----------------------------------
+UPDATE Dock.Pallets SET Qty = Qty | OBJECT X 1 — escalated to the
++ 1 (10,000 rows), default        | whole table
+LOCK_ESCALATION = TABLE           |
+----------------------------------+-----------------------------------
+same, after ALTER TABLE ... SET   | KEY X 10000, PAGE IX 26, OBJECT IX
+(LOCK_ESCALATION = DISABLE)       | 1
+----------------------------------+-----------------------------------
+... WHERE PalletId <= 1000 (1,000 | KEY X 1000, PAGE IX 3, OBJECT IX 1
+rows), TABLE                      | — below the threshold, no
+                                  | escalation
+
+LOCK_ESCALATION = DISABLE (or AUTO, which escalates per partition)
+matters when one bulk statement escalates and blocks everyone else
+on the table; it has no bearing on two single-row updates that
+lock two different keys in opposite order.
+
+Two adjacent facts, both verified: WITH (NOLOCK) is not an escape
+hatch for writers — UPDATE ... WITH (NOLOCK) fails with Msg 1065:
+The NOLOCK and READUNCOMMITTED lock hints are not allowed for
+target tables of INSERT, UPDATE, DELETE or MERGE statements.; and
+the deadlock is recorded automatically — no trace flag 1222 needed
+— as the xml_deadlock_report event in the always-on system_health
+extended-event session (ring buffer and .xel files), which is
+where you read the graph after the fact.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Blocking  = one waits for another; ends when the holder commits.
+            Diagnose: dm_exec_requests.blocking_session_id / wait_type LCK_M_*, dm_os_waiting_tasks, dm_tran_locks.
+Deadlock  = a cycle; the engine kills the victim: Msg 1205 "...chosen as the deadlock victim. Rerun the transaction."
+            Victim: lowest DEADLOCK_PRIORITY (-10..10, LOW/NORMAL/HIGH), tie -> cheapest to roll back.
+            Read the graph: system_health -> xml_deadlock_report (process-list, resource-list, victim-list).
+
+Lock compatibility: S+S ok; U+S ok; X conflicts with S, U, X.  IX/IS on page/table are intent locks.
+Escalation: ~5,000 locks per statement/object -> table (or partition with LOCK_ESCALATION = AUTO); DISABLE turns it off.
+
+Fixes that remove deadlocks:  same object/row access order, shorter transactions, indexes so
+                              statements lock fewer rows, retry on 1205.
+Fixes that only reshape them: DEADLOCK_PRIORITY (who loses), lock timeouts.
+RCSI/SNAPSHOT: cure reader-vs-writer blocking; writers still take X locks and can still deadlock.

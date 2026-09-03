@@ -1,0 +1,174 @@
+# SQL Server question — Query Store 1
+
+## Statement
+
+A toll-road operator records every plaza passage in a SQL Server 2025 database named `TollGate` (on-premises; a migration to Azure SQL Database is planned for next year). The DBA enabled Query Store when the database was created:
+
+```sql
+CREATE DATABASE TollGate;
+GO
+ALTER DATABASE TollGate SET COMPATIBILITY_LEVEL = 170;
+ALTER DATABASE TollGate SET QUERY_STORE = ON
+(
+    OPERATION_MODE = READ_WRITE,
+    QUERY_CAPTURE_MODE = ALL,
+    DATA_FLUSH_INTERVAL_SECONDS = 60,
+    INTERVAL_LENGTH_MINUTES = 1,
+    WAIT_STATS_CAPTURE_MODE = ON
+);
+GO
+USE TollGate;
+GO
+SELECT actual_state_desc, query_capture_mode_desc, readonly_reason, wait_stats_capture_mode_desc
+FROM sys.database_query_store_options;
+-- READ_WRITE | ALL | 0 | ON
+GO
+CREATE SCHEMA Toll;
+GO
+CREATE TABLE Toll.Passages
+(
+    PassageId    INT          NOT NULL PRIMARY KEY,
+    PlazaId      INT          NOT NULL,
+    PassedAt     DATETIME2(0) NOT NULL,
+    VehicleClass TINYINT      NOT NULL,
+    Amount       DECIMAL(6,2) NOT NULL
+);
+GO
+-- 100,000 passages spread over 200 plazas
+INSERT INTO Toll.Passages (PassageId, PlazaId, PassedAt, VehicleClass, Amount)
+SELECT n, n % 200 + 1, DATEADD(SECOND, n, '20260301'), n % 5 + 1, (n % 5 + 1) * 2.50
+FROM (SELECT TOP (100000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+      FROM sys.all_columns a CROSS JOIN sys.all_columns b) AS x;
+GO
+CREATE PROCEDURE Toll.usp_PlazaRevenue @PlazaId INT
+AS
+SELECT VehicleClass, SUM(Amount) AS Revenue
+FROM Toll.Passages
+WHERE PlazaId = @PlazaId
+GROUP BY VehicleClass;
+GO
+```
+
+The procedure ran three times, then a performance engineer added `CREATE NONCLUSTERED INDEX IX_Passages_PlazaId ON Toll.Passages (PlazaId) INCLUDE (VehicleClass, Amount);`, the procedure ran twice more, and the DBA flushed and inspected Query Store:
+
+```sql
+EXEC sp_query_store_flush_db;
+SELECT q.query_id, p.plan_id, OBJECT_NAME(q.object_id) AS object_name,
+       p.is_forced_plan, p.force_failure_count, p.last_force_failure_reason_desc,
+       rs.count_executions, CAST(rs.avg_logical_io_reads AS INT) AS avg_logical_reads,
+       CAST(p.query_plan AS XML).exist('declare default element namespace
+            "http://schemas.microsoft.com/sqlserver/2004/07/showplan"; //RelOp[@PhysicalOp="Index Seek"]') AS has_seek
+FROM sys.query_store_query AS q
+JOIN sys.query_store_plan AS p ON p.query_id = q.query_id
+JOIN sys.query_store_runtime_stats AS rs ON rs.plan_id = p.plan_id
+WHERE q.object_id = OBJECT_ID('Toll.usp_PlazaRevenue')
+ORDER BY p.plan_id;
+```
+
+| query_id | plan_id | object_name | is_forced_plan | force_failure_count | last_force_failure_reason_desc | count_executions | avg_logical_reads | has_seek |
+|---|---|---|---|---|---|---|---|---|
+| 7 | 7 | usp_PlazaRevenue | 0 | 0 | NONE | 3 | 361 | 0 |
+| 7 | 9 | usp_PlazaRevenue | 0 | 0 | NONE | 2 | 4 | 1 |
+
+To protect the procedure against future regressions the DBA **forced plan 9**: `EXEC sp_query_store_force_plan @query_id = 7, @plan_id = 9;` (the catalog then showed `plan_id 9, is_forced_plan 1, force_failure_count 0, NONE`).
+
+A week later a nightly maintenance script **dropped `IX_Passages_PlazaId` by mistake**. The procedure keeps returning correct results, but the plaza dashboard is slow again, and the catalog now reads:
+
+| plan_id | is_forced_plan | force_failure_count | last_force_failure_reason | last_force_failure_reason_desc |
+|---|---|---|---|---|
+| 7 | 0 | 0 | 0 | NONE |
+| 9 | 1 | 1 | 8712 | NO_INDEX |
+
+The DBA must get the procedure back to the 4-read plan **with the least disruption** and **without losing the Query Store history** collected so far. Which action should the DBA take?
+
+### a.
+
+```sql
+EXEC sp_query_store_unforce_plan @query_id = 7, @plan_id = 9;
+EXEC sp_query_store_force_plan   @query_id = 7, @plan_id = 7;
+```
+
+### b.
+
+```sql
+ALTER DATABASE TollGate SET QUERY_STORE CLEAR;
+EXEC sp_query_store_force_plan @query_id = 7, @plan_id = 9;
+```
+
+### c.
+
+```sql
+CREATE NONCLUSTERED INDEX IX_Passages_PlazaId
+    ON Toll.Passages (PlazaId) INCLUDE (VehicleClass, Amount);
+```
+
+and leave the forced plan in place.
+
+### d.
+
+Open **Query Performance Insight** for `TollGate` in the Azure portal, locate query 7 in the top-consuming list, and apply the "force plan" recommendation shown for it.
+
+## Correct Answer
+
+**c**
+
+## Explanation
+
+Query Store persists, per query (`sys.query_store_query`, keyed by `query_id` and linked to `sys.query_store_query_text`), every plan the optimizer produced (`sys.query_store_plan`, `plan_id`) and the runtime statistics of each plan per time interval (`sys.query_store_runtime_stats`, plus `sys.query_store_wait_stats` when wait-stats capture is on). That is what made the regression visible: the same `query_id 7` has a scan plan (7, 361 reads) and a seek plan (9, 4 reads), and the seek plan only exists because the index exists.
+
+### Why option c is correct
+
+A forced plan is not a copy of the index; it is a plan shape (`USE PLAN`-style) that the optimizer must reproduce at compile time. When the index disappeared, forcing **failed** — but forcing failures are not errors for the user: the engine falls back to a normal compilation (hence "correct results, slow"), increments `force_failure_count`, and records why in `last_force_failure_reason` / `_desc` (`8712` = `NO_INDEX`: an index referenced by the forced plan does not exist). Other documented reasons include `NO_PLAN`, `NO_TABLE`, `NO_CONSTRAINT`, `NO_PARTITION_SCHEME`, `NO_SEMANTICS`, `NO_STATISTICS`, `NO_INDEX_HINT` and `GENERAL_FAILURE`.
+
+Re-creating the index with the same definition makes the forced plan reproducible again. Verified: after the `CREATE INDEX`, two more executions of the procedure, and a flush,
+
+| plan_id | is_forced_plan | force_failure_count | last_force_failure_reason_desc | executions | avg_logical_reads |
+|---|---|---|---|---|---|
+| 7 | 0 | 0 | NONE | 4 | 361 |
+| 9 | 1 | 1 | NO_INDEX | 4 | 4 |
+
+plan 9's execution count rose from 2 to 4 at 4 logical reads each — forcing works again — while `force_failure_count = 1` and `NO_INDEX` remain as **history** of the incident (the counters are not reset by a later success). No plan was unforced, nothing was cleared, and the fix is the one that addresses the cause: the index that the regression-protection plan depends on.
+
+### Why option a is wrong
+
+It is syntactically fine and it "stops the failures" — by forcing the **slow** plan. Plan 7 is the clustered-index-scan plan with 361 logical reads (`has_seek = 0`); forcing it pins the dashboard at the regressed speed permanently and, worse, prevents the optimizer from ever choosing a seek even after somebody restores the index. Reading the runtime statistics before choosing the `plan_id` to force is the whole discipline of plan forcing; "the plan without failures" is not the same as "the good plan". (Unforcing plan 9 alone, with `sp_query_store_unforce_plan`, would at least let the optimizer pick freely — but with no index there is nothing better to pick.)
+
+### Why option b is wrong
+
+This is the subtle distractor: "clear the bad state and force the good plan again". `ALTER DATABASE ... SET QUERY_STORE CLEAR` deletes **everything** — queries, plans, runtime and wait statistics — so the history requirement is violated, and the second statement fails because query 7 and plan 9 no longer exist. Verified:
+
+```text
+Msg 12402, Level 11, State 2, Procedure sp_query_store_force_plan
+Query with provided query_id (7) is not found in the Query Store for database (17).
+Check the query_id value and rerun the command.
+```
+
+(The companion error for an existing query but a wrong plan is `Msg 12406: Query plan with provided plan_id (999) is not found in the Query Store for query (1). Check the plan_id value and rerun the command.`) Even after new executions repopulated Query Store, the missing index would produce a scan plan only, so there would be no seek plan to force.
+
+### Why option d is wrong
+
+Query Performance Insight is an **Azure SQL Database** portal feature (single and pooled databases) built on top of Query Store: it charts the top resource-consuming (CPU, duration, execution count) and long-running queries, requires Query Store to be active (the portal prompts to enable it when it is off or in `READ_ONLY` state), and annotates the charts with Database Advisor recommendations. `TollGate` runs on an on-premises SQL Server, which has no Azure portal blade; QPI does not exist for it (nor for Azure SQL Managed Instance). And even in Azure SQL Database QPI *shows* queries — plan forcing there comes from **automatic tuning** (`FORCE_LAST_GOOD_PLAN`, which reverts a plan regression detected by Query Store) or from the same `sp_query_store_force_plan` procedure, not from a QPI button; an index that was dropped is not a plan regression that `FORCE_LAST_GOOD_PLAN` can undo.
+
+### Other verified Query Store facts
+
+- `OPERATION_MODE` can be switched to `READ_ONLY` (`actual_state_desc = READ_ONLY`, `readonly_reason = 0` when switched deliberately); Query Store also goes read-only on its own when `MAX_STORAGE_SIZE_MB` is exhausted (`readonly_reason` non-zero), which is why the size-based cleanup policy matters. `sys.database_query_store_options` is the place to check both.
+- Capture modes: `ALL` records every query (used here so the five executions were guaranteed to be captured), `AUTO` (the default) skips infrequent and insignificant ones, `CUSTOM` lets you define the thresholds, and `NONE` stops capturing new queries while continuing to collect statistics for the ones already captured.
+- `sp_query_store_flush_db` writes the in-memory statistics to disk immediately; otherwise they appear after `DATA_FLUSH_INTERVAL_SECONDS` (60 here; the default is 900).
+- With `WAIT_STATS_CAPTURE_MODE = ON`, `sys.query_store_wait_stats` aggregates waits per plan and category (in this run, for example, `Memory`, `Parallelism`, `Preemptive`, `Latch`).
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Query Store (per database):  ALTER DATABASE x SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, QUERY_CAPTURE_MODE = ALL|AUTO|CUSTOM|NONE, ...)
+   sys.database_query_store_options  -> actual_state_desc, readonly_reason
+   sys.query_store_query -> sys.query_store_plan (plan_id, is_forced_plan, force_failure_count, last_force_failure_reason_desc)
+                          -> sys.query_store_runtime_stats / sys.query_store_wait_stats   (per interval)
+Regression:  same query_id, new plan_id with worse avg_* -> sp_query_store_force_plan @query_id, @plan_id (the GOOD plan)
+             undo with sp_query_store_unforce_plan.  Forcing failure != error: fallback plan + NO_INDEX / NO_PLAN / ... recorded.
+             Fix the cause (missing index) and the forced plan works again; counters keep the history.
+QUERY_STORE CLEAR wipes history (then Msg 12402/12406 on force).   READ_ONLY = no new data captured.
+Query Performance Insight = Azure SQL Database portal view over Query Store (top CPU/duration/executions);
+   not available for SQL Server or Managed Instance; automatic plan correction = AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON).
+```

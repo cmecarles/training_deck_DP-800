@@ -1,0 +1,184 @@
+# SQL Server question — Create External Model 1
+
+## Statement
+
+An insurer stores adjuster notes in a SQL Server 2025 database named `ClaimsDesk`. Notes must be embedded with the Azure OpenAI deployment `text-embedding-3-large`, **shortened to 1,024 dimensions**, and the embeddings are generated in T-SQL with `AI_GENERATE_EMBEDDINGS`.
+
+The database, table, role, and credential already exist:
+
+```sql
+CREATE DATABASE ClaimsDesk;
+GO
+USE ClaimsDesk;
+GO
+CREATE SCHEMA Claims;
+GO
+CREATE TABLE Claims.Notes
+(
+    NoteId    INT           NOT NULL PRIMARY KEY,
+    NoteText  NVARCHAR(MAX) NULL,
+    Embedding VECTOR(1024)  NULL
+);
+GO
+CREATE ROLE ClaimsAnalysts;
+CREATE USER Dana WITHOUT LOGIN;
+ALTER ROLE ClaimsAnalysts ADD MEMBER Dana;
+GO
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'Cl@imsDesk!2026';
+GO
+CREATE DATABASE SCOPED CREDENTIAL [https://claimsdesk-oai.openai.azure.com/]
+WITH IDENTITY = 'HTTPEndpointHeaders', SECRET = '{"api-key":"REDACTED"}';
+GO
+```
+
+Requirements:
+
+1. Register the model as an external model object named `NotesEmbedder` that sends `"dimensions": 1024` with every request.
+2. Members of `ClaimsAnalysts` (such as `Dana`) must be able to run `SELECT AI_GENERATE_EMBEDDINGS(N'...' USE MODEL NotesEmbedder)` themselves.
+3. Later, the operations team must add a retry policy (`"sql_rest_options": {"retry_count": 3}`) **in place**: the model object may already be referenced by name from other objects, so dropping and recreating it is not acceptable.
+
+Which script meets all three requirements?
+
+### a.
+
+```sql
+CREATE EXTERNAL MODEL NotesEmbedder
+WITH (
+    LOCATION   = 'https://claimsdesk-oai.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-02-01',
+    API_FORMAT = 'Azure AI Foundry',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL      = 'text-embedding-3-large',
+    CREDENTIAL = [https://claimsdesk-oai.openai.azure.com/],
+    PARAMETERS = '{"dimensions":1024}'
+);
+GRANT EXECUTE ON EXTERNAL MODEL::NotesEmbedder TO ClaimsAnalysts;
+GRANT REFERENCES ON DATABASE SCOPED CREDENTIAL::[https://claimsdesk-oai.openai.azure.com/] TO ClaimsAnalysts;
+-- later
+ALTER EXTERNAL MODEL NotesEmbedder SET (PARAMETERS = '{"dimensions":1024, "sql_rest_options": {"retry_count": 3}}');
+```
+
+### b.
+
+```sql
+CREATE EXTERNAL MODEL NotesEmbedder
+WITH (
+    LOCATION   = 'https://claimsdesk-oai.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-02-01',
+    API_FORMAT = 'Azure OpenAI',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL      = 'text-embedding-3-large',
+    CREDENTIAL = [https://claimsdesk-oai.openai.azure.com/],
+    PARAMETERS = '{"dimensions":1024}'
+);
+GRANT EXECUTE ON EXTERNAL MODEL::NotesEmbedder TO ClaimsAnalysts;
+GRANT REFERENCES ON DATABASE SCOPED CREDENTIAL::[https://claimsdesk-oai.openai.azure.com/] TO ClaimsAnalysts;
+-- later
+ALTER EXTERNAL MODEL NotesEmbedder SET (PARAMETERS = '{"dimensions":1024, "sql_rest_options": {"retry_count": 3}}');
+```
+
+### c.
+
+```sql
+CREATE EXTERNAL MODEL NotesEmbedder
+WITH (
+    LOCATION   = 'https://claimsdesk-oai.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-02-01',
+    API_FORMAT = 'Azure OpenAI',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL      = 'text-embedding-3-large',
+    CREDENTIAL = [https://claimsdesk-oai.openai.azure.com/],
+    PARAMETERS = '{"dimensions":1024}'
+);
+GRANT ALTER ANY EXTERNAL MODEL TO ClaimsAnalysts;
+-- later
+ALTER EXTERNAL MODEL NotesEmbedder WITH (PARAMETERS = '{"dimensions":1024, "sql_rest_options": {"retry_count": 3}}');
+```
+
+### d.
+
+```sql
+CREATE EXTERNAL MODEL NotesEmbedder
+WITH (
+    LOCATION   = 'https://claimsdesk-oai.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-02-01',
+    API_FORMAT = 'Azure OpenAI',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL      = 'text-embedding-3-large',
+    CREDENTIAL = [https://claimsdesk-oai.openai.azure.com/],
+    PARAMETERS = '{"dimensions":1024}'
+);
+GRANT EXECUTE ON EXTERNAL MODEL::NotesEmbedder TO ClaimsAnalysts;
+-- later
+DROP EXTERNAL MODEL NotesEmbedder;
+CREATE EXTERNAL MODEL NotesEmbedder
+WITH (
+    LOCATION   = 'https://claimsdesk-oai.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-02-01',
+    API_FORMAT = 'Azure OpenAI',
+    MODEL_TYPE = EMBEDDINGS,
+    MODEL      = 'text-embedding-3-large',
+    CREDENTIAL = [https://claimsdesk-oai.openai.azure.com/],
+    PARAMETERS = '{"dimensions":1024, "sql_rest_options": {"retry_count": 3}}'
+);
+```
+
+## Correct Answer
+
+**b**
+
+## Explanation
+
+Every script in the four options was executed on SQL Server 2025 (RTM); the outcomes below are the engine's literal messages. The lab instance has no route to Azure, which is useful: a call that reaches the network layer proves that every catalog and permission check has already passed.
+
+### Why option b is correct
+
+- **`CREATE EXTERNAL MODEL`** accepts exactly the documented option set: `LOCATION` (HTTPS only), `API_FORMAT` ∈ {`Azure OpenAI`, `OpenAI`, `Ollama`, `ONNX Runtime`}, `MODEL_TYPE = EMBEDDINGS` (the only accepted type), `MODEL`, optional `CREDENTIAL`, optional `PARAMETERS` (a JSON string appended to every request body). The statement succeeded, and `sys.external_models` then showed one row: `name = NotesEmbedder`, `api_format = Azure OpenAI`, `model_type_desc = EMBEDDINGS`, `model = text-embedding-3-large`, `credential_id = 65536`, `parameters = {"dimensions":1024}` (the `parameters` column is of type **json**). No `PREVIEW_FEATURES` setting was needed for this DDL on the RTM build; the documentation asks for `PREVIEW_FEATURES = ON` only for the local `ONNX Runtime` path.
+- **Two grants are needed to *use* a model.** With no grants, `Dana` cannot even see the model: `SELECT name FROM sys.external_models` returns no rows and the call fails with `Msg 15151 Cannot find the external model 'NotesEmbedder', because it does not exist or you do not have permission.` After `GRANT EXECUTE ON EXTERNAL MODEL::NotesEmbedder`, the model becomes visible but the call fails one step later with `Msg 15151 Cannot find the credential 'https://claimsdesk-oai.openai.azure.com/', because it does not exist or you do not have permission.` After `GRANT REFERENCES ON DATABASE SCOPED CREDENTIAL::[...]` as well, Dana's call gets all the way to the network: `Msg 31608 An error occurred, failed to communicate with the external rest endpoint. HRESULT: 0x80072ee7.` — the same error the owner gets, i.e. authorization is complete.
+- **`ALTER EXTERNAL MODEL ... SET ( ... )`** is the documented in-place syntax. It succeeded and the catalog immediately showed `parameters = {"dimensions":1024,"sql_rest_options":{"retry_count":3}}` with a new `modify_time`. Nothing was dropped, so objects that reference the model by name keep working.
+
+### Why option a is wrong
+
+`API_FORMAT = 'Azure AI Foundry'` is not an accepted value. The engine rejects the statement outright:
+
+```text
+Msg 46508, Level 15, State 32
+Incorrect syntax on external DDL option 'API_FORMAT'.
+```
+
+Nothing after it can work because the model is never created. (The same kind of rejection hits an invalid `MODEL_TYPE`: `MODEL_TYPE = COMPLETIONS` fails with `Msg 102 Incorrect syntax near 'COMPLETIONS'` — `EMBEDDINGS` is the only accepted value.)
+
+### Why option c is wrong
+
+This is the subtle distractor — its `CREATE` is identical to option b's. It fails requirements 2 and 3:
+
+- `ALTER ANY EXTERNAL MODEL` is a **DDL** permission ("Requires `ALTER ANY EXTERNAL MODEL` or `CREATE EXTERNAL MODEL` database permission" to create or alter models). It makes the model visible in `sys.external_models`, but it does not let Dana call it: the call still fails with `Msg 15151 Cannot find the external model 'NotesEmbedder', because it does not exist or you do not have permission.` Using a model in an AI function requires `GRANT EXECUTE ON EXTERNAL MODEL::name` (plus `REFERENCES` on the credential it uses).
+- `ALTER EXTERNAL MODEL ... WITH ( ... )` is not the syntax. The engine answers `Msg 156 Incorrect syntax near the keyword 'WITH'.` The `WITH` clause belongs to `CREATE`; `ALTER` uses `SET`.
+
+### Why option d is wrong
+
+- With `EXECUTE` but no `REFERENCES` on the credential, Dana is stopped at the credential check (`Msg 15151 Cannot find the credential ...`), so requirement 2 is not met.
+- `DROP` + `CREATE` violates requirement 3 by design, and it can fail outright: with a schemabound view selecting `AI_GENERATE_EMBEDDINGS(NoteText USE MODEL NotesEmbedder)`, the drop is refused with `Msg 3729 Cannot DROP 'NotesEmbedder' because it is being referenced by object 'NoteVectors'.` Related guard: a credential used by a model cannot be dropped either — `Msg 46556 Cannot drop the credential 'https://claimsdesk-oai.openai.azure.com/' because it is used by an external model.`
+
+### Other engine-verified behaviours worth knowing
+
+- `AI_GENERATE_EMBEDDINGS` needs the instance option `external rest endpoint enabled` = 1; otherwise: `Msg 31643 'ai_generate_embeddings' is disabled on this instance of SQL Server. Use sp_configure 'external rest endpoint enabled' to enable it.`
+- `LOCATION` must be HTTPS. An `http://localhost:11434/api/embed` Ollama model is *created* without complaint but every call fails with `Msg 31610 Accessing the external endpoint is only allowed via HTTPS.`
+- A `NULL` input is not skipped: `UPDATE ... SET Embedding = AI_GENERATE_EMBEDDINGS(NoteText USE MODEL NotesEmbedder)` on the row whose `NoteText` is `NULL` fails with `Msg 31701 Parameter 'input data' must be specified. This parameter cannot be NULL.` Filter with `WHERE NoteText IS NOT NULL`.
+- The function's `PARAMETERS` argument must be a **json**-typed value (`DECLARE @p JSON = N'{"dimensions":256}'`); a plain string literal fails with `Msg 8116 Argument data type varchar is invalid for argument 3 of ai_generate_embeddings function.` Runtime parameters override the same key in the model's `PARAMETERS`.
+- Model names are unique per database: a second `CREATE EXTERNAL MODEL NotesEmbedder` fails with `Msg 46502 Type with name 'NotesEmbedder' already exists.` There is no `DROP EXTERNAL MODEL IF EXISTS` form (`Msg 156 Incorrect syntax near the keyword 'IF'`).
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+CREATE EXTERNAL MODEL name [AUTHORIZATION owner]
+WITH ( LOCATION   = 'https://…',                  -- HTTPS only
+       API_FORMAT = 'Azure OpenAI' | 'OpenAI' | 'Ollama' | 'ONNX Runtime',
+       MODEL_TYPE = EMBEDDINGS,                    -- the only type
+       MODEL      = 'text-embedding-3-large',
+     [ CREDENTIAL = [https://host/] ,]             -- DATABASE SCOPED CREDENTIAL named as the URL
+     [ PARAMETERS = '{"dimensions":1024}' ] );     -- JSON appended to every request
+
+ALTER EXTERNAL MODEL name SET ( … );               -- SET, not WITH; in place
+DROP  EXTERNAL MODEL name;                         -- blocked by schemabound references (3729)
+SELECT * FROM sys.external_models;                  -- you see only models you may use
+```
+
+Permissions come in two layers: **managing** models needs `CREATE EXTERNAL MODEL` / `ALTER ANY EXTERNAL MODEL`; **using** one in `AI_GENERATE_EMBEDDINGS(text USE MODEL name)` needs `EXECUTE ON EXTERNAL MODEL::name` **and** `REFERENCES` on the credential — plus `sp_configure 'external rest endpoint enabled', 1` at instance level on SQL Server 2025.

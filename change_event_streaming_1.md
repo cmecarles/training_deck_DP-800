@@ -1,0 +1,161 @@
+# SQL Server question — Change Event Streaming 1
+
+## Statement
+
+An insurer runs its claims system on **SQL Server 2025** (Developer edition in the lab, Standard in production) in a database named `ClaimStream`, with the database migrating to **Azure SQL Database** next quarter. The DDL:
+
+```sql
+CREATE DATABASE ClaimStream;
+GO
+USE ClaimStream;
+GO
+CREATE SCHEMA Claims;
+GO
+CREATE TABLE Claims.Claim
+(
+    ClaimId  INT           NOT NULL PRIMARY KEY,
+    PolicyNo CHAR(8)       NOT NULL,
+    Status   VARCHAR(12)   NOT NULL,
+    Amount   DECIMAL(10,2) NOT NULL
+);
+INSERT INTO Claims.Claim VALUES
+  (1,'PL-10001','OPEN',1200.00), (2,'PL-10002','OPEN',450.00), (3,'PL-10003','PAID',9800.00);
+GO
+```
+
+Before deciding, the team **verified two of the candidate mechanisms locally** (SQL Server 2025 RTM; `SELECT status_desc FROM sys.dm_server_services WHERE servicename LIKE 'SQL Server Agent%'` returned `Running`):
+
+```sql
+-- Change Tracking
+ALTER DATABASE ClaimStream SET CHANGE_TRACKING = ON (CHANGE_RETENTION = 3 DAYS, AUTO_CLEANUP = ON);
+ALTER TABLE Claims.Claim ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = ON);
+GO
+DECLARE @v0 BIGINT = CHANGE_TRACKING_CURRENT_VERSION();          -- 0
+UPDATE Claims.Claim SET Status = 'REVIEW', Amount = 1350.00 WHERE ClaimId = 1;
+UPDATE Claims.Claim SET Status = 'PAID' WHERE ClaimId = 1;
+DELETE Claims.Claim WHERE ClaimId = 2;
+INSERT INTO Claims.Claim VALUES (4,'PL-10004','OPEN',300.00);
+SELECT CHANGE_TRACKING_CURRENT_VERSION() AS version_now;         -- 4
+SELECT ct.ClaimId, ct.SYS_CHANGE_VERSION, ct.SYS_CHANGE_OPERATION, c.Status, c.Amount
+FROM CHANGETABLE(CHANGES Claims.Claim, @v0) AS ct
+LEFT JOIN Claims.Claim AS c ON c.ClaimId = ct.ClaimId ORDER BY ct.ClaimId;
+```
+
+```text
+ClaimId  SYS_CHANGE_VERSION  SYS_CHANGE_OPERATION  Status  Amount
+1        2                   U                     PAID    1350.00
+2        3                   D                     NULL    NULL
+4        4                   I                     OPEN    300.00
+```
+
+```sql
+-- Change Data Capture
+EXEC sys.sp_cdc_enable_db;
+EXEC sys.sp_cdc_enable_table @source_schema = N'Claims', @source_name = N'Claim',
+                             @role_name = NULL, @supports_net_changes = 1;
+-- messages: Job 'cdc.ClaimStream_capture' started successfully.
+--           Job 'cdc.ClaimStream_cleanup' started successfully.
+UPDATE Claims.Claim SET Amount = 500.00 WHERE ClaimId = 4;
+DELETE Claims.Claim WHERE ClaimId = 3;
+WAITFOR DELAY '00:00:25';
+DECLARE @from binary(10) = sys.fn_cdc_get_min_lsn('Claims_Claim'), @to binary(10) = sys.fn_cdc_get_max_lsn();
+SELECT __$operation, __$update_mask, ClaimId, PolicyNo, Status, Amount
+FROM cdc.fn_cdc_get_all_changes_Claims_Claim(@from, @to, N'all update old') ORDER BY __$start_lsn, __$seqval, __$operation;
+```
+
+```text
+__$operation  __$update_mask  ClaimId  PolicyNo  Status  Amount
+3             0x08            4        PL-10004  OPEN    300.00
+4             0x08            4        PL-10004  OPEN    500.00
+1             0x0F            3        PL-10003  PAID    9800.00
+```
+
+`sys.tables` now lists `cdc.Claims_Claim_CT` (columns `__$start_lsn, __$end_lsn, __$seqval, __$operation, __$update_mask, ClaimId, PolicyNo, Status, Amount, __$command_id`) and `msdb.dbo.cdc_jobs` holds a `capture` and a `cleanup` job.
+
+The new requirement is an **event-driven integration**:
+
+1. Every `INSERT`, `UPDATE` and `DELETE` on `Claims.Claim` must be **pushed** to **Azure Event Hubs** in near real time as a self-describing message, consumed independently by three microservices and a Fabric Eventstream.
+2. Each update message must carry both the **previous and the new column values**; each delete must carry the deleted row's values.
+3. The database must **not** accumulate change/capture tables of its own, and no application-side polling job may be required to move changes to Event Hubs.
+4. The mechanism must **not depend on SQL Server Agent jobs** and must keep working unchanged after the move to Azure SQL Database.
+5. Row-level security and masking are not in scope; the source table has a primary key and the database uses the full recovery model.
+
+Which mechanism should you implement?
+
+### a.
+
+```sql
+ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;   -- SQL Server 2025 only
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = '<password>';
+CREATE DATABASE SCOPED CREDENTIAL EventHubsCred
+    WITH IDENTITY = '<SAS policy name>', SECRET = '<policy key>';   -- or IDENTITY = 'Managed Identity'
+EXEC sys.sp_enable_event_stream;
+EXEC sys.sp_create_event_stream_group
+    @stream_group_name = N'ClaimsGroup', @destination_type = N'AzureEventHubsApacheKafka',
+    @destination_location = N'claims-ns.servicebus.windows.net:9093/claims-hub',
+    @destination_credential = EventHubsCred, @max_message_size_kb = 256, @partition_key_scheme = N'None';
+EXEC sys.sp_add_object_to_event_stream_group N'ClaimsGroup', N'Claims.Claim';
+```
+
+### b.
+
+Keep CDC as verified above. Deploy a timer-triggered Azure Function (every 10 seconds) that reads `cdc.fn_cdc_get_all_changes_Claims_Claim(@from, @to, N'all update old')` for the new LSN range, builds one message per row pair, and sends it to Event Hubs.
+
+### c.
+
+Keep Change Tracking as verified above. Deploy an Azure Function with `[SqlTrigger("[Claims].[Claim]", "SqlConnectionString")]`; for each `SqlChange` in the batch, send `{ Operation, Item }` to Event Hubs.
+
+### d.
+
+Add `RowVer ROWVERSION` to `Claims.Claim`. Build an Azure Logic Apps workflow whose trigger is the SQL Server connector's **When an item is modified (V2)** (polling every 15 seconds) and whose action sends the row to Event Hubs.
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+The five mechanisms in this skill bullet answer different questions. Score each option against the requirements:
+
+| Requirement | a (CES) | b (CDC + poller) | c (CT + SQL trigger) | d (Logic Apps) |
+| --- | --- | --- | --- | --- |
+| 1. Push to Event Hubs, multi-consumer | satisfied | **violated** (poller) | **violated** (function pushes, but CT is polled) | **violated** (polling) |
+| 2. Old + new values, deletes with values | satisfied | satisfied | **violated** | **violated** |
+| 3. No capture tables, no app polling job | satisfied | **violated** | **violated** (`az_func` leases + polling loop) | satisfied |
+| 4. No SQL Agent, unchanged in Azure SQL DB | satisfied | **violated** on SQL Server | satisfied | satisfied |
+
+### Why option a is correct
+
+**Change event streaming (CES)** — preview in SQL Server 2025, Azure SQL Database, Azure SQL Managed Instance and SQL database in Fabric — reads the transaction log asynchronously and **publishes each DML change as a CloudEvent** (JSON or Avro) directly to Azure Event Hubs or Fabric Eventstream. The message carries the current schema, the **previous values and the new values**, so requirement 2 is met natively. There are no capture tables, no consumer-side polling and no Agent job: the stream group *is* the pipeline (requirements 1, 3, 4). Event Hubs' publish-subscribe model gives the three microservices and the Eventstream independent consumers. The catalog on the verified instance already exposes the procedures (`sp_enable_event_stream`, `sp_create_event_stream_group`, `sp_add_object_to_event_stream_group`, `sp_remove_object_from_event_stream_group`, `sp_drop_event_stream_group`, `sp_disable_event_stream`), and `sys.databases.is_event_stream_enabled = 1` / `sys.tables.is_replicated = 1` report the state afterwards. The exact call in option a follows the documented order: master key, credential (SAS key or `'Managed Identity'`), enable at database level, create the group (destination type `AzureEventHubsApacheKafka` for SQL Server/MI, `AzureEventHubs` for Azure SQL Database), add the table. Prerequisites match the scenario: `PREVIEW_FEATURES = ON` on SQL Server 2025 (not needed in Azure SQL Database), full recovery model, a primary key, and note that CES does not seed existing rows and is incompatible with CDC on the same database — which is why CDC must be disabled first.
+
+### Why option b is wrong
+
+CDC captures before/after images (`__$operation` 3 = before update, 4 = after update, 1 = delete, 2 = insert; `__$update_mask 0x08` flags the fourth captured column, `Amount`) — but it does so **into capture tables inside the database** (`cdc.Claims_Claim_CT`, requirement 3) and, on SQL Server, the log scan runs as the **SQL Server Agent jobs** `cdc.ClaimStream_capture` / `cdc.ClaimStream_cleanup` that the engine created and started (requirement 4). Nothing pushes anything: the Function must poll LSN ranges (requirement 1/3). Note also that the row inserted *before* `sp_cdc_enable_table` (claim 4's insert) never appears — CDC starts at enable time. In Azure SQL Database CDC uses an internal scheduler instead of Agent, but the capture tables and polling remain.
+
+### Why option c is wrong
+
+The subtle distractor. Change Tracking is cheap and the Azure Functions SQL trigger does push to the function — but it is built **on** Change Tracking, which records only **primary keys and a version** (`SYS_CHANGE_VERSION`, `SYS_CHANGE_OPERATION`), never column values. The verified `CHANGETABLE` output shows claim 1's two updates coalesced into a single `U` row at version 2 with only the *current* values from the join, and claim 2's `D` row with no values at all. `SqlChange.Item` is populated the same way (current row, or just the key for deletes), so requirement 2 fails. The trigger is also a polling loop (`Sql_Trigger_PollingIntervalMs`, default 1000 ms) that persists state in `az_func` leases tables.
+
+### Why option d is wrong
+
+The Logic Apps SQL connector triggers are **polling** triggers with hard column requirements: *When an item is created (V2)* needs an `IDENTITY` column, *When an item is modified (V2)* needs a `ROWVERSION` column and "fires on both INSERT and UPDATE row operations" — it **cannot see deletes**, and it delivers only the current row, never previous values. Requirements 1 and 2 fail.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output (the CES procedure catalog was verified; the stream itself needs an Event Hubs destination and was not executed).
+
+## DP-800 Exam Rule to Remember
+
+```text
+Change Tracking      → WHICH rows changed (PK + version), CHANGETABLE(CHANGES ...), retention window
+Azure Functions SQL  → built ON Change Tracking; polls; az_func leases; current row only
+  trigger binding
+CDC                  → WHAT changed (before/after images) into cdc.<schema>_<table>_CT;
+                       SQL Agent capture/cleanup jobs on SQL Server; consumers poll LSN ranges
+Logic Apps SQL       → polling trigger; needs IDENTITY (created) / ROWVERSION (modified); no deletes
+  connector
+Change Event         → PUSH each DML change (old + new values) as a CloudEvent to Event Hubs /
+  Streaming (CES)      Fabric Eventstream; no capture tables, no Agent; SQL 2025 (PREVIEW_FEATURES),
+                       Azure SQL DB/MI, Fabric SQL; sp_enable_event_stream →
+                       sp_create_event_stream_group → sp_add_object_to_event_stream_group
+```
+
+Ask three questions: does the consumer need **values or just keys**, must changes be **pushed or may they be polled**, and where may state live (**inside the database** or **outside**). "Push, with old and new values, no capture tables, no Agent" has exactly one answer: CES.

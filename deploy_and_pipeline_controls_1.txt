@@ -1,0 +1,232 @@
+============================================================
+ SQL Server question — Deploy and Pipeline Controls 1
+============================================================
+
+Statement
+---------
+
+A city's parking department maintains the Azure SQL Database
+ParkPermit as an SDK-style SQL Database Project in the GitHub
+repository cityparking/parkpermit. The team has a staging and a
+production database, and two database administrators who form the
+GitHub team @cityparking/dba-team.
+
+A developer opens a pull request that changes
+Permits/Tables/Permit.sql so that the single column HolderName
+NVARCHAR(120) is replaced by HolderFirstName NVARCHAR(60) and
+HolderLastName NVARCHAR(60). Production holds 480,000 permits.
+
+The department's release policy states:
+
+1. Every pull request must build the project and show reviewers
+   WHAT THE DEPLOYMENT WOULD DO to the staging database, WITHOUT
+   CHANGING any database.
+2. Changes to anything under Permits/Tables/ cannot be merged
+   until a member of @cityparking/dba-team has approved the pull
+   request; nobody, administrators included, may push directly to
+   main.
+3. A merge to main deploys STAGING automatically. PRODUCTION is
+   deployed only after TWO named approvers accept it, and a
+   deployment that would LOSE DATA must fail rather than proceed.
+4. It must be possible to re-run the production deployment ON
+   DEMAND without a new commit.
+
+Which configuration implements the policy?
+
+a.
+
+Branch protection on main: require a pull request with 1 approval,
+REQUIRE REVIEW FROM CODE OWNERS, require the build status check,
+and DO NOT ALLOW BYPASSING THE ABOVE SETTINGS. Add:
+
+# .github/CODEOWNERS
+/Permits/Tables/   @cityparking/dba-team
+
+Create the production environment with the two DBAs as REQUIRED
+REVIEWERS, and this workflow:
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: dotnet build ParkPermit.sqlproj -c Release
+      - if: github.event_name == 'pull_request'
+        run: >
+          sqlpackage /Action:DeployReport /SourceFile:bin/Release/ParkPermit.dacpac
+          /TargetConnectionString:"${{ secrets.STAGING_SQL_CONNECTION }}" /OutputPath:report.xml
+      - uses: actions/upload-artifact@v4
+        with: { name: dacpac, path: bin/Release/ParkPermit.dacpac }
+  deploy-staging:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dacpac }
+      - run: sqlpackage /Action:Publish /SourceFile:ParkPermit.dacpac /TargetConnectionString:"${{ secrets.SQL_CONNECTION }}"
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dacpac }
+      - run: >
+          sqlpackage /Action:Publish /SourceFile:ParkPermit.dacpac
+          /TargetConnectionString:"${{ secrets.SQL_CONNECTION }}" /p:BlockOnPossibleDataLoss=True
+
+b.
+
+Same branch protection and CODEOWNERS as option a, but no
+environments. A single deploy job runs on push to main and
+publishes staging and then production with
+/p:BlockOnPossibleDataLoss=False /p:DropObjectsNotInSource=True,
+"so that releases never fail on a column change and the databases
+always match the project". Approval is provided by the
+pull-request review.
+
+c.
+
+Add the CODEOWNERS file (same content) but leave REQUIRE REVIEW
+FROM CODE OWNERS unchecked, "because GitHub automatically requests
+the owners' review anyway". Trigger production deployment on
+pull_request so reviewers can inspect the deployed result before
+approving, and run sqlpackage /Action:Publish ...
+/p:BlockOnPossibleDataLoss=True.
+
+d.
+
+Generate the deployment script instead of deploying — sqlpackage
+/Action:Script /SourceFile:... /TargetConnectionString:...
+/OutputPath:deploy.sql — on every push to main, upload it as an
+artifact, and let the two DBAs run it by hand in SQL Server
+Management Studio after reading it. Gate the workflow with a
+workflow_dispatch input approved: true that the DBAs must set when
+they trigger it.
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+The policy maps one-to-one onto GitHub's control surfaces and
+SqlPackage's actions: WHAT WOULD HAPPEN is a DeployReport; WHO MAY
+MERGE WHAT is branch protection plus CODEOWNERS; WHO MAY DEPLOY
+WHERE is an environment with required reviewers; NEVER LOSE DATA
+is BlockOnPossibleDataLoss; ON DEMAND is workflow_dispatch. Option
+a uses each for its purpose.
+
+Why option a is correct
+-----------------------
+
+- RULE 1 — SHOW, DON'T CHANGE. On pull_request the workflow builds
+  the .dacpac and runs sqlpackage /Action:DeployReport against
+  staging. DeployReport compares the source .dacpac with the
+  target and writes an XML report of the operations a publish
+  would perform (including the HolderName drop flagged as a
+  data-loss operation) — it makes NO changes. The if: guards keep
+  the deploy-* jobs off pull-request runs, so a PR never touches a
+  database.
+- RULE 2 — REQUIRED OWNER REVIEW, NO DIRECT PUSHES. CODEOWNERS
+  (valid locations: repository root, docs/, or .github/) maps the
+  path pattern /Permits/Tables/ to the team @cityparking/dba-team;
+  owners are automatically requested for review, and — only when
+  branch protection enables REQUIRE REVIEW FROM CODE OWNERS — an
+  approval from at least one owner becomes MANDATORY for files
+  matching the pattern (the last matching pattern wins; the team
+  must have write access). "Require a pull request before merging"
+  blocks direct pushes to main, and DO NOT ALLOW BYPASSING THE
+  ABOVE SETTINGS extends the rules to administrators.
+- RULE 3 — STAGED ROLLOUT WITH APPROVAL AND A DATA-LOSS STOP. push
+  to main runs build, then deploy-staging, then deploy-production.
+  The production job carries environment: production; because that
+  environment has REQUIRED REVIEWERS (up to six people or teams),
+  the job pauses before starting and waits until the reviewers
+  approve — the environment's secrets are not even exposed until
+  then. /p:BlockOnPossibleDataLoss=True (the default, stated
+  explicitly here) makes the publish terminate during validation
+  if the change could lose data. For this particular change that
+  is exactly what will happen — and it is the point: the right
+  delivery is a two-release expand/contract (add the two new
+  columns and back-fill them in a post-deployment script; drop
+  HolderName in a later release once nothing reads it), or a
+  pre-deployment script that preserves the data before the drop.
+- RULE 4 — ON DEMAND. workflow_dispatch lets an authorized person
+  start the same workflow manually from the Actions tab (or gh
+  workflow run), reusing the build and going through the same
+  environment approval.
+
+Why option b is wrong
+---------------------
+
+Two properties, both dangerous as blanket settings.
+BlockOnPossibleDataLoss=False lets the publish drop HolderName and
+its 480,000 values without stopping — the exact event rule 3
+forbids. DropObjectsNotInSource=True deletes from the target every
+object absent from the project — indexes a DBA added, a monitoring
+view, a diagnostic table — silently. Both belong, if ever, to a
+deliberate one-off run after a DeployReport has been read. And a
+pull-request review is not a deployment approval: the reviewer
+approved the code; nobody approved this deployment to production
+at this time, which is what an environment gate records. Without
+environments there is no per-job secret scoping either.
+
+Why option c is wrong
+---------------------
+
+This is the subtle distractor: CODEOWNERS does cause GitHub to
+REQUEST the owners' review automatically. But a request is not a
+requirement — without the REQUIRE REVIEW FROM CODE OWNERS
+branch-protection option, a pull request with an approval from any
+other reviewer can be merged while the DBAs' request is still
+pending. Deploying production on pull_request is worse: it runs on
+unreviewed, unmerged code (and from a fork the secrets would not
+even be available); "inspect the deployed result" is what
+DeployReport and the staging deployment exist for.
+
+Why option d is wrong
+---------------------
+
+/Action:Script is a legitimate, useful action: it generates the
+T-SQL that a publish would execute, to be read and archived. As
+the deployment mechanism it breaks the pipeline: humans running
+scripts by hand in SSMS bypass every control (no environment
+approval trail, no artifact lineage, a script produced against
+yesterday's target state executed against today's), and the
+department has replaced automation with a manual procedure. A
+workflow_dispatch INPUT is not an approval gate — anyone with
+write access can type approved: true — whereas environment
+required reviewers are enforced by GitHub, recorded, and limited
+to the named people or teams.
+
+Conceptual question (Azure / tooling); not executed against an
+engine.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+SqlPackage:  /Action:Publish  = apply changes        (/p:BlockOnPossibleDataLoss=True default: stop on data loss;
+                                                       /p:DropObjectsNotInSource=False default; /p:IncludeCompositeObjects
+                                                       for same-database references; /Profile:x.publish.xml for saved props)
+             /Action:Script   = write the T-SQL, do not run it
+             /Action:DeployReport = XML of what Publish would do, no changes   -> the PR check
+Branch protection (main):  require PR + N approvals, require status checks, Require review from Code Owners,
+             restrict who can push, do not allow bypassing (applies to admins), no force pushes
+CODEOWNERS:  root | docs/ | .github/;  "<pattern> @user | @org/team";  last match wins; owners auto-requested;
+             REQUIRED only with the branch-protection checkbox
+Environments:  job-level `environment: production` -> required reviewers (approval gate), wait timer,
+             deployment-branch restriction, environment-scoped secrets
+Triggers:  pull_request = validate (build, DeployReport) | push to main = deploy staging -> production
+           workflow_dispatch = manual, on-demand run with the same gates
+Column rename/drop with data: expand (add + back-fill) now, contract (drop) later; never blanket-disable the data-loss block.

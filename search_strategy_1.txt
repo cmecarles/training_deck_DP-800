@@ -1,0 +1,290 @@
+============================================================
+ SQL Server question — Search Strategy 1
+============================================================
+
+Statement
+---------
+
+PartsPro is the catalog database of an industrial-parts
+distributor on Azure SQL Database. The catalog table holds about
+12 MILLION parts:
+
+CREATE TABLE Catalog.Parts
+(
+    PartId      INT            NOT NULL PRIMARY KEY,
+    PartNumber  VARCHAR(30)    NOT NULL UNIQUE,   -- e.g. 'BRG-6205-2RS'
+    Name        NVARCHAR(150)  NOT NULL,
+    Description NVARCHAR(MAX)  NOT NULL,          -- English, Spanish, German
+    Category    NVARCHAR(60)   NOT NULL,
+    Embedding   VECTOR(1536)   NOT NULL           -- text-embedding-3-large, dimensions = 1536
+);
+
+Three search experiences must be delivered, and the team must also
+decide how to EVALUATE the search:
+
+- SEARCH 1 — TECHNICIAN LOOKUP. Technicians type exact part
+  numbers (BRG-6205-2RS), prefixes (BRG-62*), and boolean
+  expressions such as bearing AND NOT sealed. Results must be
+  exact: a part number that is one character off must not match.
+- SEARCH 2 — "DESCRIBE THE PROBLEM" SEARCH. Buyers type natural
+  language, often paraphrased and sometimes in Spanish or German:
+  "something to stop a conveyor belt slipping in a damp warehouse"
+  should find anti-slip belt lagging even though no word of the
+  query appears in the description.
+- SEARCH 3 — MAIN CATALOG SEARCH BOX. One box that must give
+  KEYWORD PRECISION (an exact model name typed by an expert ranks
+  first) and SEMANTIC RECALL (paraphrases still find the right
+  parts), over all 12 million rows, with sub-second latency.
+- EVALUATION. Because the 12-million-row semantic search will use
+  an approximate vector index, the team must be able to say how
+  much accuracy the approximation costs and when to bypass it.
+
+Which strategy is correct?
+
+a.
+
+Search 1: a full-text index on PartNumber, Name, Description
+queried with CONTAINS (prefix terms, AND / AND NOT). Search 2: a
+DiskANN vector index on Embedding queried with VECTOR_SEARCH
+(cosine). Search 3: hybrid — run the full-text ranking
+(CONTAINSTABLE / FREETEXTTABLE) and the vector ranking, then fuse
+them with reciprocal rank fusion. Evaluation: on a sample of a few
+hundred real queries, compute RECALL@10 of VECTOR_SEARCH against
+the exact TOP (10) ... ORDER BY VECTOR_DISTANCE(...) result,
+record latency and index build time, and use exact search instead
+of the index whenever a WHERE filter (category, supplier) leaves
+at most a few tens of thousands of candidate rows.
+
+b.
+
+Use vector search for all three: embed part numbers, names, and
+descriptions together so that the model "understands" codes as
+well as prose; one DiskANN index on Embedding serves every search
+box. Evaluation: compute the AVERAGE COSINE DISTANCE of the rows
+each query returns — the smaller the average, the better the
+search.
+
+c.
+
+Use full-text search for all three: CONTAINS with
+FORMSOF(THESAURUS, ...) for synonyms and per-language thesaurus
+files (Spanish, German) so that paraphrases and translations
+match; hybrid search is unnecessary because FREETEXT already
+"matches meaning". Evaluation: count how many queries return at
+least one row.
+
+d.
+
+Search 1: full-text with CONTAINS. Searches 2 and 3: the DiskANN
+vector index alone — an expert's exact model name is text too, so
+its embedding will rank the right part first. Evaluation: validate
+the index by verifying, for every production query, that
+VECTOR_SEARCH returns the same 10 rows as an exact VECTOR_DISTANCE
+scan of all 12 million rows; if any query differs, the index is
+faulty and must be rebuilt.
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+The skills outline asks you to choose among full-text, semantic
+vector, and hybrid search, and to evaluate vector and hybrid
+search. Each technique answers a different question:
+
+Technique       | Answers         | Strong at       | Blind to
+----------------+-----------------+-----------------+-----------------
+Full-text       | "which rows     | exact codes,    | meaning; other
+(CONTAINS /     | contain these   | prefixes,       | languages;
+FREETEXT)       | tokens?"        | phrases,        | paraphrase
+                |                 | boolean logic,  |
+                |                 | inflections (FO |
+                |                 | RMSOF(INFLECTIO |
+                |                 | NAL))           |
+----------------+-----------------+-----------------+-----------------
+Vector (VECTOR_ | "which rows     | paraphrase,     | exact codes (a
+DISTANCE /      | mean something  | intent,         | part number is
+VECTOR_SEARCH)  | similar?"       | multilingual    | an opaque token
+                |                 | retrieval       | to an embedding
+                |                 |                 | model)
+----------------+-----------------+-----------------+-----------------
+Hybrid (both,   | both at once    | keyword         | nothing extra to
+fused with RRF) |                 | precision +     | maintain beyond
+                |                 | semantic recall | the two indexes
+
+Why option a is correct
+-----------------------
+
+- SEARCH 1 -> FULL-TEXT. Part numbers, prefixes, and booleans are
+  exactly the CONTAINS feature set: CONTAINS(PartNumber,
+  '"BRG-62*"') for prefixes (the asterisk must be inside the
+  double quotes), 'bearing AND NOT sealed' for boolean logic, plus
+  NEAR and FORMSOF(INFLECTIONAL, ...) when needed. Matching is
+  token-exact: one character off does not match, which is the
+  requirement.
+- SEARCH 2 -> VECTOR. Third-generation OpenAI embeddings are
+  evaluated on multilingual retrieval, so a Spanish query lands
+  near an English description with the same meaning; no word
+  overlap is required. On 12 million rows an exhaustive
+  VECTOR_DISTANCE scan is too slow for an interactive box, so an
+  approximate DiskANN index (CREATE VECTOR INDEX ... WITH (METRIC
+  = 'cosine', TYPE = 'diskann') + VECTOR_SEARCH) is the right tool
+  — with the accuracy trade-off measured, see below.
+- SEARCH 3 -> HYBRID. One list cannot satisfy both requirements:
+  full-text alone misses paraphrases; vector alone ranks an exact
+  model name only approximately first. Hybrid search runs both and
+  fuses the two rankings — reciprocal rank fusion (score = Σ 1/(k
+  + rank), k = 60) is the standard, score-scale-free way to merge
+  a full-text RANK list and a vector distance list.
+- EVALUATION -> RECALL@K VS EXACT, PLUS LATENCY AND BUILD COST.
+  Microsoft defines recall as "the proportion of the approximate
+  nearest neighbors that are identified by the algorithm, compared
+  to the exact nearest neighbors that an exhaustive search would
+  return"; "a perfect recall, which is equivalent to no
+  approximation, is 1". Measuring it on a representative sample of
+  queries against the exact ORDER BY VECTOR_DISTANCE result is the
+  only way to quantify what the approximation costs. Latency and
+  index build time complete the picture — DiskANN indexes are
+  expensive to build and to keep up to date. And the documented
+  guidance is that exact search is fine when few vectors are
+  searched: "less than 50,000 vectors as a general recommendation"
+  — "the table can contain many more vectors as long as your
+  search predicates reduce the number of vectors to use for
+  neighbor search to 50,000 or fewer". A filtered technician query
+  easily meets that, and exact search has recall 1 by definition.
+
+Why option b is wrong
+---------------------
+
+An embedding model has no notion of a part number as an
+identifier: BRG-6205-2RS and BRG-6205-2RZ embed to nearly
+identical vectors, so a one-character-off code will match,
+violating Search 1. Boolean logic (AND NOT sealed) cannot be
+expressed as a nearest-neighbour query at all. The evaluation
+metric is wrong too: a small average distance says the returned
+rows are close to the query vector, not that they are the right
+rows — an approximate index that misses the true nearest
+neighbours and returns slightly farther ones still has a "good"
+average. Quality of an ANN index is recall against the exact
+result, not the distances of whatever came back.
+
+Why option c is wrong
+---------------------
+
+Full-text is lexical. A thesaurus maps listed words to listed
+synonyms; it cannot map "stop a conveyor belt slipping in a damp
+warehouse" to anti-slip lagging unless someone wrote that rule,
+and it cannot translate. Per-language thesaurus files would have
+to enumerate every paraphrase in every language — unmaintainable
+and still incomplete. FREETEXT "matches the meaning, but not the
+exact wording" only in the narrow sense of inflectional forms and
+thesaurus expansions of the same words; it is not semantic search.
+"Returns at least one row" measures nothing about relevance.
+
+Why option d is wrong
+---------------------
+
+This is the subtle distractor because its Search 1 and Search 2
+choices are right. Search 3 fails: vector ranking is approximate
+and semantic — an exact model name is a token match that full-text
+ranks first deterministically, while its embedding competes with
+similar-sounding products and may land second or fifth. That is
+precisely why the outline lists hybrid search. The evaluation is
+unworkable: comparing every production query against an exhaustive
+12-million-row scan means running the exact search anyway, which
+defeats the index; and treating any difference as a fault
+misunderstands ANN — a recall below 1 is the expected, accepted
+trade-off ("trade off some accuracy, particularly recall, for
+significant speed gains"). You measure recall on a sample and
+decide whether it is acceptable; you do not demand identity.
+
+What each of the three searches looks like in T-SQL
+---------------------------------------------------
+
+Search 1 — exact, prefix, and boolean keyword logic (full-text):
+
+SELECT PartId, PartNumber, Name
+FROM Catalog.Parts
+WHERE CONTAINS((PartNumber, Name, Description), '"BRG-62*" OR (bearing AND NOT sealed)');
+
+Search 2 — semantic, approximate, over the whole table (vector
+index):
+
+DECLARE @qv VECTOR(1536) = AI_GENERATE_EMBEDDINGS(N'something to stop a conveyor belt slipping in a damp warehouse'
+                                                  USE MODEL PartsEmbedder);
+SELECT p.PartId, p.Name, r.distance
+FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
+                   SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS r
+ORDER BY r.distance;
+
+Search 3 — hybrid: two rankings, one fused list (reciprocal rank
+fusion, k = 60):
+
+WITH Kw AS
+(
+    SELECT [KEY] AS PartId, ROW_NUMBER() OVER (ORDER BY [RANK] DESC, [KEY]) AS Rnk
+    FROM CONTAINSTABLE(Catalog.Parts, (Name, Description), 'conveyor AND belt', 50)
+),
+Vec AS
+(
+    SELECT p.PartId, ROW_NUMBER() OVER (ORDER BY r.distance, p.PartId) AS Rnk
+    FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
+                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 50) AS r
+)
+SELECT TOP (10) COALESCE(k.PartId, v.PartId) AS PartId,
+       ISNULL(1.0e0 / (60 + k.Rnk), 0) + ISNULL(1.0e0 / (60 + v.Rnk), 0) AS RrfScore
+FROM Kw AS k
+FULL OUTER JOIN Vec AS v ON v.PartId = k.PartId
+ORDER BY RrfScore DESC, PartId;
+
+Evaluation — recall@10 of the approximate index for one query,
+computed in T-SQL (run it over a sampled query set and average):
+
+WITH Exact AS
+(
+    SELECT TOP (10) PartId
+    FROM Catalog.Parts
+    ORDER BY VECTOR_DISTANCE('cosine', Embedding, @qv), PartId      -- exact kNN, never uses the index
+),
+Approx AS
+(
+    SELECT p.PartId
+    FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
+                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS r
+)
+SELECT COUNT(*) / 10.0 AS RecallAt10
+FROM Exact AS e
+WHERE EXISTS (SELECT 1 FROM Approx AS a WHERE a.PartId = e.PartId);
+
+The same harness reports latency by wrapping each variant in SET
+STATISTICS TIME ON (or by reading sys.dm_exec_query_stats), and
+the index build cost is simply the elapsed time and CPU of CREATE
+VECTOR INDEX on the production-sized table — recorded once,
+because a first-version vector index must be dropped and rebuilt
+whenever the table changes.
+
+Conceptual question (Azure / tooling); not executed against an
+engine.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+exact codes / prefixes / phrases / AND, OR, AND NOT / NEAR   → full-text  (CONTAINS, CONTAINSTABLE)
+paraphrase, intent, multilingual                              → vector     (VECTOR_DISTANCE exact,
+                                                                            VECTOR_SEARCH + DiskANN approx.)
+keyword precision AND semantic recall in one box              → hybrid     (both lists fused with RRF)
+
+Evaluating vector / hybrid search:
+
+- RECALL@K = |ANN top-k ∩ exact top-k| / k, measured on a sample
+  of real queries against ORDER BY VECTOR_DISTANCE (exact, never
+  uses the index); perfect = 1.
+- Record LATENCY and INDEX BUILD/MAINTENANCE COST; ANN is a
+  speed-for-recall trade.
+- EXACT SEARCH IS FINE for small sets — roughly ≤ 50,000 candidate
+  vectors after WHERE filtering — so use it (recall 1) when
+  filters are selective, and reserve the index for the whole-table
+  case.

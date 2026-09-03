@@ -1,0 +1,142 @@
+# SQL Server question — DAB deployment 1
+
+## Statement
+
+A ferry operator keeps its timetable in an Azure SQL database named `RiverFerry`. The table `Ferry.Sailings` (primary key `SailingId`) must be published read-only through **Data API builder (DAB)**, hosted as a container in **Azure Container Apps**. A single-page web app served from `https://app.riverferry.example` calls the API directly from the browser.
+
+The platform team's requirements:
+
+1. The connection string must **never** appear in the repository, the container image, or `dab-config.json`. It is injected at run time as the Container Apps environment variable `DATABASE_CONNECTION_STRING`.
+2. The deployed runtime must run in **production** mode: no interactive tooling (Swagger UI, Nitro) may be reachable, and the GraphQL **schema must not be discoverable** by clients.
+3. REST must be served from the base path **`/data`** (not the default) and GraphQL from the default path.
+4. The browser app must be able to call the API cross-origin from `https://app.riverferry.example` only.
+5. The CI pipeline must **fail before building the image** if the configuration is invalid (schema, permissions, connectivity, entity metadata).
+6. The Container Apps health probe, which runs unauthenticated, must get an HTTP 200 from DAB's **`/health`** endpoint in production.
+
+The team started with:
+
+```bash
+dab init --database-type mssql \
+         --connection-string "@env('DATABASE_CONNECTION_STRING')" \
+         --host-mode production \
+         --rest.path /data \
+         --cors-origin "https://app.riverferry.example"
+dab add Sailing --source Ferry.Sailings --permissions "anonymous:read"
+```
+
+and builds the image with `FROM mcr.microsoft.com/azure-databases/data-api-builder:latest` / `COPY dab-config.json /App/dab-config.json`, then deploys it with target port 5000 and the environment variable set in the container app.
+
+Which combination of pipeline step and `runtime` section satisfies **all six** requirements?
+
+### a.
+
+Pipeline: `dab validate --config dab-config.json` runs before `az acr build`; a non-zero exit code stops the pipeline.
+
+```json
+"runtime": {
+  "rest":    { "enabled": true, "path": "/data" },
+  "graphql": { "enabled": true, "path": "/graphql", "allow-introspection": false },
+  "host":    { "mode": "production",
+               "cors": { "origins": [ "https://app.riverferry.example" ], "allow-credentials": false } },
+  "health":  { "enabled": true, "roles": [ "anonymous" ] }
+}
+```
+
+### b.
+
+Pipeline: `dab validate` runs before `az acr build`.
+
+```json
+"runtime": {
+  "rest":    { "enabled": true, "path": "/data" },
+  "graphql": { "enabled": true, "path": "/graphql", "allow-introspection": false },
+  "host":    { "mode": "development",
+               "cors": { "origins": [ "https://app.riverferry.example" ] } },
+  "health":  { "enabled": true }
+}
+```
+
+### c.
+
+Pipeline: `dab validate` runs before `az acr build`.
+
+```json
+"runtime": {
+  "rest":    { "enabled": true, "path": "/data" },
+  "graphql": { "enabled": true, "path": "/graphql", "allow-introspection": false },
+  "host":    { "mode": "production",
+               "cors": { "origins": [ "https://app.riverferry.example" ] } },
+  "health":  { "enabled": true }
+}
+```
+
+### d.
+
+Pipeline: `dab start --config dab-config.json` is launched in the CI agent for 30 seconds; if the process is still alive the pipeline continues.
+
+```json
+"runtime": {
+  "rest":    { "enabled": true, "path": "/data/v1" },
+  "graphql": { "enabled": true, "path": "/graphql", "allow-introspection": false },
+  "host":    { "mode": "production",
+               "cors": { "origins": [ "https://app.riverferry.example" ] } },
+  "health":  { "enabled": true, "roles": [ "anonymous" ] }
+}
+```
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+The question stacks the DAB deployment knobs the exam expects you to know: secret handling with `@env()`, host mode, endpoint paths, CORS, config validation in CI, and the production behaviour of the health endpoint.
+
+### Why option a is correct
+
+| Requirement | How option a meets it |
+| --- | --- |
+| 1. No secret in config/image | `dab init --connection-string "@env('DATABASE_CONNECTION_STRING')"` writes the literal token `@env('DATABASE_CONNECTION_STRING')` into `data-source.connection-string`; DAB resolves it at load time from the process environment (or a local `.env` file). The container app supplies the variable, so the image and repo hold no secret. |
+| 2. Production mode, no schema discovery | `runtime.host.mode: "production"` (the default; `--host-mode production`) keeps Swagger UI and Nitro off and logging at normal verbosity. `runtime.graphql.allow-introspection: false` hides the GraphQL schema — introspection defaults to **true** in both modes, so it must be set explicitly. |
+| 3. REST at `/data`, GraphQL default | `runtime.rest.path: "/data"`, `runtime.graphql.path: "/graphql"` (default). Both are single-segment paths, which is all DAB accepts. |
+| 4. Cross-origin from one origin | `runtime.host.cors.origins: ["https://app.riverferry.example"]` (`--cors-origin` at init). `allow-credentials` stays `false`. |
+| 5. Fail before build | `dab validate` runs the five stages in order — schema, config properties, permissions, database connection, entity metadata — without starting the runtime, and returns exit code 0 only if every stage passes. It is exactly the documented CI use case. |
+| 6. Unauthenticated `/health` returns 200 in production | In **production** mode `runtime.health.roles` is **required**: "roles omitted or null → 403". Listing `anonymous` makes the report visible to the probe. |
+
+Hosting choice: the official image `mcr.microsoft.com/azure-databases/data-api-builder` reads `/App/dab-config.json`, listens on port 5000, and runs in Azure Container Apps or App Service. The former Static Web Apps *database connections* feature (also DAB-powered, under `/data-api`) was retired on 30 November 2025, so it is no longer a valid target.
+
+### Why option b is wrong
+
+`"mode": "development"` violates requirement 2. Development mode enables Nitro for GraphQL, Swagger UI for REST, anonymous health checks and Debug-level logging. It would incidentally make requirement 6 pass without `roles` — which is exactly the trap: the option "fixes" the health probe by weakening the host. Turning off introspection does not compensate; Swagger and Nitro are still reachable.
+
+### Why option c is wrong
+
+This is the subtle distractor. Everything is right except `"health": { "enabled": true }` with **no `roles`**. In production mode DAB answers `/health` with **403** when `roles` is omitted, so the Container Apps probe fails and the revision never becomes healthy (requirement 6). The behaviour table in the runtime docs is explicit: *"roles omitted or null → Production: 403 status"*; only in development mode is the report shown without roles.
+
+### Why option d is wrong
+
+Two independent faults:
+
+- `"path": "/data/v1"` — the REST `path` property "doesn't support subpath values like `/api/data`". `dab validate` stage 2 (config properties) rejects it, and the runtime would not start.
+- Replacing `dab validate` with "run `dab start` for 30 seconds" is not validation: `dab start` is the runtime host, its liveness proves nothing about permissions or entity metadata, and the pipeline would need the production connection string on the build agent — contradicting requirement 1. `dab validate` needs connectivity too (stage 4), but it is a purpose-built, exit-code-driven check with no listener.
+
+Conceptual question (Azure / tooling); not executed against an engine.
+
+## DP-800 Exam Rule to Remember
+
+```text
+dab init      → data-source (--database-type, --connection-string "@env('VAR')"),
+                --host-mode, --rest.path, --graphql.path, --cors-origin, --auth.provider
+dab add/update→ entities (source, --source.type, --permissions "role:actions", relationships)
+dab validate  → 5 stages, exit code 0/non-zero, no runtime started  → put it in CI
+dab start     → serves http://localhost:5000 / https://localhost:5001 (--config, --verbose, --no-https-redirect)
+```
+
+Runtime keys that change behaviour between environments:
+
+- `runtime.host.mode`: `production` (default) vs `development` (Swagger + Nitro + anonymous health + Debug logs). `DAB_ENVIRONMENT=X` makes the CLI pick `dab-config.X.json`.
+- `runtime.graphql.allow-introspection` defaults to **true** — set it to `false` yourself for production.
+- `runtime.rest.path` / `runtime.graphql.path`: single segment only (`/data`, not `/data/v1`).
+- `runtime.host.cors.origins` (array, `*` allowed) and `allow-credentials`.
+- `runtime.health.roles` is **required in production**; without it `/health` is 403.
+- Secrets: `@env('NAME')` resolves from the process environment or a `.env` file next to the config (the `.env` entry wins if both exist); never commit `.env`.

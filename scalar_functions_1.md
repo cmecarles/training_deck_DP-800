@@ -1,0 +1,221 @@
+# SQL Server question — Scalar Functions 1
+
+## Statement
+
+`TollRoad` is the billing database of a motorway operator running SQL Server 2025 at compatibility level 170. Toll fees depend on the vehicle class; unclassified vehicles pay a base rate. The developers write several **scalar user-defined functions** with different options:
+
+```sql
+CREATE DATABASE TollRoad;
+GO
+USE TollRoad;
+GO
+CREATE SCHEMA Toll;
+GO
+CREATE TABLE Toll.Rate
+(
+    VehicleClass CHAR(1)      NOT NULL PRIMARY KEY,
+    PerKm        DECIMAL(6,3) NOT NULL
+);
+INSERT INTO Toll.Rate (VehicleClass, PerKm) VALUES ('A', 0.050), ('B', 0.120), ('C', 0.300);
+CREATE TABLE Toll.Trip
+(
+    TripID       INT          NOT NULL PRIMARY KEY,
+    VehicleClass CHAR(1)      NULL,
+    Km           DECIMAL(7,1) NOT NULL
+);
+INSERT INTO Toll.Trip (TripID, VehicleClass, Km)
+VALUES (1, 'A', 100.0), (2, 'C', 40.0), (3, NULL, 100.0), (4, 'B', 10.5);
+GO
+CREATE FUNCTION Toll.Fee (@Class CHAR(1), @Km DECIMAL(7,1))
+RETURNS DECIMAL(9,2)
+AS
+BEGIN
+    DECLARE @rate DECIMAL(6,3) = 0.010;   -- base rate for unclassified vehicles
+    SELECT @rate = PerKm FROM Toll.Rate WHERE VehicleClass = @Class;
+    RETURN @Km * @rate;
+END;
+GO
+CREATE FUNCTION Toll.FeeStrict (@Class CHAR(1), @Km DECIMAL(7,1))
+RETURNS DECIMAL(9,2)
+WITH SCHEMABINDING, RETURNS NULL ON NULL INPUT
+AS
+BEGIN
+    DECLARE @rate DECIMAL(6,3) = 0.010;
+    SELECT @rate = PerKm FROM Toll.Rate WHERE VehicleClass = @Class;
+    RETURN @Km * @rate;
+END;
+GO
+CREATE FUNCTION Toll.FeeNoInline (@Class CHAR(1), @Km DECIMAL(7,1))
+RETURNS DECIMAL(9,2)
+WITH INLINE = OFF
+AS
+BEGIN
+    DECLARE @rate DECIMAL(6,3) = 0.010;
+    SELECT @rate = PerKm FROM Toll.Rate WHERE VehicleClass = @Class;
+    RETURN @Km * @rate;
+END;
+GO
+CREATE FUNCTION Toll.RushSurcharge (@Km DECIMAL(7,1))
+RETURNS DECIMAL(9,2)
+WITH SCHEMABINDING
+AS
+BEGIN
+    RETURN CASE WHEN DATEPART(HOUR, GETDATE()) BETWEEN 7 AND 9 THEN @Km * 0.01 ELSE 0 END;
+END;
+GO
+CREATE FUNCTION Toll.RoundKm (@Km DECIMAL(7,1))
+RETURNS INT
+WITH SCHEMABINDING
+AS
+BEGIN
+    RETURN CEILING(@Km);
+END;
+GO
+```
+
+The following eight statements are then executed **in order, each in its own batch**:
+
+```sql
+-- S1
+SELECT Fee('A', 10.0) AS Fee;
+
+-- S2
+SELECT TripID, Toll.Fee(VehicleClass, Km) AS Fee, Toll.FeeStrict(VehicleClass, Km) AS FeeStrict
+FROM Toll.Trip ORDER BY TripID;
+
+-- S3
+ALTER TABLE Toll.Trip ADD Surcharge AS Toll.RushSurcharge(Km) PERSISTED;
+
+-- S4
+ALTER TABLE Toll.Trip ADD FeeDue AS Toll.Fee(VehicleClass, Km) PERSISTED;
+
+-- S5
+ALTER TABLE Toll.Trip ADD KmUp AS Toll.RoundKm(Km) PERSISTED;
+CREATE NONCLUSTERED INDEX IX_Trip_KmUp ON Toll.Trip (KmUp);
+
+-- S6
+ALTER TABLE Toll.Rate ALTER COLUMN PerKm DECIMAL(8,3) NOT NULL;
+
+-- S7
+CREATE FUNCTION Toll.LogFee (@Class CHAR(1), @Km DECIMAL(7,1))
+RETURNS DECIMAL(9,2)
+AS
+BEGIN
+    INSERT INTO Toll.Trip (TripID, VehicleClass, Km) VALUES (99, @Class, @Km);
+    RETURN Toll.Fee(@Class, @Km);
+END;
+
+-- S8
+DECLARE @r DECIMAL(9,2);
+EXEC @r = Toll.Fee 'B', 10.0;
+SELECT @r AS FeeB;
+```
+
+For each statement S1–S8, state whether it **succeeds or raises an error**, giving the exact result set where one is produced. Then give the exact result of this final query:
+
+```sql
+SELECT OBJECT_NAME(m.object_id) AS FunctionName, m.is_inlineable, m.inline_type,
+       m.is_schema_bound, m.null_on_null_input,
+       OBJECTPROPERTY(m.object_id, 'IsDeterministic') AS IsDeterministic
+FROM sys.sql_modules AS m
+JOIN sys.objects AS o ON o.object_id = m.object_id
+WHERE o.type = 'FN' AND o.schema_id = SCHEMA_ID('Toll')
+ORDER BY FunctionName;
+```
+
+## Correct Answer
+
+Per-statement outcomes (all error numbers and messages are the engine's actual output):
+
+| Stmt | Outcome | Detail |
+|------|---------|--------|
+| S1 | **Fails** | `Msg 195` — `'Fee' is not a recognized built-in function name.` |
+| S2 | **Succeeds** | 4 rows (below) |
+| S3 | **Fails** | `Msg 4936` — `Computed column 'Surcharge' in table 'Trip' cannot be persisted because the column is non-deterministic.` |
+| S4 | **Fails** | `Msg 4936` — `Computed column 'FeeDue' in table 'Trip' cannot be persisted because the column is non-deterministic.` |
+| S5 | **Succeeds** | Persisted computed column and index created (KmUp = 100, 40, 100, 11) |
+| S6 | **Fails** | `Msg 5074` — `The object 'FeeStrict' is dependent on column 'PerKm'.` followed by `Msg 4922` — `ALTER TABLE ALTER COLUMN PerKm failed because one or more objects access this column.` |
+| S7 | **Fails** | `Msg 443` — `Invalid use of a side-effecting operator 'INSERT' within a function.` |
+| S8 | **Succeeds** | `FeeB = 1.20` |
+
+S2 result:
+
+| TripID | Fee | FeeStrict |
+|--------|------|-----------|
+| 1 | 5.00 | 5.00 |
+| 2 | 12.00 | 12.00 |
+| 3 | 1.00 | NULL |
+| 4 | 1.26 | 1.26 |
+
+Final catalog query:
+
+| FunctionName | is_inlineable | inline_type | is_schema_bound | null_on_null_input | IsDeterministic |
+|--------------|---------------|-------------|-----------------|--------------------|-----------------|
+| Fee | 1 | 1 | 0 | 0 | 0 |
+| FeeNoInline | 1 | 0 | 0 | 0 | 0 |
+| FeeStrict | 1 | 1 | 1 | 1 | 1 |
+| RoundKm | 1 | 1 | 1 | 0 | 1 |
+| RushSurcharge | 0 | 0 | 1 | 0 | 0 |
+
+(`LogFee` does not appear because S7 failed.)
+
+## Explanation
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+### S1 — scalar UDFs must be called with at least a two-part name
+
+`Fee('A', 10.0)` is parsed as a *built-in* function, and no such built-in exists (error 195). User-defined scalar functions are always invoked as `schema.function(...)`; this is also why they cannot be shadowed by, or mistaken for, system functions. (Table-valued functions have the same rule.)
+
+### S2 — RETURNS NULL ON NULL INPUT short-circuits the body
+
+For trip 3 the class is NULL. `Toll.Fee` executes its body: the `SELECT @rate = ...` finds no row, `@rate` keeps its initial 0.010 and the fee is 100 × 0.010 = **1.00**. `Toll.FeeStrict` has `RETURNS NULL ON NULL INPUT`, so the engine returns **NULL without executing the body at all** whenever any argument is NULL — the base-rate logic never runs. The default option is `CALLED ON NULL INPUT`. This is the subtle trap: the two bodies are identical, only the option differs.
+
+### S3, S4, S5 — determinism decides what can be PERSISTED or indexed
+
+A computed column can be `PERSISTED` (and indexed) only if its expression is **deterministic**, and a UDF is deterministic only when (1) it is created `WITH SCHEMABINDING` and (2) it calls no non-deterministic function.
+
+- `RushSurcharge` is schema-bound but calls `GETDATE()` → non-deterministic → S3 fails (a non-persisted computed column with it *is* allowed, but it cannot be indexed).
+- `Fee` calls only deterministic code, but it is **not schema-bound** → `OBJECTPROPERTY(..., 'IsDeterministic') = 0` → S4 fails with the same error. The fix is to add `WITH SCHEMABINDING` (as in `FeeStrict`, whose `IsDeterministic = 1`).
+- `RoundKm` is schema-bound and deterministic → S5 succeeds, and the persisted column can be indexed.
+
+### S6 — SCHEMABINDING freezes the referenced columns
+
+`FeeStrict` is bound to `Toll.Rate.PerKm`, so even a widening `ALTER COLUMN` is refused (5074 + 4922), and `DROP TABLE Toll.Rate` would fail with error 3729. `Fee` and `FeeNoInline` reference the same column without binding and would not block the change.
+
+### S7 — functions cannot have side effects
+
+A UDF may not modify database state: no `INSERT`/`UPDATE`/`DELETE` on permanent tables, no `EXEC` of a procedure, no `TRY...CATCH` (also reported as a side-effecting operator), no `RAISERROR`/`THROW`. Error 443 is raised at `CREATE` time. Table variables inside the function *may* be modified.
+
+### S8 — EXEC works for scalar functions
+
+A scalar UDF can be invoked with `EXEC @var = schema.function args`, positional or named, just like a procedure; the value 10.0 × 0.120 = **1.20** lands in `@r`. It is rarely used, but it is valid.
+
+### Scalar UDF inlining (the catalog columns)
+
+Since compatibility level 150, the optimizer can **inline** a scalar UDF into the calling query as a relational expression, removing the per-row invocation cost. `sys.sql_modules.is_inlineable` says whether the *body* qualifies; `inline_type` says whether inlining is actually enabled for that function:
+
+- `Fee`, `FeeStrict`, `RoundKm`: inlineable and enabled (1/1). The actual plan for `SELECT TripID, Toll.Fee(VehicleClass, Km) FROM Toll.Trip` shows `ContainsInlineScalarTsqlUdfs="1"`, a join to `Toll.Rate` and **no UDF operator**.
+- `FeeNoInline`: the body qualifies (`is_inlineable = 1`) but `WITH INLINE = OFF` disables it (`inline_type = 0`); its plan contains a `UserDefinedFunction` operator executed row by row.
+- `RushSurcharge`: `is_inlineable = 0` because it calls a time-dependent intrinsic (`GETDATE()`), one of the documented exclusions along with side-effecting intrinsics (`NEWSEQUENTIALID()`), `@@ROWCOUNT`, table variables and table-valued parameters, CTEs, an `EXECUTE AS` clause other than `CALLER`, and use of the UDF in a computed column or `CHECK` constraint.
+
+Inlining can also be switched off database-wide with `ALTER DATABASE SCOPED CONFIGURATION SET TSQL_SCALAR_UDF_INLINING = OFF`, or per query with `OPTION (USE HINT('DISABLE_TSQL_SCALAR_UDF_INLINING'))`.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Call            : schema.fn(...) always (one-part name -> Msg 195); EXEC @v = schema.fn also works
+NULL handling   : RETURNS NULL ON NULL INPUT -> NULL without running the body
+                  CALLED ON NULL INPUT (default) -> body decides
+Deterministic   : requires WITH SCHEMABINDING AND no GETDATE/NEWID/RAND...
+                  needed for PERSISTED computed columns and indexes (else Msg 4936)
+SCHEMABINDING   : blocks ALTER/DROP of referenced columns/tables (5074/4922, 3729)
+Side effects    : no DML on real tables, no TRY/CATCH, no EXEC (Msg 443)
+Inlining (150+) : sys.sql_modules.is_inlineable / inline_type;
+                  WITH INLINE = OFF, hint DISABLE_TSQL_SCALAR_UDF_INLINING,
+                  scoped config TSQL_SCALAR_UDF_INLINING;
+                  not inlineable: GETDATE-style intrinsics, @@ROWCOUNT, table variables,
+                  CTEs, EXECUTE AS other than CALLER
+```
+
+When a question shows two identical function bodies and different results for NULL input, look at `RETURNS NULL ON NULL INPUT`; when a `PERSISTED` column or index on a UDF fails "because the column is non-deterministic" and the body looks deterministic, the missing piece is `WITH SCHEMABINDING`.

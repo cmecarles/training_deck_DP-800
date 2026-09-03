@@ -1,0 +1,163 @@
+# SQL Server question — External Tables 1
+
+## Statement
+
+A retail chain runs two **Azure SQL Databases** on the same logical server `outlet-sql.database.windows.net`:
+
+- `OutletOrders` — the order-processing database. It contains `dbo.OrderLine (OrderID INT, ProductID INT, Qty INT, LineTotal DECIMAL(10,2))` and a reporting stored procedure `dbo.usp_SalesByProduct`.
+- `OutletCatalog` — the product master. It contains `dbo.Product (ProductID INT NOT NULL PRIMARY KEY, Name NVARCHAR(80) NOT NULL, ListPrice DECIMAL(10,2) NOT NULL)` (about 40,000 rows). A SQL user `catalog_reader` with `SELECT` permission on `dbo.Product` already exists in `OutletCatalog`.
+
+The reporting procedure in `OutletOrders` must join order lines to product names. Today it fails, because the product table lives in the other database.
+
+The solution must satisfy **all** of the following requirements:
+
+1. `dbo.usp_SalesByProduct` must reference the product table with ordinary T-SQL (a `JOIN` on `ProductID`) so that the procedure body barely changes.
+2. Product data must be read **live** from `OutletCatalog`; no copy, ETL or replication of the product table into `OutletOrders`.
+3. Filters such as `WHERE p.ProductID IN (...)` must be pushed to and evaluated in `OutletCatalog`, not applied after transferring all 40,000 rows.
+4. Nothing may be installed or changed in `OutletCatalog`, and no additional Azure service, service-tier change or elastic pool is allowed.
+5. Read access is sufficient; the procedure never writes to the product table.
+
+Which set of statements, run in `OutletOrders`, should you use?
+
+### a.
+
+Change nothing in the database. In the procedure, reference the remote table with a three-part name:
+
+```sql
+SELECT p.Name, SUM(ol.LineTotal) AS Revenue
+FROM dbo.OrderLine AS ol
+JOIN OutletCatalog.dbo.Product AS p ON p.ProductID = ol.ProductID
+GROUP BY p.Name;
+```
+
+### b.
+
+```sql
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = '<strong password>';
+GO
+CREATE DATABASE SCOPED CREDENTIAL CatalogCred
+WITH IDENTITY = 'catalog_reader', SECRET = '<password of catalog_reader>';
+GO
+CREATE EXTERNAL DATA SOURCE CatalogSrc
+WITH (TYPE = RDBMS,
+      LOCATION = 'outlet-sql.database.windows.net',
+      DATABASE_NAME = 'OutletCatalog',
+      CREDENTIAL = CatalogCred);
+GO
+CREATE EXTERNAL TABLE dbo.Product
+(
+    ProductID INT           NOT NULL,
+    Name      NVARCHAR(80)  NOT NULL,
+    ListPrice DECIMAL(10,2) NOT NULL
+)
+WITH (DATA_SOURCE = CatalogSrc, SCHEMA_NAME = 'dbo', OBJECT_NAME = 'Product');
+GO
+```
+
+Then join `dbo.Product` in the procedure as if it were local.
+
+### c.
+
+```sql
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = '<strong password>';
+GO
+CREATE DATABASE SCOPED CREDENTIAL CatalogCred
+WITH IDENTITY = 'catalog_reader', SECRET = '<password of catalog_reader>';
+GO
+CREATE EXTERNAL DATA SOURCE CatalogSrc
+WITH (LOCATION = 'sqlserver://outlet-sql.database.windows.net',
+      PUSHDOWN = ON,
+      CREDENTIAL = CatalogCred);
+GO
+CREATE EXTERNAL TABLE dbo.Product
+(
+    ProductID INT           NOT NULL,
+    Name      NVARCHAR(80)  NOT NULL,
+    ListPrice DECIMAL(10,2) NOT NULL
+)
+WITH (LOCATION = 'OutletCatalog.dbo.Product', DATA_SOURCE = CatalogSrc);
+GO
+```
+
+Then join `dbo.Product` in the procedure as if it were local.
+
+### d.
+
+```sql
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = '<strong password>';
+GO
+CREATE DATABASE SCOPED CREDENTIAL CatalogCred
+WITH IDENTITY = 'catalog_reader', SECRET = '<password of catalog_reader>';
+GO
+CREATE EXTERNAL DATA SOURCE CatalogSrc
+WITH (TYPE = SHARD_MAP_MANAGER,
+      LOCATION = 'outlet-sql.database.windows.net',
+      DATABASE_NAME = 'OutletCatalog',
+      CREDENTIAL = CatalogCred,
+      SHARD_MAP_NAME = 'ProductShardMap');
+GO
+CREATE EXTERNAL TABLE dbo.Product
+(
+    ProductID INT           NOT NULL,
+    Name      NVARCHAR(80)  NOT NULL,
+    ListPrice DECIMAL(10,2) NOT NULL
+)
+WITH (DATA_SOURCE = CatalogSrc, DISTRIBUTION = SHARDED(ProductID));
+GO
+```
+
+Then join `dbo.Product` in the procedure as if it were local.
+
+## Correct Answer
+
+**b**
+
+## Explanation
+
+The scenario is the textbook **vertical partitioning / cross-database query** case of Azure SQL Database **elastic query**: two databases with different schemas, and one of them needs read-only access to a table in the other. Azure SQL Database has no cross-database three-part names and no PolyBase; the supported mechanism is an external table over an external data source of `TYPE = RDBMS`. Conceptual question (Azure / tooling); not executed against an engine.
+
+### Why option b is correct
+
+Each of the four statements plays a documented role in the Microsoft Learn walkthrough "Get started with cross-database queries (vertical partitioning)":
+
+1. `CREATE MASTER KEY` — the database master key encrypts the credential secret stored in the database.
+2. `CREATE DATABASE SCOPED CREDENTIAL` — holds the login the remote query will use. Elastic query authenticates to the remote database with **SQL authentication only** (Microsoft Entra authentication is not supported for elastic queries), which is exactly what `catalog_reader` provides. Server-level credentials do not exist in Azure SQL Database; database-scoped credentials replace them.
+3. `CREATE EXTERNAL DATA SOURCE ... TYPE = RDBMS` — points at one remote Azure SQL Database (`LOCATION` = logical server FQDN, `DATABASE_NAME` = remote database, `CREDENTIAL`). Nothing has to be created or changed in the remote database (requirement 4); only `ALTER ANY EXTERNAL DATA SOURCE` permission is needed locally.
+4. `CREATE EXTERNAL TABLE ... WITH (DATA_SOURCE, SCHEMA_NAME, OBJECT_NAME)` — a local metadata object with the remote table's column definitions. `SCHEMA_NAME`/`OBJECT_NAME` are optional here because the names match, but they show that the external table may use a *different* local name than the remote object.
+
+After that, `dbo.Product` is queried like a local table (requirement 1) and every query opens a connection to `OutletCatalog` and reads current data (requirement 2). Elastic query pushes predicates and parameters to the remote database — the documentation notes it "works best for reporting scenarios where most of the processing (filtering, aggregation) can be performed on the external source side", so the `ProductID IN (...)` filter is evaluated remotely (requirement 3). It is available in **all service tiers** and included in the database price (requirement 4). Its main limitation matches requirement 5: external tables are **read-only** (`INSERT`/`UPDATE`/`DELETE` against them are not supported), and LOB types other than `nvarchar(max)` cannot be used in the definition. For one-off remote statements, `sp_execute_remote N'CatalogSrc', N'<T-SQL>'` runs T-SQL directly on the remote database through the same data source.
+
+### Why option a is wrong
+
+Azure SQL Database does not support cross-database queries with three- or four-part names (only references to `tempdb` and to the current database are allowed), nor `USE`, linked servers, `OPENQUERY` or `OPENDATASOURCE`. The query fails at compile time with error 40515, `Reference to database and/or server name in 'OutletCatalog.dbo.Product' is not supported in this version of SQL Server.` This would work on SQL Server or Azure SQL Managed Instance (cross-database queries in the same instance are supported there), which is precisely why it is a trap when the platform is Azure SQL Database.
+
+### Why option c is wrong
+
+This is the subtle distractor: it is valid **SQL Server 2019+ PolyBase** syntax — the generic `sqlserver://` connector, `PUSHDOWN = ON`, and an external table whose `LOCATION` names the remote `database.schema.table`. PolyBase is a SQL Server feature that must be installed and enabled (`SERVERPROPERTY('IsPolyBaseInstalled')`, `sp_configure 'polybase enabled'`); it does not exist in Azure SQL Database, whose `CREATE EXTERNAL DATA SOURCE` grammar knows only `TYPE = RDBMS`, `SHARD_MAP_MANAGER` and `BLOB_STORAGE` — there is no `sqlserver://` connector, no `PUSHDOWN` option and no `EXTERNAL FILE FORMAT`. Of those three types, and `BLOB_STORAGE` serves only `BULK INSERT` / `OPENROWSET(BULK ...)` over files in Azure Storage — a way to load or read *files*, not to query another database's table.
+
+### Why option d is wrong
+
+`TYPE = SHARD_MAP_MANAGER` is the **horizontal partitioning (sharding)** topology of elastic query: the data source must point at a shard map manager database that holds a shard map created with the Elastic Database client library, and `DISTRIBUTION = SHARDED(column)` tells the query processor how rows are spread across many databases with an *identical* schema. Here there is one remote database, no shard map, and a *different* schema — vertical partitioning — so the statements cannot even be created (there is no `ProductShardMap`) and would require changes outside `OutletOrders`. Microsoft has also announced end of support for shard map manager mode on March 31, 2027.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Azure SQL Database, table in ANOTHER database
+   -> elastic query: MASTER KEY -> DATABASE SCOPED CREDENTIAL (SQL auth)
+      -> EXTERNAL DATA SOURCE TYPE = RDBMS (LOCATION, DATABASE_NAME, CREDENTIAL)
+      -> EXTERNAL TABLE ... WITH (DATA_SOURCE [, SCHEMA_NAME, OBJECT_NAME])
+      read-only, predicates pushed down, all tiers; sp_execute_remote for ad hoc T-SQL
+   TYPE = SHARD_MAP_MANAGER + DISTRIBUTION = SHARDED/REPLICATED -> sharded, same schema
+   TYPE = BLOB_STORAGE -> files for BULK INSERT / OPENROWSET(BULK), not tables
+   Three-part names / linked servers / OPENQUERY -> not supported (Msg 40515)
+
+SQL Server (2019+)
+   -> PolyBase: EXTERNAL DATA SOURCE LOCATION = 'sqlserver://', 'oracle://', 'abs://'...
+      PUSHDOWN = ON, EXTERNAL FILE FORMAT for files (Parquet/CSV/Delta), must be installed
+   OPENROWSET(BULK ...) -> ad hoc read of one file; EXTERNAL TABLE -> reusable schema
+Fabric
+   -> Lakehouse SQL analytics endpoint / OneLake shortcuts expose Delta tables read-only;
+      SQL database in Fabric is mirrored to OneLake automatically
+```
+
+When the platform is Azure SQL Database and the wording is "query a table in another database without copying it", the answer is `TYPE = RDBMS` + `CREATE EXTERNAL TABLE`; options with three-part names, `sqlserver://` PolyBase locations or `SHARD_MAP_MANAGER` are the distractors.

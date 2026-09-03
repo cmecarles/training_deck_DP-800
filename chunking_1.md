@@ -1,0 +1,158 @@
+# SQL Server question — Chunking 1
+
+## Statement
+
+A wind-farm operator keeps turbine maintenance manuals in a SQL Server 2025 database named `TurbineDocs`. Manual pages are long, so before generating embeddings the team splits each page into overlapping fixed-size chunks with the `AI_GENERATE_CHUNKS` table-valued function and stores the chunks in a child table.
+
+For this exercise the pages are tiny and the chunk size is artificially small (20 characters) so that the result can be predicted by hand. The complete setup is:
+
+```sql
+CREATE DATABASE TurbineDocs;        -- compatibility level 170 (default on SQL Server 2025)
+GO
+USE TurbineDocs;
+GO
+CREATE SCHEMA Manuals;
+GO
+CREATE TABLE Manuals.Pages
+(
+    PageId INT           NOT NULL PRIMARY KEY,
+    Body   NVARCHAR(MAX) NULL
+);
+GO
+INSERT INTO Manuals.Pages (PageId, Body) VALUES
+    (1, N'Wind turbines convert kinetic energy into electricity.'),   -- 54 characters
+    (2, NULL),
+    (3, N'Short page.');                                              -- 11 characters
+GO
+CREATE TABLE Manuals.PageChunks
+(
+    ChunkId   INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    PageId    INT NOT NULL REFERENCES Manuals.Pages (PageId),
+    Ordinal   INT NOT NULL,
+    ChunkText NVARCHAR(MAX) NOT NULL,
+    Embedding VECTOR(1536) NULL,
+    CONSTRAINT UQ_PageChunks UNIQUE (PageId, Ordinal)
+);
+GO
+```
+
+Answer all three parts.
+
+### A.
+
+Predict the exact result set (all rows, all columns, in order) of:
+
+```sql
+SELECT p.PageId, c.chunk_order, c.chunk_offset, c.chunk_length, c.chunk
+FROM Manuals.Pages AS p
+CROSS APPLY AI_GENERATE_CHUNKS(source = p.Body, chunk_type = FIXED, chunk_size = 20, overlap = 25) AS c
+ORDER BY p.PageId, c.chunk_order;
+```
+
+### B.
+
+How many rows does this statement insert into `Manuals.PageChunks`, and does it succeed?
+
+```sql
+INSERT INTO Manuals.PageChunks (PageId, Ordinal, ChunkText)
+SELECT p.PageId, c.chunk_order, c.chunk
+FROM Manuals.Pages AS p
+CROSS APPLY AI_GENERATE_CHUNKS(source = p.Body, chunk_type = FIXED, chunk_size = 20, overlap = 25) AS c;
+```
+
+### C.
+
+What happens when the overlap is raised to 60?
+
+```sql
+SELECT c.chunk_order, c.chunk_offset, c.chunk
+FROM AI_GENERATE_CHUNKS(source = N'Wind turbines convert kinetic energy into electricity.',
+                        chunk_type = FIXED, chunk_size = 20, overlap = 60) AS c;
+```
+
+## Correct Answer
+
+**A.** Five rows:
+
+| PageId | chunk_order | chunk_offset | chunk_length | chunk |
+|---|---|---|---|---|
+| 1 | 1 | 1 | 20 | `Wind turbines conver` |
+| 1 | 2 | 16 | 20 | `onvert kinetic energ` |
+| 1 | 3 | 31 | 20 | `energy into electric` |
+| 1 | 4 | 46 | 9 | `ctricity.` |
+| 3 | 1 | 1 | 11 | `Short page.` |
+
+Page 2 (`NULL` body) produces no row at all.
+
+**B.** It succeeds and inserts **5 rows** (`(5 rows affected)`), one per chunk above; `Ordinal` receives `chunk_order`.
+
+**C.** The statement fails before producing any row:
+
+```text
+Msg 43201, Level 16, State 1
+The value 60 is invalid for overlap. Value must be between 0 and 50.
+```
+
+## Explanation
+
+### The function's contract
+
+`AI_GENERATE_CHUNKS (SOURCE = text_expression, CHUNK_TYPE = FIXED [, CHUNK_SIZE = n] [, OVERLAP = n] [, ENABLE_CHUNK_SET_ID = 0|1])` is a table-valued function available from compatibility level 170. On SQL Server 2025 (RTM) it runs **without** `PREVIEW_FEATURES` (verified: the query above was executed on a fresh database with no scoped configuration change). Key facts, all confirmed by execution:
+
+- `CHUNK_TYPE` accepts only `FIXED` (`chunk_type = SENTENCE` or `PARAGRAPH` fails with `Msg 102 Incorrect syntax near 'PARAGRAPH'`). Fixed chunking is purely **character-based**: it does not respect word boundaries, as the cut in the middle of `conver|t` shows.
+- `CHUNK_SIZE` is the chunk length **in characters**; it "can't be NULL, negative, or zero" (`chunk_size = 0` fails with `Msg 43202 The value 0 is invalid for chunk_size. Value must be greater than 0.`).
+- `OVERLAP` is a **percentage of `CHUNK_SIZE`**, an integer from 0 to 50 (default 0). It "determines the percentage of the preceding text that should be included in the current chunk".
+- Output columns: `chunk` (same type as the source), `chunk_order` (**bigint**, 1-based per source), `chunk_offset` (**bigint**, 1-based character position in the source), `chunk_length` (**int**), and optionally `chunk_set_id` (**bigint**) when `enable_chunk_set_id = 1`.
+
+### Part A, step by step
+
+Overlap 25 % of 20 characters = **5 characters**, so consecutive chunks start 20 − 5 = **15 characters** apart. Page 1 has 54 characters:
+
+| chunk_order | characters | chunk_offset | chunk_length | text |
+|---|---|---|---|---|
+| 1 | 1–20 | 1 | 20 | `Wind turbines conver` |
+| 2 | 16–35 | 16 | 20 | `onvert kinetic energ` — the first 5 characters `onver` repeat the tail of chunk 1 |
+| 3 | 31–50 | 31 | 20 | `energy into electric` — `energ` repeats the tail of chunk 2 |
+| 4 | 46–54 | 46 | 9 | `ctricity.` — only 9 characters remain (54 − 46 + 1) |
+
+Without overlap the same page yields 3 chunks at offsets 1, 21, 41 (lengths 20, 20, 14); overlap trades a few extra chunks for continuity across the cut points, so a sentence split by a boundary is still seen whole in one of the two neighbours.
+
+Page 3 is shorter than the chunk size: a single chunk with `chunk_offset = 1`, `chunk_length = 11`.
+
+Page 2 has a `NULL` body. The function returns **zero rows** for a `NULL` source, and `CROSS APPLY` drops the outer row when the applied function returns nothing — so page 2 simply disappears. (With `OUTER APPLY` the page would appear once with `NULL` chunk columns; verified.) This is the subtle part: nothing errors, the row is just absent.
+
+The overlap percentage is applied with integer truncation: `overlap = 7` on a 20-character chunk is 1.4 → **1** character (offsets 1, 20, 39 — verified), and `overlap = 10` gives 2 characters (offsets 1, 19, 37).
+
+### Part B
+
+The `INSERT ... SELECT` is the same `CROSS APPLY` with only three columns projected, so it inserts exactly the five rows of part A. `chunk_order` restarts at 1 for every source row, which is exactly what the `Ordinal` column and the `UNIQUE (PageId, Ordinal)` constraint expect — the ordinal is unique **per page**, not globally. The child table carries the FK to the parent page and leaves `Embedding` `NULL` for a later `AI_GENERATE_EMBEDDINGS(ChunkText USE MODEL ...)` pass (or a batched REST call); the parent page is never embedded as a whole.
+
+`chunk_offset` and `chunk_length` are worth storing too when the application must highlight the matching passage in the original page.
+
+### Part C
+
+The engine validates `OVERLAP` before chunking anything: 60 is outside the documented 0–50 range, so the statement raises error 43201 and returns no rows. Half a chunk is the maximum overlap the function allows — enough for continuity, and a guard against generating a near-duplicate chunk for every position.
+
+### Why chunk at all
+
+- **Model limits.** Embedding models accept a bounded input (8,192 tokens for the current Azure OpenAI embedding models); a long manual page must be split or it cannot be embedded.
+- **Retrieval precision.** One vector for a 6,000-word page averages many topics; a query about "blade pitch calibration" then matches the page weakly. A vector per passage ranks the *relevant passage* highly and lets the application show it.
+- **Fixed-size vs structure-aware.** `AI_GENERATE_CHUNKS` provides fixed-size character chunks with overlap; sentence- or paragraph-aware chunking (splitting on `.`/blank lines, or in application code) keeps semantic units intact at the cost of unequal chunk sizes. Overlap is the fixed-size method's mitigation for cutting through a sentence.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+AI_GENERATE_CHUNKS (source = text, chunk_type = FIXED,
+                    chunk_size = <chars>, overlap = <0..50 percent of chunk_size>
+                    [, enable_chunk_set_id = 1])
+→ chunk, chunk_order (1-based per source), chunk_offset (1-based char position),
+  chunk_length [, chunk_set_id]
+
+next offset = previous offset + chunk_size − trunc(chunk_size × overlap / 100)
+NULL source  → 0 rows (CROSS APPLY drops the parent row; OUTER APPLY keeps it)
+overlap > 50 → Msg 43201;   chunk_size ≤ 0 → Msg 43202;   only FIXED is accepted
+```
+
+Chunk table pattern: `ChunkId` PK, `ParentId` FK, `Ordinal` (= `chunk_order`, unique per parent), `ChunkText`, optional `chunk_offset`/`chunk_length`, and the `vector(n)` column that gets embedded — one embedding per chunk, never per parent document.
