@@ -58,7 +58,7 @@ The skills outline asks you to *choose* among full-text, semantic vector, and hy
 ### Why option a is correct
 
 - **Search 1 → full-text.** Part numbers, prefixes, and booleans are exactly the `CONTAINS` feature set: `CONTAINS(PartNumber, '"BRG-62*"')` for prefixes (the asterisk must be inside the double quotes), `'bearing AND NOT sealed'` for boolean logic, plus `NEAR` and `FORMSOF(INFLECTIONAL, ...)` when needed. Matching is token-exact: one character off does not match, which is the requirement.
-- **Search 2 → vector.** Third-generation OpenAI embeddings are evaluated on multilingual retrieval, so a Spanish query lands near an English description with the same meaning; no word overlap is required. On 12 million rows an exhaustive `VECTOR_DISTANCE` scan is too slow for an interactive box, so an approximate DiskANN index (`CREATE VECTOR INDEX ... WITH (METRIC = 'cosine', TYPE = 'diskann')` + `VECTOR_SEARCH`) is the right tool — with the accuracy trade-off measured, see below.
+- **Search 2 → vector.** Third-generation OpenAI embeddings are evaluated on multilingual retrieval, so a Spanish query lands near an English description with the same meaning; no word overlap is required. On 12 million rows an exhaustive `VECTOR_DISTANCE` scan is too slow for an interactive box, so an approximate DiskANN index (`CREATE VECTOR INDEX ... WITH (METRIC = 'cosine', TYPE = 'diskann')` + `VECTOR_SEARCH`, queried as `SELECT TOP (n) WITH APPROXIMATE ... ORDER BY distance`; the older `TOP_N` argument is deprecated and rejected by current-version indexes with Msg 42274) is the right tool — with the accuracy trade-off measured, see below. Vector indexes are still a preview feature in Azure SQL Database and SQL Server 2025.
 - **Search 3 → hybrid.** One list cannot satisfy both requirements: full-text alone misses paraphrases; vector alone ranks an exact model name only *approximately* first. Hybrid search runs both and fuses the two rankings — reciprocal rank fusion (`score = Σ 1/(k + rank)`, `k = 60`) is the standard, score-scale-free way to merge a full-text `RANK` list and a vector distance list.
 - **Evaluation → recall@k vs exact, plus latency and build cost.** Microsoft defines recall as "the proportion of the approximate nearest neighbors that are identified by the algorithm, compared to the exact nearest neighbors that an exhaustive search would return"; "a perfect recall, which is equivalent to no approximation, is 1". Measuring it on a representative sample of queries against the exact `ORDER BY VECTOR_DISTANCE` result is the only way to quantify what the approximation costs. Latency and index build time complete the picture — DiskANN indexes are expensive to build and to keep up to date. And the documented guidance is that exact search is fine when few vectors are searched: "less than 50,000 vectors as a general recommendation" — "the table can contain many more vectors as long as your search predicates reduce the number of vectors to use for neighbor search to 50,000 or fewer". A filtered technician query easily meets that, and exact search has recall 1 by definition.
 
@@ -89,10 +89,10 @@ Search 2 — semantic, approximate, over the whole table (vector index):
 ```sql
 DECLARE @qv VECTOR(1536) = AI_GENERATE_EMBEDDINGS(N'something to stop a conveyor belt slipping in a damp warehouse'
                                                   USE MODEL PartsEmbedder);
-SELECT p.PartId, p.Name, r.distance
+SELECT TOP (10) WITH APPROXIMATE p.PartId, p.Name, r.distance
 FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
-                   SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS r
-ORDER BY r.distance;
+                   SIMILAR_TO = @qv, METRIC = 'cosine') AS r
+ORDER BY r.distance;          -- WITH APPROXIMATE requires ORDER BY distance ASC and nothing else
 ```
 
 Search 3 — hybrid: two rankings, one fused list (reciprocal rank fusion, `k = 60`):
@@ -105,9 +105,12 @@ WITH Kw AS
 ),
 Vec AS
 (
-    SELECT p.PartId, ROW_NUMBER() OVER (ORDER BY r.distance, p.PartId) AS Rnk
-    FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
-                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 50) AS r
+    -- window functions cannot sit next to TOP ... WITH APPROXIMATE: run the ANN search in a subquery
+    SELECT a.PartId, ROW_NUMBER() OVER (ORDER BY a.distance, a.PartId) AS Rnk
+    FROM (SELECT TOP (50) WITH APPROXIMATE p.PartId, r.distance
+          FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
+                             SIMILAR_TO = @qv, METRIC = 'cosine') AS r
+          ORDER BY r.distance) AS a
 )
 SELECT TOP (10) COALESCE(k.PartId, v.PartId) AS PartId,
        ISNULL(1.0e0 / (60 + k.Rnk), 0) + ISNULL(1.0e0 / (60 + v.Rnk), 0) AS RrfScore
@@ -127,16 +130,17 @@ WITH Exact AS
 ),
 Approx AS
 (
-    SELECT p.PartId
+    SELECT TOP (10) WITH APPROXIMATE p.PartId
     FROM VECTOR_SEARCH(TABLE = Catalog.Parts AS p, COLUMN = Embedding,
-                       SIMILAR_TO = @qv, METRIC = 'cosine', TOP_N = 10) AS r
+                       SIMILAR_TO = @qv, METRIC = 'cosine') AS r
+    ORDER BY r.distance                                                  -- ANN via the DiskANN index
 )
 SELECT COUNT(*) / 10.0 AS RecallAt10
 FROM Exact AS e
 WHERE EXISTS (SELECT 1 FROM Approx AS a WHERE a.PartId = e.PartId);
 ```
 
-The same harness reports latency by wrapping each variant in `SET STATISTICS TIME ON` (or by reading `sys.dm_exec_query_stats`), and the index build cost is simply the elapsed time and CPU of `CREATE VECTOR INDEX` on the production-sized table — recorded once, because a first-version vector index must be dropped and rebuilt whenever the table changes.
+The same harness reports latency by wrapping each variant in `SET STATISTICS TIME ON` (or by reading `sys.dm_exec_query_stats`), and the index build cost is simply the elapsed time and CPU of `CREATE VECTOR INDEX` on the production-sized table — recorded at build time and again after any large re-embedding run. Current-version DiskANN indexes accept `INSERT`/`UPDATE`/`DELETE`/`MERGE` and are maintained in the background (`sys.dm_db_vector_indexes` shows the maintenance state), but the documentation recommends dropping and recreating the index after a near-complete replacement of the embeddings because recall degrades when the graph was built for a different distribution; earlier-version indexes made the table read-only and had to be dropped and rebuilt for any change.
 
 Conceptual question (Azure / tooling); not executed against an engine.
 
@@ -145,7 +149,9 @@ Conceptual question (Azure / tooling); not executed against an engine.
 ```text
 exact codes / prefixes / phrases / AND, OR, AND NOT / NEAR   → full-text  (CONTAINS, CONTAINSTABLE)
 paraphrase, intent, multilingual                              → vector     (VECTOR_DISTANCE exact,
-                                                                            VECTOR_SEARCH + DiskANN approx.)
+                                                                            VECTOR_SEARCH + DiskANN approx.:
+                                                                            SELECT TOP (n) WITH APPROXIMATE ...
+                                                                            ORDER BY distance; TOP_N is deprecated)
 keyword precision AND semantic recall in one box              → hybrid     (both lists fused with RRF)
 ```
 

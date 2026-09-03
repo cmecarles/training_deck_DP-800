@@ -188,7 +188,7 @@ The cardinalities of the region/trail pair are reversed. `Region.trails` with `c
 
 ### Views and stored procedures in the same picture
 
-- `OpenTrails` is a view: DAB cannot discover a primary key, so the entity needs `source.key-fields: ["TrailId"]` (or, in DAB 2.0, `fields[].primary-key: true`) before `openTrails_by_pk(TrailId: 10)` or REST `/api/OpenTrails/TrailId/10` can work. `sys.key_constraints` lists PKs only for the four tables — none for the view.
+- `OpenTrails` is a view: DAB cannot discover a primary key, so the entity needs `source.key-fields: ["TrailId"]` (deprecated in DAB 2.0 in favour of `fields[].primary-key: true`, but still accepted; the two cannot coexist) before `openTrails_by_pk(TrailId: 10)` or REST `/api/OpenTrails/TrailId/10` can work. `sys.key_constraints` lists PKs only for the four tables — none for the view.
 - `GetTrailsByRegion` is a stored procedure: it appears as `executeGetTrailsByRegion(RegionId: 1)`, under `Mutation` unless `graphql.operation: "query"` is set; only the **first result set** is returned; **pagination, filtering, ordering and relationships are not supported**, and it cannot be fetched by key. You could not hang `tags` off it.
 
 Conceptual question (Azure / tooling); the schema, foreign keys and the join result were verified against SQL Server 2025 (RTM 17.0.1000.7), the DAB configuration itself was not executed.

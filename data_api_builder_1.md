@@ -218,7 +218,7 @@ The correct answer is **b**.
 
 This question tests three DAB configuration concepts that behave differently for each kind of database object:
 
-1. **Views** do not carry a primary key, so DAB cannot infer one. The entity must declare `source.key-fields` (or, in DAB 2.0, a `fields` array with `primary-key: true`) so that single-item REST routes such as `/api/PublicCatalog/CatalogId/17` can address a row.
+1. **Views** do not carry a primary key, so DAB cannot infer one. The entity must declare `source.key-fields` (deprecated in DAB 2.0 in favour of a `fields` array with `primary-key: true`, but still accepted; the two cannot coexist) so that single-item REST routes such as `/api/PublicCatalog/CatalogId/17` can address a row.
 2. **Stored procedures** have non-obvious defaults: the REST endpoint supports **only `POST`** unless `rest.methods` explicitly lists `get`, and the GraphQL field is placed under **`Mutation`** unless `graphql.operation` is set to `query`.
 3. **Permission actions depend on the object type**: `create`/`read`/`update`/`delete` apply to tables and views, while stored procedures accept only `execute` (the `*` wildcard expands to `execute` for a stored procedure).
 
@@ -233,7 +233,7 @@ This question tests three DAB configuration concepts that behave differently for
 | 5. Anonymous read-only plus full CRUD for `curator` on the table | `Exhibit.permissions`: role `anonymous` with `read`; role `curator` with `create`, `read`, `update`, `delete` |
 | 6. Anonymous can never modify data | Anonymous holds only `read` on `Exhibit` and `PublicCatalog` and `execute` on a procedure that only reads; no `create`/`update`/`delete` is granted to `anonymous` anywhere |
 
-The `parameters` array on the stored-procedure source supplies the default value `Modern` for `@Era`, so the parameter can be omitted by callers.
+The `parameters` array on the stored-procedure source (the DAB 2.0 array format; the older `{ "Era": "Modern" }` dictionary is deprecated but still accepted) supplies the default value `Modern` for `@Era`, so the parameter can be omitted by callers.
 
 ### Why option a is wrong
 
