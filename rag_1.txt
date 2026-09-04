@@ -9,7 +9,7 @@ A travel agency runs its customer-support assistant on top of an
 Azure SQL Database named TripDesk.
 
 The assistant answers customer questions by grounding an Azure
-OpenAI chat-completions model on two kinds of data:
+OpenAI CHAT-COMPLETIONS model on two kinds of data:
 
 - The customer's booking row, converted to JSON.
 - A policy text chunk already selected by the retrieval step (the
@@ -60,7 +60,7 @@ permission and REFERENCES permission on the credential.
 You must write one T-SQL batch that, for booking 1001 and policy
 chunk 7:
 
-1. Builds a valid chat-completions request payload, even though
+1. Builds a VALID chat-completions request payload, even though
    ChunkText contains double quotation marks.
 2. Sends the request to the support-gpt deployment by using
    sys.sp_invoke_external_rest_endpoint, authenticating with the
@@ -206,40 +206,44 @@ The correct answer is c.
 This question tests the three fragile points of the T-SQL "glue"
 of a RAG pipeline in Azure SQL Database:
 
-1. The request payload must be valid JSON, even when the retrieved
+1. The request payload must be VALID JSON, even when the retrieved
    context contains characters that are special in JSON (here, the
    double quotation marks around "FlexCancel").
 2. sp_invoke_external_rest_endpoint does NOT put the HTTP body
    directly into @response. It wraps it in an envelope: the HTTP
    metadata is under the response property, and the JSON payload
-   returned by the endpoint is under the result property.
-3. The assistant's reply text is a scalar JSON string, so it must
+   returned by the endpoint is under the RESULT property.
+3. The assistant's reply text is a SCALAR JSON string, so it must
    be extracted with JSON_VALUE, not JSON_QUERY.
 
 Why option c is correct
-.......................
+-----------------------
 
 Walking the batch end to end:
 
 - FOR JSON PATH, WITHOUT_ARRAY_WRAPPER converts the single booking
   row into one JSON object such as:
 
-  {"BookingId":1001,"CustomerName":"Elena Ruiz","Destination":"Lisbon","DepartureDate":"2026-09-14","TotalAmount":1480.00}
+json {"BookingId":1001,"CustomerName":"Elena
+Ruiz","Destination":"Lisbon","DepartureDate":"2026-09-14","TotalAmount":1480.00}
 
-  This is the epigraph's "convert structured data to JSON for
-  language model processing" step.
+This is the epigraph's "convert structured data to JSON for
+language model processing" step.
 
 - The payload is assembled with the JSON constructors JSON_OBJECT
   and JSON_ARRAY. When a plain string expression is supplied as a
-  value, the constructors escape it automatically: the " characters
-  inside ChunkText and inside @bookingJson become \" in the
-  serialized output. The result is a valid chat-completions
+  value, the constructors ESCAPE IT AUTOMATICALLY: the "
+  characters inside ChunkText and inside @bookingJson become \" in
+  the serialized output. The result is a valid chat-completions
   request:
 
-  {"messages":[{"role":"system","content":"..."},{"role":"user","content":"Policy: Under the \"FlexCancel\" plan, ... Booking: {\"BookingId\":1001,...} Question: Can I cancel my trip?"}]}
+json
+{"messages":[{"role":"system","content":"..."},{"role":"user","content":"Policy:
+Under the \"FlexCancel\" plan, ... Booking:
+{\"BookingId\":1001,...} Question: Can I cancel my trip?"}]}
 
-  The chat-completions API expects exactly this shape: a messages
-  array of objects with role and content.
+The chat-completions API expects exactly this shape: a messages
+array of objects with role and content.
 
 - The procedure call is complete and correct:
   - @url targets the deployment's chat/completions endpoint
@@ -256,30 +260,24 @@ Walking the batch end to end:
 
 - The extraction accounts for the envelope. @response contains:
 
-  {
-    "response": { "status": { "http": { "code": 200, "description": "OK" } }, "headers": { ... } },
-    "result": {
-      "id": "chatcmpl-...",
-      "choices": [
-        { "index": 0, "finish_reason": "stop",
-          "message": { "role": "assistant", "content": "Yes — under the FlexCancel plan ..." } }
-      ],
-      "usage": { ... }
-    }
-  }
+json { "response": { "status": { "http": { "code": 200,
+"description": "OK" } }, "headers": { ... } }, "result": { "id":
+"chatcmpl-...", "choices": [ { "index": 0, "finish_reason":
+"stop", "message": { "role": "assistant", "content": "Yes — under
+the FlexCancel plan ..." } } ], "usage": { ... } } }
 
-  JSON_VALUE(@response, '$.result.choices[0].message.content')
-  navigates through result into the chat-completions body and
-  returns the scalar string, so Answer contains the assistant's
-  reply. (JSON_VALUE returns nvarchar(4000) by default, and in lax
-  mode a longer value comes back as NULL; a support answer fits
-  well within that limit. For longer completions you would switch
-  to OPENJSON, or cast the response to the json type and use
-  JSON_VALUE ... RETURNING nvarchar(max) — the RETURNING clause is
-  only supported on json-typed input.)
+JSON_VALUE(@response, '$.result.choices[0].message.content')
+navigates through result into the chat-completions body and
+returns the scalar string, so Answer contains the assistant's
+reply. (JSON_VALUE returns nvarchar(4000) by default, and in lax
+mode a longer value comes back as NULL; a support answer fits well
+within that limit. For longer completions you would switch to
+OPENJSON, or cast the response to the JSON type and use JSON_VALUE
+... RETURNING nvarchar(max) — the RETURNING clause is only
+supported on JSON-typed input.)
 
 Why option a is wrong
-.....................
+---------------------
 
 Option a builds the payload by naive string concatenation:
 
@@ -293,7 +291,7 @@ after it is garbage:
 
 {"messages":[{"role":"user","content":"Policy: Under the "FlexCancel" plan, ...
 
-This is NOT a valid JSON document. The documentation for
+This is NOT A VALID JSON DOCUMENT. The documentation for
 sp_invoke_external_rest_endpoint is explicit: "Payloads must be a
 valid JSON document, a well formed XML document, or text" — and
 with the auto-injected content-type: application/json, this
@@ -304,13 +302,12 @@ never contain the reply). The extraction path in option a is
 actually correct — the payload construction is the fatal flaw.
 
 Why option b is wrong
-.....................
+---------------------
 
 Option b fixes the escaping problem correctly:
-STRING_ESCAPE(@context, 'json') and
-STRING_ESCAPE(@bookingJson, 'json') escape the embedded quotation
-marks, so the payload is valid JSON and the HTTP call succeeds
-with return code 0.
+STRING_ESCAPE(@context, 'json') and STRING_ESCAPE(@bookingJson,
+'json') escape the embedded quotation marks, so the payload is
+valid JSON and the HTTP call succeeds with return code 0.
 
 The flaw is the extraction path:
 
@@ -319,7 +316,7 @@ JSON_VALUE(@response, '$.choices[0].message.content')
 There is no top-level choices property in @response. The procedure
 wraps the endpoint's payload under result; the top-level
 properties of @response are response and result. Because
-JSON_VALUE uses lax path mode by default, a path that does not
+JSON_VALUE uses LAX path mode by default, a path that does not
 exist returns NULL rather than an error.
 
 The batch therefore runs without any error and silently returns
@@ -327,7 +324,7 @@ Answer = NULL — the most treacherous failure mode of the four, and
 explicitly disallowed by requirement 3.
 
 Why option d is wrong
-.....................
+---------------------
 
 Option d is byte-for-byte identical to option c except for one
 function:
@@ -335,7 +332,7 @@ function:
 JSON_QUERY(@response, '$.result.choices[0].message.content')
 
 The path is correct, but the function is not. JSON_QUERY extracts
-objects or arrays; JSON_VALUE extracts scalar values. The content
+OBJECTS OR ARRAYS; JSON_VALUE extracts SCALAR VALUES. The content
 property is a scalar JSON string. In the default lax path mode,
 JSON_QUERY returns NULL when the path points to a scalar (in
 strict mode it would raise an error instead).
@@ -347,7 +344,10 @@ JSON_QUERY(@response, '$.result.choices[0].message') returns the
 whole {"role":"assistant","content":"..."} object, and the
 documentation's own Azure OpenAI example uses
 JSON_QUERY(@response, '$.result.data[0].embedding') because an
-embedding is an array.
+embedding is an ARRAY.
+
+Conceptual question (Azure / tooling); not executed against an
+engine.
 
 DP-800 Exam Rule to Remember
 ----------------------------

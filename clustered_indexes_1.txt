@@ -95,27 +95,26 @@ The question packs four separable clustered-index facts; each
 wrong option is one of them mis-remembered.
 
 Why option a is wrong — PRIMARY KEY ≠ clustered index
-.....................................................
+-----------------------------------------------------
 
 "One clustered index per table" is true, but PK_Sessions is not
-it. A PRIMARY KEY constraint is enforced by a unique index, and
+it. A PRIMARY KEY constraint is enforced by a UNIQUE INDEX, and
 that index is clustered only BY DEFAULT. Here the constraint was
 declared PRIMARY KEY NONCLUSTERED, so after CREATE TABLE the table
-is a heap with a unique nonclustered index enforcing the key. The
-one clustered-index slot is still free, and
-CREATE CLUSTERED INDEX ... ON (EntryTime) legally claims it — on a
-column that is neither the key nor unique. The two roles — "row
-identity" (PK) and "physical organization of the table" (CI) —
-are independent, and separating them like this is a real design
-pattern (cluster on the insert/range column, keep the surrogate
-key nonclustered).
+is a HEAP with a unique nonclustered index enforcing the key. The
+one clustered-index slot is still free, and CREATE CLUSTERED INDEX
+... ON (EntryTime) legally claims it — on a column that is neither
+the key nor unique. The two roles — "row identity" (PK) and
+"physical organization of the table" (CI) — are independent, and
+separating them like this is a real design pattern (cluster on the
+insert/range column, keep the surrogate key nonclustered).
 
 Also note the opposite trap: had the batch instead tried to create
 a second clustered index after this one, THAT would fail with
 "Cannot create more than one clustered index on table".
 
 Why option b is correct — index_id is a role, not a birth order
-...............................................................
+---------------------------------------------------------------
 
 sys.indexes uses fixed slots:
 
@@ -135,32 +134,31 @@ index_id  name                 type_desc     is_unique  is_primary_key
 
 Creating the clustered index converts the heap: row 0 disappears,
 CIX_Sessions_EntryTime appears as index_id = 1 even though it was
-created LAST, and the two nonclustered indexes keep ids 2 and 3.
+created last, and the two nonclustered indexes keep ids 2 and 3.
 is_unique = 0 for the clustered index (see option d) and
 is_primary_key = 0 (see option a).
 
 Why option c is wrong — the creation-order myth
-...............................................
+-----------------------------------------------
 
 Option c is the subtle distractor: identical rows, but it assumes
 index_id values are handed out sequentially in creation order
 (heap 0, PK 2, PlateNo 3, so the new index gets 4). index_id = 1
-is RESERVED for the clustered index, whenever it is created; a
-heap-to-clustered conversion moves the table from slot 0 to
-slot 1. An index_id of 4 for a clustered index is impossible, as
-is the survival of a HEAP row alongside a clustered index — the
-heap and the clustered index are the SAME slot in two states,
-never coexisting.
+is reserved for the clustered index, whenever it is created; a
+heap-to-clustered conversion moves the table from slot 0 to slot
+1. An index_id of 4 for a clustered index is impossible, as is the
+survival of a HEAP row alongside a clustered index — the heap and
+the clustered index are the same slot in two states, never
+coexisting.
 
-Why option d is wrong — the uniqueifier does not make the index
-unique
-...............................................................
+Why option d is wrong — the uniqueifier does not make the index unique
+----------------------------------------------------------------------
 
 Three inserted rows share EntryTime = '2026-08-01 06:15:00', and
 the CREATE CLUSTERED INDEX (no UNIQUE keyword) still succeeds — a
 clustered index does NOT have to be unique. Internally the engine
 must still tell duplicate key rows apart, so it appends a hidden
-4-byte uniqueifier to the key of every row that duplicates an
+4-byte UNIQUEIFIER to the key of every row that duplicates an
 earlier key value (the first occurrence carries none — it is a
 variable-length column added only when needed). Verified on this
 data via sys.dm_db_index_physical_stats(... 'DETAILED'): leaf
@@ -173,13 +171,13 @@ inserting successfully (verified), and the optimizer does not get
 the plan-simplification benefits of a declared unique index.
 
 What also happened, invisibly, to the nonclustered indexes
-..........................................................
+----------------------------------------------------------
 
-Every nonclustered index row carries a row locator pointing at its
+Every nonclustered index row carries a ROW LOCATOR pointing at its
 base-table row:
 
-- on a heap: the RID (file:page:slot);
-- on a clustered table: the clustering key (plus the uniqueifier
+- on a HEAP: the RID (file:page:slot);
+- on a CLUSTERED TABLE: the CLUSTERING KEY (plus the uniqueifier
   when present).
 
 PK_Sessions and IX_Sessions_PlateNo were built while the table was
@@ -188,14 +186,17 @@ therefore silently REBUILT BOTH NONCLUSTERED INDEXES to replace
 RIDs with EntryTime (+ uniqueifier) locators — which is why
 creating (or dropping) a clustered index on a large table is far
 more expensive than the clustered index alone, and why a wide
-clustered key inflates EVERY nonclustered index. Dropping
+clustered key inflates every nonclustered index. Dropping
 CIX_Sessions_EntryTime would rebuild them back to RIDs.
 
 One last myth for completeness: a clustered index defines the
-LOGICAL order of the data and is not a promise that pages sit
-physically contiguous on disk, nor that
-SELECT ... FROM Park.Sessions without ORDER BY will return rows in
-EntryTime order. Order of results is guaranteed only by ORDER BY.
+logical order of the data and is not a promise that pages sit
+physically contiguous on disk, nor that SELECT ... FROM
+Park.Sessions without ORDER BY will return rows in EntryTime
+order. Order of results is guaranteed only by ORDER BY.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
 
 DP-800 Exam Rule to Remember
 ----------------------------
@@ -207,8 +208,8 @@ non-unique CI      → hidden 4-byte uniqueifier on duplicates; is_unique stays 
 nonclustered index → row locator = RID on a heap, clustering key (+uniqueifier) on a clustered table
 create/drop the CI → every nonclustered index is rebuilt to swap its locators
 
-When a question shows PRIMARY KEY NONCLUSTERED followed by
-CREATE CLUSTERED INDEX on another column, read it as: heap →
-clustered conversion, clustered index takes index_id = 1
-regardless of creation order, and the wide/narrow-clustering-key
-trade-off now applies to every secondary index on the table.
+When a question shows PRIMARY KEY NONCLUSTERED followed by CREATE
+CLUSTERED INDEX on another column, read it as: heap -> clustered
+conversion, clustered index takes index_id = 1 regardless of
+creation order, and the wide/narrow-clustering-key trade-off now
+applies to every secondary index on the table.

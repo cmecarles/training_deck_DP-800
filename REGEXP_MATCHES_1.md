@@ -106,6 +106,8 @@ Group 1 = an uppercase letter optionally followed by one lowercase letter (an el
 - Extracting the parts with scalar calls gives the same data one column at a time: `REGEXP_SUBSTR(Formula, '([A-Z][a-z]?)(\d*)', 1, n)` for the n-th match plus `REGEXP_INSTR(..., n, 0/1)` for its positions — but only `REGEXP_MATCHES` delivers all matches and all groups in a single table.
 - `JSON_VALUE(m.substring_matches, '$[0].value')` and `'$[1].value'` pull the element symbol and atom count out of the JSON array into relational columns.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 - SQL Server 2025 adds regex support: scalar functions (`REGEXP_LIKE`, `REGEXP_COUNT`, `REGEXP_INSTR`, `REGEXP_SUBSTR`, `REGEXP_REPLACE`) and **table-valued** functions (`REGEXP_MATCHES`, `REGEXP_SPLIT_TO_TABLE`).

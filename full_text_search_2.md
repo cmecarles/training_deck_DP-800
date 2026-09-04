@@ -1,0 +1,177 @@
+# SQL Server question — Full-Text Search 2
+
+## Statement
+
+A travel publisher keeps its guidebook paragraphs in a SQL Server 2025 database named `AtlasGuides`, on an instance where the **Full-Text and Semantic Extractions for Search** feature is installed (`SELECT FULLTEXTSERVICEPROPERTY('IsFullTextInstalled')` returns 1). The instance keeps the default value (0) of the `transform noise words` server option.
+
+```sql
+CREATE DATABASE AtlasGuides;
+GO
+USE AtlasGuides;
+GO
+CREATE SCHEMA Trips;
+GO
+CREATE TABLE Trips.Guides
+(
+    GuideId INT           NOT NULL CONSTRAINT PK_Guides PRIMARY KEY,
+    Title   NVARCHAR(80)  NOT NULL,
+    Body    NVARCHAR(MAX) NOT NULL
+);
+INSERT INTO Trips.Guides (GuideId, Title, Body) VALUES
+    (1, N'Alpine ridge',   N'Hikers ride the cable car up and then walk the ridge trail.'),
+    (2, N'Valley railway', N'We rode the narrow-gauge railway through the valley.'),
+    (3, N'Canal city',     N'Riding a bicycle along the canal is the best way to see the city.'),
+    (4, N'Harbour hop',    N'The ferry crossing takes forty minutes; a bike rental is nearby.'),
+    (5, N'Island loop',    N'Cycling routes cover the whole island.');
+GO
+CREATE FULLTEXT CATALOG GuideCatalog AS DEFAULT;
+GO
+CREATE FULLTEXT INDEX ON Trips.Guides (Body LANGUAGE 1033)
+    KEY INDEX PK_Guides
+    WITH (CHANGE_TRACKING = AUTO, STOPLIST = SYSTEM);
+GO
+```
+
+Population has completed (`OBJECTPROPERTYEX(OBJECT_ID('Trips.Guides'), 'TableFullTextPopulateStatus')` returns 0).
+
+A sysadmin then edits the English thesaurus file `tsenu.xml` in the instance's `FTDATA` folder — removing the `<!-- ... -->` comment markers that surround the shipped sample and saving the file as Unicode with a byte-order mark — so that it reads:
+
+```xml
+<XML ID="Microsoft Search Thesaurus">
+    <thesaurus xmlns="x-schema:tsSchema.xml">
+        <diacritics_sensitive>0</diacritics_sensitive>
+        <expansion>
+            <sub>bicycle</sub>
+            <sub>bike</sub>
+            <sub>cycling</sub>
+        </expansion>
+        <replacement>
+            <pat>ferry</pat>
+            <sub>boat</sub>
+        </replacement>
+    </thesaurus>
+</XML>
+```
+
+and loads it into the instance:
+
+```sql
+EXECUTE sys.sp_fulltext_load_thesaurus_file 1033;
+```
+
+Six queries are then executed:
+
+```sql
+-- Q1
+SELECT GuideId FROM Trips.Guides WHERE CONTAINS(Body, 'ride');
+-- Q2
+SELECT GuideId FROM Trips.Guides WHERE CONTAINS(Body, 'FORMSOF(INFLECTIONAL, ride)');
+-- Q3
+SELECT GuideId FROM Trips.Guides WHERE CONTAINS(Body, 'FORMSOF(THESAURUS, bicycle)');
+-- Q4
+SELECT GuideId FROM Trips.Guides WHERE CONTAINS(Body, 'FORMSOF(THESAURUS, ferry)');
+-- Q5
+SELECT GuideId FROM Trips.Guides WHERE FREETEXT(Body, 'riding');
+-- Q6
+SELECT GuideId FROM Trips.Guides WHERE CONTAINS(Body, 'FORMSOF(INFLECTIONAL, ride)', LANGUAGE 0x0);
+```
+
+Which option lists the `GuideId` values that each query returns?
+
+### a.
+
+| Query | GuideId values returned |
+|---|---|
+| Q1 | 1 |
+| Q2 | 1, 2, 3 |
+| Q3 | 3, 4, 5 |
+| Q4 | (no rows) |
+| Q5 | 1, 2, 3 |
+| Q6 | 1 |
+
+### b.
+
+| Query | GuideId values returned |
+|---|---|
+| Q1 | 1, 2, 3 |
+| Q2 | 1, 2, 3 |
+| Q3 | 3, 4, 5 |
+| Q4 | 4 |
+| Q5 | 1, 2, 3 |
+| Q6 | 1, 2, 3 |
+
+### c.
+
+| Query | GuideId values returned |
+|---|---|
+| Q1 | 1 |
+| Q2 | 1, 3 |
+| Q3 | 3 |
+| Q4 | 4 |
+| Q5 | 1, 2, 3 |
+| Q6 | 1 |
+
+### d.
+
+| Query | GuideId values returned |
+|---|---|
+| Q1 | 1 |
+| Q2 | 1, 2, 3 |
+| Q3 | 3, 4, 5 |
+| Q4 | 4 |
+| Q5 | 1 |
+| Q6 | 1 |
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+Three different mechanisms widen a full-text query beyond the literal token: the **language stemmer** (`FORMSOF(INFLECTIONAL, ...)`, and implicitly `FREETEXT`), the **thesaurus** (`FORMSOF(THESAURUS, ...)`, and implicitly `FREETEXT`), and the **language** the query is resolved in (`LANGUAGE` argument, otherwise the column's full-text language). A plain `CONTAINS` simple term uses none of them.
+
+### Why option a is correct
+
+- **Q1 — simple term.** `CONTAINS(Body, 'ride')` is a `<simple_term>`: "Specifies a match for an exact word or a phrase" (case-insensitive). Only row 1 contains the token *ride*; *rode* (row 2) and *Riding* (row 3) are different tokens, and no stemming is applied to a simple term. Result: **1**.
+- **Q2 — inflectional forms.** `FORMSOF(INFLECTIONAL, ride)` "specifies that the language-dependent stemmer is to be used on the specified simple term"; the column's full-text language is English (1033). The documentation's own example is that *drive* is "the inflectional stem of drives, drove, driving, and driven", and the Learn module states that `FORMSOF(INFLECTIONAL, "ride")` "matches ride, rides, riding, and rode" — irregular past tenses included. Rows 1 (*ride*), 2 (*rode*) and 3 (*Riding*) match. Result: **1, 2, 3**.
+- **Q3 — thesaurus expansion set.** `FORMSOF(THESAURUS, bicycle)` uses "the thesaurus corresponding to the column full-text language". *bicycle* is a `<sub>` of an **expansion set**, and "queries that contain a match for any synonym in an expansion set are expanded to include every other synonym in the expansion set" — the condition becomes *bicycle* OR *bike* OR *cycling*. Rows 3 (*bicycle*), 4 (*bike*) and 5 (*Cycling*; `diacritics_sensitive` = 0 and matching is case-insensitive) match. Result: **3, 4, 5**.
+- **Q4 — thesaurus replacement set.** *ferry* is a `<pat>` of a **replacement set**, and a replacement set "contains a text pattern to be replaced by a substitution set". The documentation's example is explicit: for a pattern *Win8* replaced by *Windows Server 2012*, "full-text search only returns search results containing 'Windows Server 2012' or 'Windows 8.0'. It doesn't return results containing 'Win8'". The query therefore searches for *boat*, which no row contains. Row 4, the only row with the word *ferry*, is **not** returned. Result: **no rows**.
+- **Q5 — FREETEXT.** "`freetext_string` is wordbroken, stemmed, and passed through the thesaurus", and `FREETEXT` "automatically looks for inflectional forms of your search terms". *riding* stems to the same forms as Q2 (the thesaurus has no entry for it). Result: **1, 2, 3**.
+- **Q6 — neutral language.** `LANGUAGE 0x0` selects the neutral language resources ("To use the neutral language resources, specify 0x0 as `language_term`"), and "the neutral language does not have an associated stemmer"; when `language_term` is given, "the stemmer corresponding to that language is used". With no stemmer, `FORMSOF(INFLECTIONAL, ride)` degrades to the literal token. Result: **1**.
+
+### Why option b is wrong
+
+It applies stemming to the plain simple term in Q1 — but only `FREETEXT` and `FORMSOF` stem; `CONTAINS(col, 'word')` is exact. It reads the replacement set of Q4 as if it were an expansion set (row 4 would be returned only if *ferry* had been kept alongside *boat*, which is exactly what a replacement set does **not** do), and it ignores the `LANGUAGE 0x0` argument in Q6, whose whole effect is to remove the English stemmer.
+
+### Why option c is wrong
+
+Option c assumes the stemmer handles only regular suffixes, dropping *rode* from Q2 — the documentation's *drive/drove/driven* example rules that out. It also assumes the thesaurus is not in effect for Q3 (returning only the literal *bicycle*). Both premises fail: the file **was** loaded explicitly with `sp_fulltext_load_thesaurus_file 1033`, and even without that call "thesaurus files are automatically loaded by full-text queries that use the thesaurus" (the procedure exists "to avoid this first-time performance impact"). Q4 repeats the replacement/expansion confusion.
+
+### Why option d is wrong
+
+This is the subtle distractor: Q1, Q2, Q3 and Q6 are right. Q4 is wrong for the reason above — a `<replacement>` element **removes** the user's pattern and substitutes the `<sub>` entries (a pattern with no `<sub>` at all simply deletes the term from the query). Q5 is wrong because `FREETEXT` is never an exact match: it is the *loosest* predicate, matching "the meaning, but not the exact wording", and treats Boolean words such as *AND* as stopwords rather than operators.
+
+### Related facts from the documentation
+
+- **Weighted terms.** `ISABOUT(canal WEIGHT(0.9), island WEIGHT(0.1))` accepts weights from 0.0 through 1.0 (decimal separator always a period). "WEIGHT does not affect the results of CONTAINS queries, but WEIGHT affects rank in CONTAINSTABLE queries": in `CONTAINSTABLE(Trips.Guides, Body, 'ISABOUT(...)')` rows 3 and 5 come back with `KEY` and `RANK`, row 3 ranked higher; in `CONTAINS` the same condition merely returns both rows.
+- **FREETEXTTABLE** returns `KEY` and `RANK` for the `FREETEXT` semantics, with an optional `LANGUAGE` argument and `top_n_by_rank`; `WEIGHT`, `FORMSOF`, wildcards and `NEAR` are not allowed inside its string.
+- **Stoplists.** With `STOPLIST = SYSTEM`, stopwords such as *the* are omitted from the index (their *positions* are kept, so phrase and `NEAR` distances stay correct) and removed from queries. With `transform noise words` = 0, a Boolean condition that includes a stopword — `CONTAINS(Body, 'canal AND the')` — "returns zero rows, and SQL Server raises a warning"; setting the option to 1 drops the stopword and evaluates the rest (row 3 returned). Custom lists: `CREATE FULLTEXT STOPLIST ... FROM SYSTEM STOPLIST`, `ALTER FULLTEXT STOPLIST ... ADD 'word' LANGUAGE 1033`, `ALTER FULLTEXT INDEX ... SET STOPLIST`; inspect with `sys.fulltext_stopwords`; test tokenization with `sys.dm_fts_parser`.
+- **LANGUAGE.** May be a string (`sys.syslanguages.alias`, e.g. `'English'`), an integer LCID (1033) or a hex value (`0x409`); it governs "word breaking, stemming, thesaurus expansions and replacements, and noise-word removal"; an invalid or uninstalled language returns an error; when omitted, "the column full-text language is used" — which is why `Body LANGUAGE 1033` in the index definition matters.
+- **Thesaurus files.** One per language, named `ts` + three-letter abbreviation + `.xml` (`tsenu.xml` for English) plus the global `tsglobal.xml` (LCID 0, consulted after the language file), in `<data path>\MSSQL\FTDATA\`. They ship "essentially empty" with the sample commented out; only sysadmins may edit them; entries must not be empty or duplicated, phrases are limited to 512 characters, `<sub>` entries should avoid stopwords, and when two replacement patterns overlap "the longer of the two takes precedence". `sp_fulltext_load_thesaurus_file @lcid [, @loadOnlyIfNotLoaded]` parses the file into `tempdb` and recompiles the full-text queries that use that thesaurus. The thesaurus documentation applies to **SQL Server** only: Azure SQL Database exposes no file system, so synonym handling there is a reason to look at query rewriting or vector/hybrid search rather than `FORMSOF(THESAURUS, ...)`.
+
+Conceptual question (the lab instance has no full-text component — `FULLTEXTSERVICEPROPERTY('IsFullTextInstalled')` returns 0 — so the behaviour is taken from the official Microsoft Learn documentation). Not executed against an engine.
+
+## DP-800 Exam Rule to Remember
+
+```text
+CONTAINS(col, 'word')                    exact token, no stemming, no synonyms
+CONTAINS(col, 'FORMSOF(INFLECTIONAL, w)') stemmer of the query language (rides, riding, rode)
+CONTAINS(col, 'FORMSOF(THESAURUS, w)')    tsXXX.xml of the query language:
+      <expansion><sub>a</sub><sub>b</sub>   -> a OR b (both kept)
+      <replacement><pat>a</pat><sub>b</sub> -> a is REPLACED by b (a itself no longer matches)
+FREETEXT(col, 'text')                    wordbreak + stem + thesaurus, any term matches, AND/NOT are stopwords
+LANGUAGE lcid | 'alias' | 0xHEX          picks stemmer/thesaurus/stoplist; 0x0 = neutral = NO stemmer
+ISABOUT(t WEIGHT(0.0..1.0), ...)          changes RANK in CONTAINSTABLE/FREETEXTTABLE only, never the row set
+```
+
+Operational checklist: edit `tsenu.xml` (remove the comment markers, save as Unicode with BOM), `EXEC sys.sp_fulltext_load_thesaurus_file 1033` (sysadmin; otherwise loaded lazily on first use), `STOPLIST = SYSTEM` strips stopwords from index and query, and `transform noise words` = 0 makes a Boolean condition containing a stopword return zero rows with a warning.

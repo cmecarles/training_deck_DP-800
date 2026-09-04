@@ -345,6 +345,8 @@ That means `AppUser` would satisfy the predicate for every `AppUserId`, regardle
 
 This violates the tenant-isolation requirements.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `SESSION_CONTEXT` identifies an application-level caller only because the database predicate chooses to trust that value.

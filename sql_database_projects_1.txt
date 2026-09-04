@@ -30,8 +30,8 @@ A GitHub Actions workflow runs on every merge to main:
     /TargetConnectionString:"${{ secrets.PROD_SQL_CONNECTION }}"
 
 The publish step runs with default SqlPackage publish properties.
-The StoreCatalog database has NEVER been registered as a data-tier
-application.
+The StoreCatalog database has NEVER BEEN REGISTERED AS A DATA-TIER
+APPLICATION.
 
 During a weekend incident, a DBA connected directly to production
 and hot-fixed the database:
@@ -48,13 +48,12 @@ Before the next deployment runs, the team lead requires that you:
 
 1. Produce a reviewable report of the exact actions the next
    deployment would perform against the CURRENT state of
-   production, WITHOUT modifying production.
-2. Ensure the hot-fix is preserved by making it part of the project
-   source through the normal pull-request process, so that future
-   deployments do not revert it.
+   production, WITHOUT MODIFYING PRODUCTION.
+2. Ensure the hot-fix is preserved by making it part of the
+   project source through the normal pull-request process, so that
+   future deployments do not revert it.
 
 Which approach should you use?
-
 
 a.
 
@@ -67,9 +66,8 @@ a.
 
 Rely on BlockOnPossibleDataLoss=True to terminate the publish
 operation because the target schema no longer matches the dacpac.
-Review the error output to identify the hot-fixed objects, then add
-them to the project in a pull request.
-
+Review the error output to identify the hot-fixed objects, then
+add them to the project in a pull request.
 
 b.
 
@@ -79,10 +77,9 @@ b.
     /TargetConnectionString:"${{ secrets.PROD_SQL_CONNECTION }}"
     /OutputPath:"drift-report.xml"
 
-Run DriftReport against production to generate an XML report of the
-changes the DBA made, review the report, then add the hot-fixed
-objects to the project in a pull request.
-
+Run DriftReport against production to generate an XML report of
+the changes the DBA made, review the report, then add the
+hot-fixed objects to the project in a pull request.
 
 c.
 
@@ -96,14 +93,13 @@ c.
     /TargetConnectionString:"${{ secrets.PROD_SQL_CONNECTION }}"
     /OutputPath:"deploy-report.xml"
 
-Build the dacpac from main with dotnet build, run DeployReport with
-the dacpac as source and production as target, and review the XML
-report of the actions a publish would take. The report reveals that
-publish would drop IX_Product_SupplierId and alter
+Build the dacpac from main with dotnet build, run DeployReport
+with the dacpac as source and production as target, and review the
+XML report of the actions a publish would take. The report reveals
+that publish would drop IX_Product_SupplierId and alter
 dbo.usp_GetProductsBySupplier back to the old body. Add the index
 definition and the new procedure body to the project source in a
 pull request before the next deployment.
-
 
 d.
 
@@ -114,16 +110,14 @@ d.
     /TargetFile:"bin/Release/StoreCatalog.dacpac"
 
 Run Extract against production and overwrite the pipeline's build
-artifact bin/Release/StoreCatalog.dacpac with the extracted dacpac,
-so that the next publish step deploys a dacpac that already
-contains the hot-fix and nothing is reverted.
-
+artifact bin/Release/StoreCatalog.dacpac with the extracted
+dacpac, so that the next publish step deploys a dacpac that
+already contains the hot-fix and nothing is reverted.
 
 Correct Answer
 --------------
 
 c
-
 
 Explanation
 -----------
@@ -136,14 +130,14 @@ SqlPackage:
 1. An SDK-style (Microsoft.Build.Sql) project is built with dotnet
    build, and the build output artifact is a .dacpac file that
    represents the intended state of the schema.
-2. SqlPackage /Action:DeployReport creates an XML report of the
-   changes that would be made by a publish action, comparing a
+2. SqlPackage /Action:DeployReport creates an XML REPORT OF THE
+   CHANGES THAT WOULD BE MADE BY A PUBLISH ACTION, comparing a
    source (here, the dacpac built from main) against a target
-   database — WITHOUT executing anything against the target.
-3. Out-of-band changes are only safe once they are merged back into
-   the project source, because the project — not the live database
-   — is the source of truth that every future build and publish is
-   derived from.
+   database — WITHOUT EXECUTING ANYTHING AGAINST THE TARGET.
+3. Out-of-band changes are only safe once they are merged back
+   into the project source, because the project — not the live
+   database — is the source of truth that every future build and
+   publish is derived from.
 
 Why option c is correct
 -----------------------
@@ -155,8 +149,8 @@ read-only comparison: production is not modified, which satisfies
 requirement 1.
 
 Because the dacpac built from main does not contain the hot-fix,
-the report surfaces exactly how the next publish would collide with
-it:
+the report surfaces exactly how the next publish would collide
+with it:
 
 - IX_Product_SupplierId exists only in the target. The publish
   default DropIndexesNotInSource=True means the report shows the
@@ -167,10 +161,10 @@ it:
 
 Reviewing the report tells the team precisely which objects
 drifted. Adding the index and the new procedure body to the
-project's declarative T-SQL source through a pull request makes the
-hot-fix part of the model, so subsequent builds produce a dacpac
-that already contains it and future publishes no longer revert it.
-That satisfies requirement 2.
+project's declarative T-SQL source through a pull request makes
+the hot-fix part of the model, so subsequent builds produce a
+dacpac that already contains it and future publishes no longer
+revert it. That satisfies requirement 2.
 
 Why option a is wrong
 ---------------------
@@ -196,16 +190,17 @@ The action name sounds exactly right, which is the trap. Per the
 documentation, DriftReport "creates an XML report of the changes
 that have been made to the REGISTERED database since it was LAST
 REGISTERED" — it compares the live database against the snapshot
-stored when the database was registered as a data-tier application,
-and it accepts only target parameters (there is no /SourceFile).
+stored when the database was registered as a data-tier
+application, and it accepts only target parameters (there is no
+/SourceFile).
 
-The statement says StoreCatalog has NEVER been registered as a
-data-tier application, so there is no registration baseline to
+The statement says StoreCatalog has NEVER BEEN REGISTERED AS A
+DATA-TIER APPLICATION, so there is no registration baseline to
 compare against and DriftReport cannot report the DBA's changes.
 Even in a registered database, DriftReport compares production
 against its registration snapshot, not against the dacpac built
-from main, so it would not show what the NEXT DEPLOYMENT would do —
-which is what requirement 1 asks for.
+from main, so it would not show what the next deployment would do
+— which is what requirement 1 asks for.
 
 Why option d is wrong
 ---------------------
@@ -217,16 +212,19 @@ no-op, so:
 
 - No report of differences is ever produced or reviewed —
   requirement 1 is not met.
-- The .sqlproj T-SQL source in GitHub is never updated. The project
-  remains the source of truth for every future build, so the very
-  next merge to main runs dotnet build again, produces a dacpac
-  WITHOUT the hot-fix, and the following publish drops the index
-  and reverts the procedure after all — requirement 2 is not met.
+- The .sqlproj T-SQL source in GitHub is never updated. The
+  project remains the source of truth for every future build, so
+  the very next merge to main runs dotnet build again, produces a
+  dacpac WITHOUT the hot-fix, and the following publish drops the
+  index and reverts the procedure after all — requirement 2 is not
+  met.
 
 Bypassing the pull-request process by swapping binary artifacts
 inside the pipeline also defeats the purpose of keeping the schema
 under source control.
 
+Conceptual question (Azure / tooling); not executed against an
+engine.
 
 DP-800 Exam Rule to Remember
 ----------------------------
@@ -247,12 +245,12 @@ Match the SqlPackage action to the question being asked:
 
 And remember the defaults that make undetected drift dangerous:
 
-- BlockOnPossibleDataLoss=True blocks data loss ONLY, never schema
+- BlockOnPossibleDataLoss=True blocks DATA LOSS ONLY, never schema
   drift in general.
 - DropIndexesNotInSource=True means a hot-fix index added directly
   in production is silently dropped by the next publish.
 
 When production has been changed out-of-band, the recovery is
 always the same: DETECT the difference with a read-only report,
-then MERGE the change into the SQL Database Project source — the
+then MERGE THE CHANGE INTO THE SQL DATABASE PROJECT SOURCE — the
 project, not the database, is the source of truth in CI/CD.

@@ -155,6 +155,8 @@ Call 555-0117 or 555-XXXX or 555-0199 now.
 - `[0-9]{3}` ≡ `\d{3}`: R4 rewritten with `N'(\d{3})-(\d{4})'` was executed and returns the identical string.
 - R1's greedy single match could equally be replaced with `occurrence = 1` explicitly (`1, 1` for start/occurrence): with only one possible match, occurrence 0 and 1 coincide.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `REGEXP_REPLACE(string, pattern [, replacement [, start [, occurrence [, flags]]]])`

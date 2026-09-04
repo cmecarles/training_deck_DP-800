@@ -1,0 +1,323 @@
+============================================================
+ SQL Server question — Audit Retention 1
+============================================================
+
+Statement
+---------
+
+A pharmaceutical manufacturer runs its batch-record system on
+AZURE SQL DATABASE. The logical server pharmatrace-sql hosts the
+production database PharmaTrace, a PharmaTraceDev copy, and a new
+database is added every quarter for each new plant. Manufacturing
+regulations impose these requirements on AUDITING:
+
+1. Every database on the server — existing and future — must be
+   audited with the default action groups, and the audit logs must
+   be kept for SEVEN YEARS (2,555 DAYS) in a WORM store: nobody in
+   the subscription, DBAs and Owners included, may delete or
+   shorten the logs before they expire, but the retention must be
+   EXTENDABLE if a regulator asks.
+2. The security operations team must alert on batch events within
+   minutes using KQL, keep the events interactively queryable for
+   90 DAYS, and keep them cheaply for TWO YEARS.
+3. Operations performed by MICROSOFT SUPPORT ENGINEERS on the
+   server during support cases must be captured.
+4. PharmaTrace alone must additionally record permission changes
+   and schema-object access
+   (DATABASE_OBJECT_PERMISSION_CHANGE_GROUP,
+   SCHEMA_OBJECT_ACCESS_GROUP) into a SEPARATE STORAGE ACCOUNT
+   owned by the compliance team, without changing what the other
+   databases record.
+5. Auditors must be able to pull, with T-SQL, only the events of a
+   given TWO-HOUR WINDOW from the seven-year blob archive, without
+   the function scanning every file in the archive.
+
+Which configuration meets all five requirements?
+
+a.
+
+- On the SERVER (pharmatrace-sql -> Security -> Auditing), enable
+  auditing with two destinations: the general-purpose v2 storage
+  account ptaudit (authentication: managed identity; container
+  sqldbauditlogs; RETENTION (DAYS) = 2,600) and the Log Analytics
+  workspace pt-law.
+- On ptaudit/sqldbauditlogs, configure a TIME-BASED RETENTION
+  POLICY OF 2,555 DAYS, set Allow protected append writes to
+  APPEND BLOBS, and LOCK the policy.
+- In pt-law, set the AzureDiagnostics table to 90 DAYS ANALYTICS
+  RETENTION / 730 DAYS TOTAL RETENTION, and create a log alert on
+  AzureDiagnostics | where Category == "SQLSecurityAuditEvents"
+  and action_name_s == "BATCH COMPLETED".
+- On the server's Auditing page switch ENABLE AUDITING OF
+  MICROSOFT SUPPORT OPERATIONS to ON (same destinations).
+- On PharmaTrace, enable DATABASE-LEVEL auditing to the compliance
+  storage account with Set-AzSqlDatabaseAudit -AuditActionGroup
+  "DATABASE_OBJECT_PERMISSION_CHANGE_GROUP","SCHEMA_OBJECT_ACCESS_GROUP"
+  ....
+- Auditors query:
+
+SELECT event_time, server_principal_name, database_name, statement
+FROM sys.fn_get_audit_file_v2(
+    'https://ptaudit.blob.core.windows.net/sqldbauditlogs/pharmatrace-sql/master/SqlDbAuditing_ServerAudit/',
+    DEFAULT, DEFAULT, '2026-09-04T08:00:00Z', '2026-09-04T10:00:00Z');
+
+b.
+
+- Enable DATABASE-LEVEL auditing on PharmaTrace and PharmaTraceDev
+  (no server policy, "so that each database writes to its own
+  folder"), destination ptaudit with RETENTION (DAYS) = 0, plus
+  pt-law.
+- On ptaudit/sqldbauditlogs, place a LEGAL HOLD tagged GxP-7y.
+- Support engineers "are covered by BATCH_COMPLETED_GROUP", so
+  leave the Microsoft support operations switch OFF.
+- On PharmaTrace, REPLACE the action groups with
+  DATABASE_OBJECT_PERMISSION_CHANGE_GROUP and
+  SCHEMA_OBJECT_ACCESS_GROUP and point the database audit at the
+  compliance account.
+- Auditors query
+  sys.fn_get_audit_file('https://ptaudit.blob.core.windows.net/sqldbauditlogs/pharmatrace-sql/PharmaTrace/*.xel',
+  DEFAULT, DEFAULT) with WHERE event_time BETWEEN ... AND ....
+
+c.
+
+- Enable SERVER-LEVEL auditing to the Log Analytics workspace
+  pt-law ONLY; set the AzureDiagnostics table to 90 days analytics
+  retention and 2,556 DAYS TOTAL RETENTION — "Log Analytics is
+  append-only, so the workspace is the WORM archive".
+- Microsoft support operations "are already included in server
+  auditing".
+- Add DATABASE_OBJECT_PERMISSION_CHANGE_GROUP and
+  SCHEMA_OBJECT_ACCESS_GROUP to the SERVER policy so that
+  PharmaTrace records them.
+- Auditors query the window with KQL (AzureDiagnostics | where
+  TimeGenerated between (...)).
+
+d.
+
+- Same server-level auditing as option a (storage ptaudit +
+  pt-law), but RETENTION (DAYS) = 0 on the SQL side "so that only
+  the immutable policy governs deletion".
+- On ptaudit/sqldbauditlogs, a TIME-BASED RETENTION POLICY OF
+  2,555 DAYS with Allow protected append writes = Append blobs,
+  left UNLOCKED "so that compliance can adjust the period later".
+- AzureDiagnostics 90 / 730 days, KQL alert, Microsoft support
+  operations switch ON, and the same PharmaTrace database-level
+  audit as option a.
+- Auditors query:
+
+SELECT event_time, server_principal_name, database_name, statement
+FROM sys.fn_get_audit_file(
+    'https://ptaudit.blob.core.windows.net/sqldbauditlogs/pharmatrace-sql/master/SqlDbAuditing_ServerAudit/',
+    DEFAULT, DEFAULT)
+WHERE event_time >= '2026-09-04T08:00:00' AND event_time < '2026-09-04T10:00:00';
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+Azure SQL Database auditing "tracks database events and writes
+them to an audit log in your Azure storage account, Log Analytics
+workspace, or Event Hubs" — and "you can configure any combination
+of these options, and audit logs are written to each". The
+question is about the STORAGE AND LIFECYCLE of those logs, which
+is where the five requirements live.
+
+Why option a is correct
+-----------------------
+
+- REQUIREMENT 1 — SERVER SCOPE + LOCKED WORM. "Server auditing
+  policies apply to all existing and newly created databases on
+  this server", so the quarterly plant databases are covered
+  automatically. Audit logs "are written to Append Blobs" in .xel
+  format, in the sqldbauditlogs container. The documented way to
+  make them tamper-proof is Azure Storage immutability: "To
+  configure an immutable log store for the server or
+  database-level audit events, follow the instructions provided by
+  Azure Storage ... ensure that ALLOW PROTECTED APPEND WRITES is
+  set to either APPEND BLOBS or BLOCK AND APPEND BLOBS. The NONE
+  option isn't supported. For time-based retention policies, the
+  storage account's retention interval must be SHORTER than the
+  SQL Auditing retention setting. Configurations where the storage
+  policy is set, but SQL Auditing retention is 0, aren't
+  supported." Hence storage 2,555 days and SQL retention 2,600
+  days. A locked time-based policy is the WORM state: "You can't
+  delete a locked time-based retention policy. You can extend the
+  retention period, but you can't decrease it" — exactly "nobody
+  can shorten, but it can be extended" — and "a time-based
+  retention policy must be locked for the blob to be in a
+  compliant immutable ... state". Managed identity is the
+  recommended storage authentication ("Storage Access Keys pose a
+  security risk"); GPv2 is required if the account sits behind a
+  VNet/firewall.
+- REQUIREMENT 2 — LOG ANALYTICS. Configuring the workspace
+  destination "creates a Diagnostic Setting with
+  SQLSecurityAuditEvents category enabled"; events land in
+  AzureDiagnostics with Category == "SQLSecurityAuditEvents" and
+  field names such as action_name_s, event_time_t, statement_s.
+  Workspace tables default to 30 days; analytics retention can be
+  raised to two years and TOTAL retention "to up to 12 years", the
+  tail being low-cost long-term retention reachable through search
+  jobs. 90 / 730 is therefore a valid table setting. Note the
+  doc's warning: if the SQLSecurityAuditEvents_... diagnostic
+  setting is deleted, "the auditing functionality will fail
+  silently".
+- REQUIREMENT 3 — SUPPORT OPERATIONS. This is a separate,
+  server-level switch: "Navigate to Auditing under the Security
+  heading in your Azure SQL server pane, and switch ENABLE
+  AUDITING OF MICROSOFT SUPPORT OPERATIONS to ON". It audits
+  "Microsoft support engineers' operations when they need to
+  access your server during a support request", writes to the same
+  or a different destination, and shows up in Log Analytics as
+  Category == "DevOpsOperationsAudit".
+- REQUIREMENT 4 — A SECOND, DATABASE-LEVEL POLICY. "If server
+  auditing is enabled, the database-configured audit exists
+  side-by-side with the server audit." A database policy with its
+  own action groups and its own storage account changes nothing
+  for the other databases; Set-AzSqlDatabaseAudit
+  -AuditActionGroup is the documented way to set non-default
+  groups (the portal exposes only the defaults).
+- REQUIREMENT 5 — TIME-FILTERED READS. sys.fn_get_audit_file_v2
+  "introduces time-based filtering at both the file and record
+  levels": "FILE-LEVEL FILTERING: the function first filters the
+  files based on the specified time range, reducing the number of
+  files that need to be scanned", then record-level filtering. Its
+  blob-URL file_pattern takes a prefix (server/database/audit
+  name), not a wildcard; after the July-2025 re-architecture "all
+  server audit logs are consolidated into a single folder labeled
+  master", so the prefix is
+  <server>/master/SqlDbAuditing_ServerAudit/. Reading requires
+  CONTROL DATABASE (server admins see every database's logs;
+  others only their current database).
+
+Why option b is wrong
+---------------------
+
+Four faults. A database-only policy leaves every FUTURE database
+unaudited — only the server policy "applies to all existing and
+newly created databases". Replacing PharmaTrace's groups removes
+BATCH_COMPLETED_GROUP from the only policy it has, so requirement
+1 fails for the production database too. RETENTION 0 PLUS AN
+IMMUTABILITY POLICY is the documented unsupported combination. A
+LEGAL HOLD keeps data "until the legal hold is explicitly cleared"
+— it never expires and is meant for when "the period of time that
+the data must be kept in a WORM state is unknown"; it does not
+implement a seven-year clock, and anyone with the permission can
+clear it. Support engineers' sessions are not part of your
+BATCH_COMPLETED_GROUP; they need the dedicated switch. Finally,
+the blob-URL form of fn_get_audit_file "doesn't support an
+asterisk wildcard" (prefixes only), and even with a valid prefix
+it reads every blob before the WHERE filters rows.
+
+Why option c is wrong
+---------------------
+
+Log Analytics is not a WORM store: a workspace contributor can
+shorten a table's total retention (data is removed after a 30-day
+grace period), delete tables, or purge records — the opposite of
+"nobody may delete". Its maximum total retention (12 years) is
+irrelevant to that. Server-level auditing does NOT include
+Microsoft support operations; that is the separate toggle. Adding
+the two groups to the SERVER policy applies them to every database
+(requirement 4 says PharmaTrace only, to a separate account). And
+with no blob files there is nothing for sys.fn_get_audit_file_v2
+to read — requirement 5 asked for T-SQL over the blob archive.
+
+Why option d is wrong
+---------------------
+
+This is the subtle distractor: destinations, KQL,
+support-operations switch and the PharmaTrace side policy are all
+right. It fails on three details. RETENTION 0 WITH AN IMMUTABILITY
+POLICY IS UNSUPPORTED — the SQL retention must be a number larger
+than the storage policy's interval. An UNLOCKED time-based policy
+"protects against deletes and overwrites" but "you can modify an
+unlocked policy by shortening or extending the retention period.
+You can also delete an unlocked policy" — so a DBA with the right
+role could shorten it; Microsoft "recommends that you lock the
+policy in a reasonable amount of time, typically less than 24
+hours". And sys.fn_get_audit_file with a WHERE clause returns the
+right rows but only after opening every blob under the prefix: the
+two extra arguments of fn_get_audit_file_v2 exist precisely so
+that files outside the window are never read.
+
+Which destination answers which requirement
+-------------------------------------------
+
+Need            | Storage account | Log Analytics   | Event Hubs
+                | (append blobs)  | workspace       |
+----------------+-----------------+-----------------+-----------------
+Long-term,      | Yes —           | No — retention  | No — a stream,
+tamper-proof    | immutability    | is editable,    | not a store
+archive         | policy (locked  | data purgeable  |
+                | time-based      |                 |
+                | retention or    |                 |
+                | legal hold) on  |                 |
+                | the container   |                 |
+----------------+-----------------+-----------------+-----------------
+Near-real-time  | No              | Yes — AzureDiag | Indirectly (SIEM
+alerting, KQL   |                 | nostics, log    | / Stream
+                |                 | alerts          | Analytics)
+----------------+-----------------+-----------------+-----------------
+Retention       | SQL Retention   | analytics ≤ 2   | consumer-defined
+control         | (Days) (0 =     | years, total ≤  |
+                | unlimited) plus | 12 years per    |
+                | the storage     | table           |
+                | policy          |                 |
+----------------+-----------------+-----------------+-----------------
+T-SQL reads     | sys.fn_get_audi | No (KQL only)   | No
+                | t_file_v2 over  |                 |
+                | the blob URL    |                 |
+----------------+-----------------+-----------------+-----------------
+Microsoft       | Yes, once the   | Yes — Category  | Yes
+support         | server switch   | == "DevOpsOpera |
+operations      | is on           | tionsAudit"     |
+
+The pattern the exam expects is therefore two destinations: blob
+storage with an immutability policy for compliance retention, and
+Log Analytics (or Event Hubs) for operational monitoring — never
+one destination stretched to do both jobs.
+
+Related facts
+-------------
+
+- Default action groups: BATCH_COMPLETED_GROUP,
+  SUCCESSFUL_DATABASE_AUTHENTICATION_GROUP,
+  FAILED_DATABASE_AUTHENTICATION_GROUP. statement and
+  data_sensitivity_information are truncated at 4,000 characters;
+  tempdb and temporary tables are not audited.
+- Storage layout:
+  <ServerName>/<DatabaseName>/<AuditName>/<Date>/<hh_mm_ss_ms>_<n>.xel;
+  read-only replica events are in the same master folder, flagged
+  by is_secondary_replica_true.
+- Event Hubs is the third destination (Avro/JSON, for SIEM
+  streaming); Azure SQL Managed Instance instead keeps CREATE
+  SERVER AUDIT ... TO URL; SQL Server writes to FILE,
+  APPLICATION_LOG or SECURITY_LOG, and fn_get_audit_file_v2 "can't
+  be used when the audit is created with the APPLICATION_LOG,
+  SECURITY_LOG, or EXTERNAL_MONITOR options".
+- Auditing is optimised for database availability: "During periods
+  of very high activity or high network load, the auditing feature
+  might allow transactions to proceed without recording all of the
+  events". Ledger, not auditing, is the feature that gives
+  cryptographic proof that data was not tampered with.
+
+Conceptual question (Azure / tooling); not executed against an
+engine.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Azure SQL DB auditing = server policy (all DBs, present and future) [+ side-by-side database policy]
+   destinations: Storage (append blobs .xel, sqldbauditlogs) | Log Analytics (AzureDiagnostics,
+                 SQLSecurityAuditEvents) | Event Hubs   -> any combination
+   Retention (Days): 0 = unlimited; only applies to logs written after it is set
+WORM archive = storage immutability, NOT SQL retention:
+   time-based policy (1..146,000 days; LOCK it: extend-only, undeletable) | legal hold (no expiry, cleared by tag)
+   "Allow protected append writes" = Append blobs;  storage interval < SQL retention;  SQL retention 0 unsupported
+Log Analytics: 30-day default, analytics <= 2 years, total <= 12 years (long-term = search jobs); not WORM
+Microsoft support operations = separate server switch -> Category "DevOpsOperationsAudit"
+Read blobs: sys.fn_get_audit_file_v2(prefix URL, DEFAULT, DEFAULT, start_utc, end_utc)  -- file-level time filter

@@ -148,6 +148,8 @@ The array length no longer matches the group's row count, and the surviving elem
 - `Cards` could equivalently be produced per category with a correlated `(SELECT ... FOR JSON PATH, INCLUDE_NULL_VALUES)` subquery, but note `FOR JSON PATH` *without* `INCLUDE_NULL_VALUES` drops the null-valued **keys** (`{"dish":"Duck Confit","eur":22.50}`), which `JSON_OBJECT` does not.
 - Adding `RETURNING json` to any of the aggregates returns the native `json` type instead of `nvarchar(max)`; the text is unchanged.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `JSON_ARRAYAGG` defaults to **`ABSENT ON NULL`**: `NULL` input rows vanish, so the array length can differ from `COUNT(*)` of the group, and an all-`NULL` (or empty-after-`LEFT JOIN`) group returns `[]`, never SQL `NULL`.

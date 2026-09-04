@@ -122,6 +122,8 @@ When the flags string contains contradictory characters, SQL Server uses the **l
 - `AdminPos` is equivalent to `REGEXP_INSTR(LogLine, 'admin', 1, 1, 0, 'i')` — the leading `c` is dead weight once `i` follows it.
 - The default argument values are `start = 1`, `occurrence = 1`, `return_option = 0`, `flags = 'c'`, `group = 0`, so `REGEXP_INSTR(LogLine, '/\w+')` ≡ `REGEXP_INSTR(LogLine, '/\w+', 1, 1, 0, 'c', 0)`.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `REGEXP_INSTR(string, pattern, start, occurrence, return_option, flags, group)`:

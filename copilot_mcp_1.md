@@ -166,6 +166,8 @@ Option d confuses two different customization mechanisms.
 
 The closing line — "Never run DROP, DELETE, UPDATE, or INSERT statements" — also guarantees nothing. It is an instruction inside the prompt context, which is precisely the layer prompt injection attacks. A stronger injected instruction in tool output can override it, and the model may simply fail to follow it. Only permissions enforced by the database engine satisfy requirement 4.
 
+Conceptual question (Azure / tooling); not executed against an engine.
+
 ## DP-800 Exam Rule to Remember
 
 In Visual Studio Code, keep the two customization surfaces separate:

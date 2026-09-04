@@ -1,0 +1,200 @@
+# SQL Server question — Data Types 1
+
+## Statement
+
+`SeedBank` is the catalog of a botanical seed vault. Each *accession* (a batch of seeds) is stored with a short ASCII code, a Latin species name, a seed count, the weight of one seed, a unit price and two timestamps. The table also has a rarely filled `SPARSE` column and a `PERSISTED` computed column:
+
+```sql
+SET QUOTED_IDENTIFIER ON;   -- required to create/modify a table with a persisted computed column
+CREATE DATABASE SeedBank;
+GO
+USE SeedBank;
+GO
+CREATE SCHEMA Vault;
+GO
+CREATE TABLE Vault.Accession
+(
+    AccessionID INT           NOT NULL PRIMARY KEY,
+    Code        VARCHAR(8)    NOT NULL,
+    Species     NVARCHAR(40)  NOT NULL,
+    SeedCount   SMALLINT      NOT NULL,
+    GramsEach   DECIMAL(6,4)  NOT NULL,
+    UnitPrice   MONEY         NOT NULL,
+    CollectedAt DATETIME      NOT NULL,
+    LoggedAt    DATETIME2(3)  NOT NULL,
+    Viability   TINYINT       SPARSE NULL,
+    TotalGrams  AS SeedCount * GramsEach PERSISTED
+);
+GO
+INSERT INTO Vault.Accession
+    (AccessionID, Code, Species, SeedCount, GramsEach, UnitPrice, CollectedAt, LoggedAt, Viability)
+VALUES
+    (1, 'QU-0001 ', N'Quercus robur', 32000, 3.55555, 0.12345,
+     '2026-03-01 23:59:59.999', '2026-03-01 23:59:59.999', NULL);
+GO
+```
+
+Note the trailing space in `'QU-0001 '`. The following eight statements are then executed **in order, each in its own batch**, in a single session:
+
+```sql
+-- S1
+INSERT INTO Vault.Accession
+    (AccessionID, Code, Species, SeedCount, GramsEach, UnitPrice, CollectedAt, LoggedAt, Viability)
+VALUES
+    (2, 'PI-0002-ALT', N'Pinus pinea', 500, 0.61, 1.00, '2026-04-10', '2026-04-10', 80);
+
+-- S2
+UPDATE Vault.Accession SET SeedCount = SeedCount + 1000 WHERE AccessionID = 1;
+
+-- S3
+UPDATE Vault.Accession SET TotalGrams = 0 WHERE AccessionID = 1;
+
+-- S4
+ALTER TABLE Vault.Accession ADD Notes NVARCHAR(30) SPARSE NOT NULL;
+
+-- S5
+ALTER TABLE Vault.Accession ADD AgeDays AS DATEDIFF(DAY, CollectedAt, GETDATE()) PERSISTED;
+
+-- S6
+CREATE TABLE Vault.Label
+(
+    LabelID INT         NOT NULL,
+    Body    CHAR(8000)  NOT NULL,
+    Tag1    VARCHAR(24) NOT NULL,
+    Tag2    VARCHAR(24) NOT NULL,
+    Tag3    VARCHAR(24) NOT NULL
+);
+
+-- S7
+INSERT INTO Vault.Label (LabelID, Body, Tag1, Tag2, Tag3)
+VALUES (1, REPLICATE('B', 8000), REPLICATE('x', 24), REPLICATE('y', 24), REPLICATE('z', 24));
+
+-- S8
+CREATE TABLE Vault.Tag
+(
+    TagID  INT        NOT NULL,
+    Body   CHAR(8000) NOT NULL,
+    Suffix CHAR(60)   NOT NULL
+);
+```
+
+For each statement S1–S8, state whether it **succeeds, succeeds with a warning, or raises an error**. Then give the exact result of these two final queries:
+
+```sql
+-- Q1
+SELECT AccessionID, Code, LEN(Code) AS LenCode, DATALENGTH(Code) AS DlCode,
+       LEN(Species) AS LenSp, DATALENGTH(Species) AS DlSp,
+       SeedCount, GramsEach, TotalGrams, UnitPrice,
+       CollectedAt, LoggedAt, DATALENGTH(CollectedAt) AS DlColl, DATALENGTH(LoggedAt) AS DlLog
+FROM Vault.Accession;
+
+-- Q2
+SELECT
+    SQL_VARIANT_PROPERTY(Code + Species, 'BaseType')          AS ConcatType,
+    SQL_VARIANT_PROPERTY(TotalGrams, 'Precision')             AS TotP,
+    SQL_VARIANT_PROPERTY(TotalGrams, 'Scale')                 AS TotS,
+    GramsEach / 3                                             AS DivDec,
+    SQL_VARIANT_PROPERTY(GramsEach / 3, 'Precision')          AS DivP,
+    SQL_VARIANT_PROPERTY(GramsEach / 3, 'Scale')              AS DivS,
+    UnitPrice / 3 * 3                                         AS MoneyTrip,
+    CAST(UnitPrice AS DECIMAL(19,4)) / 3 * 3                  AS DecTrip,
+    ASCII(CAST(NCHAR(937) AS VARCHAR(4)))                     AS Lossy,   -- NCHAR(937) = Greek capital omega
+    '1' + 1                                                   AS StrPlusInt
+FROM Vault.Accession;
+```
+
+## Correct Answer
+
+Per-statement outcomes (all error numbers and messages are the engine's actual output):
+
+| Stmt | Outcome | Detail |
+|------|---------|--------|
+| S1 | **Fails** | `Msg 2628` — `String or binary data would be truncated in table 'SeedBank.Vault.Accession', column 'Code'. Truncated value: 'PI-0002-'.` |
+| S2 | **Fails** | `Msg 220` — `Arithmetic overflow error for data type smallint, value = 33000.` |
+| S3 | **Fails** | `Msg 271` — `The column "TotalGrams" cannot be modified because it is either a computed column or is the result of a UNION operator.` |
+| S4 | **Fails** | `Msg 1731` — `Cannot create the sparse column 'Notes' in the table 'Accession' because an option or data type specified is not valid. A sparse column must be nullable and cannot have the ROWGUIDCOL, IDENTITY, or FILESTREAM properties. A sparse column cannot be of the following data types: text, ntext, image, geometry, geography, or user-defined type.` |
+| S5 | **Fails** | `Msg 4936` — `Computed column 'AgeDays' in table 'Accession' cannot be persisted because the column is non-deterministic.` |
+| S6 | **Succeeds with a warning** | `Warning: The table "Label" has been created, but its maximum row size exceeds the allowed maximum of 8060 bytes. INSERT or UPDATE to this table will fail if the resulting row exceeds the size limit.` (this is message 1708) |
+| S7 | **Fails** | `Msg 511` — `Cannot create a row of size 8091 which is greater than the allowable maximum row size of 8060.` |
+| S8 | **Fails** | `Msg 1701` — `Creating or altering table 'Tag' failed because the minimum row size would be 8071, including 7 bytes of internal overhead. This exceeds the maximum allowable table row size of 8060 bytes.` |
+
+Q1 — the single row (nothing after the seed insert changed the table):
+
+| AccessionID | Code | LenCode | DlCode | LenSp | DlSp | SeedCount | GramsEach | TotalGrams | UnitPrice | CollectedAt | LoggedAt | DlColl | DlLog |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | QU-0001␠ | 7 | 8 | 13 | 26 | 32000 | 3.5556 | 113779.2000 | .1235 | 2026-03-02 00:00:00.000 | 2026-03-01 23:59:59.999 | 8 | 7 |
+
+(`␠` marks the stored trailing space.)
+
+Q2:
+
+| ConcatType | TotP | TotS | DivDec | DivP | DivS | MoneyTrip | DecTrip | Lossy | StrPlusInt |
+|---|---|---|---|---|---|---|---|---|---|
+| nvarchar | 12 | 4 | 1.185200 | 8 | 6 | .1233 | .123498 | 79 | 2 |
+
+## Explanation
+
+Every value is decided by a data-type rule, not by the data. Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+### S1 — truncation is an error, and since 2019 the message names the value
+
+`Code` is `VARCHAR(8)`; `'PI-0002-ALT'` has 11 characters. Since SQL Server 2019 (and in Azure SQL Database) the engine raises error 2628 instead of the old, anonymous 8152: it names the table, the column and the **truncated value** `'PI-0002-'` — the first 8 characters — which makes the offending column easy to find. It is an error: the row is not inserted and no silent truncation ever happens on `INSERT`/`UPDATE`. (Silent truncation only happens on an explicit `CAST`/`CONVERT` to a shorter type, or when assigning to a shorter variable.)
+
+### S2 — SMALLINT overflow is checked at assignment
+
+`SeedCount + 1000` is evaluated as `INT` (the literal `1000` is `INT`, which has higher precedence than `SMALLINT`), giving 33000 without trouble; the failure comes when 33000 is stored back into a `SMALLINT` column (range −32768 to 32767). The message names the type and the offending value. The same happens with `DECLARE @s SMALLINT = 32767; SET @s += 1;` (`value = 32768`).
+
+### S3, S5 — computed columns
+
+A computed column is an expression; it cannot be the target of an `UPDATE` (271). `PERSISTED` stores the result physically (and lets you index it or use it in a foreign key), but only if the expression is **deterministic**: `GETDATE()` changes on every call, so `AgeDays` cannot be persisted (4936). As a non-persisted computed column the same expression would be accepted. `TotalGrams` is persistable because `SeedCount * GramsEach` is deterministic — `sys.columns` shows it with `is_computed = 1`, `precision 12`, `scale 4`, and `sys.computed_columns.is_persisted = 1`.
+
+### S4 — SPARSE columns must be nullable
+
+`SPARSE` optimizes storage for columns that are mostly `NULL`: a `NULL` in a sparse column costs **0 bytes**, while a non-null value costs its normal size **plus 4 bytes**. The trade-off only makes sense for nullable columns, so `SPARSE NOT NULL` is rejected outright (1731), together with `IDENTITY`, `ROWGUIDCOL`, `FILESTREAM`, `text`/`ntext`/`image`, `geometry`/`geography` and CLR types. A table with sparse columns may hold up to 30,000 columns but its rows are limited to 8,018 bytes instead of 8,060. `Viability TINYINT SPARSE NULL` in the setup is valid, and `sys.columns.is_sparse = 1` for it.
+
+### S6, S7, S8 — the 8,060-byte row and the three different reactions
+
+The in-row limit is 8,060 bytes (including 7 bytes of row overhead, plus a null bitmap and 2 bytes per variable-length column). The engine reacts at different moments depending on what it can know:
+
+- **S8 — error 1701 at `CREATE TABLE`.** `CHAR(8000)` + `CHAR(60)` + `INT` are all fixed-length: the row can never be smaller than 8,071 bytes, so the table is refused immediately ("minimum row size would be 8071, including 7 bytes of internal overhead").
+- **S6 — warning 1708 at `CREATE TABLE`.** `CHAR(8000)` + three `VARCHAR(24)` can reach 8,091 bytes but need not; the table is created, with the warning that a full row will fail. The warning appears precisely because these variable-length columns are **too short to be pushed off-row**: only variable-length values longer than 24 bytes can move to `ROW_OVERFLOW_DATA` pages (the in-row pointer itself is 24 bytes).
+- **S7 — error 511 at `INSERT`.** Filling the three tags with 24 characters each produces a row of 8,091 bytes with nothing that can overflow, so the insert fails. An insert with short tags (`'oak', 'pine', 'fir'`) succeeds.
+
+The subtle distractor is the classic "two `VARCHAR(8000)` columns" table: `CREATE TABLE Vault.Sheet (SheetID INT, Front VARCHAR(8000), Back VARCHAR(8000))` raises **no** warning, and inserting 4,100 + 4,100 characters **succeeds** — verified: `sys.dm_db_index_physical_stats` shows one record in `IN_ROW_DATA` and one in `ROW_OVERFLOW_DATA`. Row-overflow (since SQL Server 2005) rescues long variable-length values; it cannot rescue fixed-length columns or short variable-length ones. (`(MAX)` types are LOB data and never count against the 8,060 bytes beyond a 24-byte pointer.)
+
+### Q1 — what each column really stored
+
+- **`Code`** kept its trailing space (`VARCHAR` stores exactly what was inserted; `ANSI_PADDING` is on by default): `LEN` ignores trailing spaces (7) while `DATALENGTH` counts bytes (8). `Species` has 13 characters but `DATALENGTH` 26 because `NVARCHAR` uses 2 bytes per character (UTF-16). Rule: `LEN` = characters without trailing spaces; `DATALENGTH` = bytes, always.
+- **`GramsEach`**: `3.55555` into `DECIMAL(6,4)` is **rounded** to 3.5556, not truncated. **`TotalGrams`** = 32000 × 3.5556 = 113779.2000, typed `DECIMAL(12,4)`: `SMALLINT` counts as `DECIMAL(5,0)`, and multiplication gives precision p1 + p2 + 1 = 12, scale s1 + s2 = 4.
+- **`UnitPrice`**: `MONEY` has exactly 4 decimal places; `0.12345` is rounded to .1235 on conversion.
+- **`CollectedAt`**: `DATETIME` has an accuracy of 1/300 s — values are rounded to increments of .000, .003 or .007 — so `23:59:59.999` rounds **up to the next day**, `2026-03-02 00:00:00.000`. (`.998` and `.997` become `.997`.) This is the classic bug in `BETWEEN ... AND '2026-03-01 23:59:59.999'` range filters. **`LoggedAt`** is `DATETIME2(3)` and keeps `.999` exactly.
+- **Storage**: `DATETIME` is always 8 bytes; `DATETIME2(n)` uses 6 bytes for precision 0–2, 7 bytes for 3–4 and 8 bytes for 5–7 (`DATETIME2(7)` = `DATETIME`'s size with 100 ns accuracy; `DATETIME2(3)` = `DATETIME`'s accuracy at 7 bytes). `SMALLDATETIME` is 4 bytes, minute accuracy.
+
+### Q2 — precedence, precision/scale rules and rounding
+
+- **`ConcatType = nvarchar`**: in `Code + Species` the `VARCHAR` operand is implicitly converted to `NVARCHAR`, because `nvarchar` has higher data-type precedence. The same rule is why `WHERE VarcharColumn = N'...'` converts the **column** (not the literal) and, with a SQL collation, turns an index seek into a scan with a `PlanAffectingConvert` warning. **`'1' + 1 = 2`**: `int` outranks `varchar`, so the string is converted to a number and the operator is addition; `'abc' + 1` fails with error 245 (`Conversion failed when converting the varchar value 'abc' to data type int.`).
+- **`DivDec = 1.185200`, `DECIMAL(8,6)`**: the division rule is precision = p1 − s1 + s2 + max(6, s1 + p2 + 1), scale = max(6, s1 + p2 + 1). For `DECIMAL(6,4) / 3` the engine uses the literal's own precision (one digit): 6 − 4 + 0 + max(6, 4 + 1 + 1) = 8, scale 6. Dividing by an `INT` variable or column instead uses precision 10 and gives `DECIMAL(17,15)` = `1.185200000000000` (verified). Scale is what you get, precision is what you pay: when a result exceeds 38, precision is capped at 38 and the scale is cut (never below 6) to save the integer part.
+- **`MoneyTrip = .1233` vs `DecTrip = .123498`**: `MONEY` arithmetic works at 4 decimal places and the engine **truncates** the intermediate quotient: `.1235 / 3` = `.0411` (verified: `$2/3` = `.6666`), so `× 3` gives `.1233` — two ten-thousandths lost. `DECIMAL(19,4) / 3` is `DECIMAL(21,6)` = `.041166` (again truncated, not rounded), and `× 3` = `.123498`. Neither round-trips; `MONEY` loses the most because its scale is fixed at 4. Do currency math in `DECIMAL` with enough scale for the intermediate results, and round once at the end.
+- **`Lossy = 79`**: `NCHAR(937)` (Ω) does not exist in code page 1252, the `VARCHAR` code page of this server's `Modern_Spanish_CI_AS` collation (and of `Latin1_General_*` / `SQL_Latin1_General_CP1_*`), so the cast substitutes a best-fit character — the Latin `O`, ASCII 79 — and `DATALENGTH` drops from 2 to 1. A character with no best-fit mapping becomes `?` (verified: `NCHAR(20013)`, a CJK ideograph, gives 63). Data in scripts other than Latin needs `NVARCHAR` (or a `_UTF8` collation on `VARCHAR`).
+
+## DP-800 Exam Rule to Remember
+
+```text
+VARCHAR 1 byte/char (code page; foreign scripts -> best-fit 'O' or '?')   NVARCHAR 2 bytes/char
+   varchar + nvarchar -> nvarchar (precedence)   '1' + 1 -> 2   'abc' + 1 -> Msg 245
+LEN = characters, trailing spaces ignored       DATALENGTH = bytes, everything counted
+DECIMAL(p,s): assignment ROUNDS (3.55555 -> 3.5556)
+   x * y -> p1+p2+1, s1+s2          x / y -> p1-s1+s2+max(6, s1+p2+1), scale max(6, s1+p2+1)
+   integer literal counts with its own digit count; > 38 -> capped, scale cut (min 6)
+   division result is truncated to the result scale (2.0/3 -> 0.666666)
+MONEY = 4 decimals, 8 bytes; conversion rounds, division truncates -> $10/3*3 = 9.9999
+DATETIME 8 bytes, 1/300 s: .999 rounds to next second   DATETIME2(n): 6/7/8 bytes, exact to 100 ns
+SMALLINT -32768..32767: overflow -> Msg 220 "value = 33000"
+Truncation on INSERT/UPDATE -> Msg 2628 with "Truncated value: '...'"
+Row size 8060: fixed columns too big -> 1701 at CREATE; variable columns too big -> warning 1708 at
+   CREATE + Msg 511 at INSERT; variable values > 24 bytes escape to ROW_OVERFLOW_DATA (no error)
+SPARSE: nullable only (1731); NULL = 0 bytes, value = size + 4; row limit 8018; 30,000 columns
+Computed: not updatable (271); PERSISTED needs deterministic expression (4936) and QUOTED_IDENTIFIER ON
+```
+
+Pick the type by its rules, not its name: `MONEY` is a 4-decimal integer in disguise, `DATETIME` cannot store `.999`, `VARCHAR` cannot store Ω, and the row-size limit only bites where a value cannot be pushed off-row.

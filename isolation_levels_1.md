@@ -164,6 +164,8 @@ A deadlock requires a **cycle of mutual waiting**: each session must hold a lock
 
 For a deadlock (error 1205) to be possible, both sessions would have to hold locks and then request each other's resources — for example, both running under `REPEATABLE READ`, each doing `SELECT` (shared lock held to end of transaction) on the same seat and then both attempting the `UPDATE` (lock conversion to exclusive): each would wait for the other's shared lock to be released, and the Database Engine would kill one victim. One of `SNAPSHOT` isolation's selling points is exactly that its lock-free reads make this reader-writer deadlock pattern far less likely.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `SNAPSHOT` isolation is **optimistic**: readers never block and are never blocked, but every write is validated against the latest committed version of the row.

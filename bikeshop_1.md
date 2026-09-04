@@ -315,3 +315,5 @@ ORDER BY Revenue DESC;
 4. **Price from `OrderLines.UnitPrice`, not `Products.ListPrice`.** Two lines were sold below list; pricing with `ListPrice` gives Chloe 1430.80 instead of 1370.80.
 5. **An empty sum becomes 0.00 (`ISNULL`/`COALESCE`); an empty max stays NULL.** One, not both.
 6. **`ORDER BY Revenue DESC`**, and the `IDENTITY(1000,1)` seed is what maps `OrderLines` 1000–1005 back to the six inserted orders.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.

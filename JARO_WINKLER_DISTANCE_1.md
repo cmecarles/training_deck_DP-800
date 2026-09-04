@@ -111,6 +111,8 @@ The `decimal(6,4)` cast rounds the raw floats (whose binary noise appears only a
 
 Equivalent alternative (verified on the same engine): `JARO_WINKLER_SIMILARITY(CustomerName, WatchlistName)` returns the **int** scores 100, 96, 94, 84, 81, 89, NULL for pairs 1–7 — i.e. `ROUND(100 × (1 − distance))` — so `ORDER BY JARO_WINKLER_SIMILARITY(...) DESC` ranks the non-NULL pairs identically (with the NULL row moving to the end under `DESC`).
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `JARO_WINKLER_DISTANCE` (SQL Server 2025, documented for compat 170, preview-gated on RTM) returns a **float distance in [0, 1] where 0 = identical** — read the name literally: it is a *distance*, while `JARO_WINKLER_SIMILARITY` is its 0–100 integer mirror. Keep the two-stage formula straight:

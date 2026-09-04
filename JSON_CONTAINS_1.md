@@ -153,6 +153,8 @@ Option d scores `HasSqlNoWild` as `1` for Ada and Bruno, assuming the engine aut
 - A `json`-typed **search value** is rejected with `Msg 8116` as well, and a string that merely *looks* like an array (`'["sql","azure"]'`) is compared as one literal string — array-containment via a string search value returns `0`.
 - The function itself is version-gated, not compatibility-gated: it also runs at `COMPATIBILITY_LEVEL = 160` on this build. Level 170 is still the sensible setting for a 2025 JSON workload.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `JSON_CONTAINS` is a **typed** containment test with a three-valued result:

@@ -132,9 +132,13 @@ Why option a is correct
   tracked and propagated to the full-text index." Propagation is
   asynchronous ("changes might not be reflected immediately in the
   full-text index"), so a loader that queries right after
-  inserting must poll FULLTEXTCATALOGPROPERTY('LegalCatalog',
-  'PopulateStatus') (0 = idle) or sys.dm_fts_index_population
-  before asserting results.
+  inserting must poll
+  OBJECTPROPERTYEX(OBJECT_ID('Legal.Contracts'),
+  'TableFullTextPopulateStatus') (0 = idle) or
+  sys.dm_fts_index_population before asserting results.
+  (FULLTEXTCATALOGPROPERTY(cat, 'PopulateStatus') still works but
+  is documented as scheduled for removal; the docs point to the
+  table-level OBJECTPROPERTYEX property instead.)
 - STOPLIST. STOPLIST = SYSTEM associates the system stoplist: "The
   index isn't populated with any tokens that are part of the
   specified stoplist", and the same stoplist strips those words
@@ -250,7 +254,10 @@ Query side:
   OR / AND NOT (never a leading NOT).
 - FREETEXT matches any word form of any term and treats AND/NOT as
   ordinary words — meaning-ish, never exact.
-- Population is asynchronous: poll FULLTEXTCATALOGPROPERTY(cat,
-  'PopulateStatus') = 0 or sys.dm_fts_index_population before
-  trusting fresh rows; NO POPULATION means empty until ALTER
-  FULLTEXT INDEX ... START FULL POPULATION.
+- Population is asynchronous: poll
+  OBJECTPROPERTYEX(OBJECT_ID('tbl'),
+  'TableFullTextPopulateStatus') = 0 (or
+  sys.dm_fts_index_population; the catalog-level
+  FULLTEXTCATALOGPROPERTY(cat, 'PopulateStatus') is deprecated)
+  before trusting fresh rows; NO POPULATION means empty until
+  ALTER FULLTEXT INDEX ... START FULL POPULATION.

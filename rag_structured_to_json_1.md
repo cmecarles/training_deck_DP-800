@@ -137,7 +137,7 @@ Equivalent accepted forms: `JSON_ARRAYAGG(JSON_OBJECT('id':ProductId,'name':Name
 {"messages":[{"role":"system",...},{"role":"user","content":[{"ProductId":1,"Name":"GreenHome 5",...},{"ProductId":3,...}]}],...}
 ```
 
-The document is valid JSON (`ISJSON` = `1`) but `content` is now a **JSON array of product objects**, not a string: `JSON_VALUE(@payload,'$.messages[0].content')` returns `NULL` and `JSON_QUERY` returns the array. The chat-completions API accepts `content` only as a string or as an array of typed content parts (`{"type":"text","text":...}`), so the service rejects the request with HTTP 400. Requirement 2 ("must be a JSON string") is violated. `JSON_QUERY` is the right tool only when you *want* nested JSON — for example a `tools`/`response_format` object — never for prose the model should read.
+The document is valid JSON (`ISJSON` = `1`) but `content` is now a **JSON array of product objects**, not a string: `JSON_VALUE(@payload,'$.messages[1].content')` returns `NULL` and `JSON_QUERY` returns the array. The chat-completions API accepts `content` only as a string or as an array of typed content parts (`{"type":"text","text":...}`), so the service rejects the request with HTTP 400. Requirement 2 ("must be a JSON string") is violated. `JSON_QUERY` is the right tool only when you *want* nested JSON — for example a `tools`/`response_format` object — never for prose the model should read.
 
 ### Why option c is wrong
 

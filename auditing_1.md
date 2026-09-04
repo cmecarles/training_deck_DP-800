@@ -79,7 +79,7 @@ CREATE USER Inspector WITHOUT LOGIN;
 GRANT SELECT ON Cargo.Berths TO Inspector;
 
 -- A9  (as the administrator, i.e. dbo)
-SELECT COUNT(*) FROM Cargo.Manifests;
+SELECT COUNT(*) AS N FROM Cargo.Manifests;
 ```
 
 Finally the auditor runs:

@@ -134,6 +134,8 @@ Also engine-verified: without `m`, `$` does **not** match before a trailing line
 - `[0-9]` ≡ `\d`: the pattern `N'^[A-Z]{2}-\d{4}-[A-Z]{2}$'` with `'im'` was executed and returns the same rows.
 - Flag order is irrelevant for non-contradictory flags: `'mi'` ≡ `'im'` (verified).
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `REGEXP_LIKE(string, pattern [, flags])` — two mandatory arguments, flags third.

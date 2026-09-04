@@ -14,7 +14,7 @@ Which plan is correct?
 
 ### a.
 
-In the Fabric admin portal, under **Copilot and AI** tenant settings, keep **Users can use Copilot and other features powered by Azure OpenAI** enabled but scope it to `sg-aurora-copilot`; enable **Data sent to Azure OpenAI can be processed outside your capacity's geographic region, compliance boundary, or national cloud instance**, because Australia East is outside the US and the EU data boundary and Copilot stays disabled otherwise. Leave the workspace on the F8 capacity.
+In the Fabric admin portal, under **Copilot and AI** tenant settings, keep **Users can use Copilot and other features powered by Azure OpenAI** enabled but scope it to `sg-aurora-copilot`; enable **Data sent to Azure OpenAI can be processed outside your capacity's geographic region, compliance boundary, or national cloud instance**, because Australia East is outside the US or France and Copilot stays disabled otherwise. Leave the workspace on the F8 capacity.
 
 In Visual Studio Code, install the **MSSQL** extension plus **GitHub Copilot** and **GitHub Copilot Chat** (an active Copilot subscription is required), connect to `AuroraOps` with Microsoft Entra authentication, and use the **`@mssql`** chat participant or agent mode. For the lakehouse, add the Fabric Data Warehouse MCP server to `mcp.json` with `"type": "http", "url": "https://api.fabric.microsoft.com/v1/mcp/dataPlane/sqlEndpoint"`.
 
@@ -70,7 +70,7 @@ Fabric permissions   -> workspace role / item permission / SQL GRANTs decide wha
 
 ### Why option b is wrong
 
-Two factual errors. "Copilot in Microsoft Fabric isn't supported on trial SKUs. Only paid SKUs (F2 or higher, or P1 or higher) are supported" — moving to a trial capacity switches Copilot off. And the cross-geo claim is backwards: outside the US and the EU data boundary, Copilot requests may need to be processed in another region, which is exactly why the tenant admin must consciously enable *Data sent to Azure OpenAI can be processed outside your capacity's geographic region...*; without it, Copilot stays disabled for an Australia East capacity. Enabling for the whole organization also ignores requirement 1 (and the documentation's warning to roll out by security group).
+Two factual errors. "Copilot in Microsoft Fabric isn't supported on trial SKUs. Only paid SKUs (F2 or higher, or P1 or higher) are supported" — moving to a trial capacity switches Copilot off. And the cross-geo claim is backwards: outside the US or France, Copilot requests may need to be processed in another region, which is exactly why the tenant admin must consciously enable *Data sent to Azure OpenAI can be processed outside your capacity's geographic region...*; without it, Copilot stays disabled for an Australia East capacity. Enabling for the whole organization also ignores requirement 1 (and the documentation's warning to roll out by security group).
 
 ### Why option c is wrong
 
@@ -110,7 +110,7 @@ Conceptual question (Azure / tooling); not executed against an engine.
 Copilot in Fabric (admin portal > Tenant settings > Copilot and AI)
   "Users can use Copilot and other features powered by Azure OpenAI"      ON by default; scope to security groups
   "Data sent to Azure OpenAI can be processed outside your capacity's geographic region..."  OFF by default;
-       REQUIRED outside US / EU data boundary (else Copilot is disabled there)
+       REQUIRED outside the US or France (else Copilot is disabled there)
   "...can be stored outside..."  OFF by default; only for notebooks / data agents (conversation history)
   Paid capacity only: F2+ or P1+; trial SKUs do NOT support Copilot; settings can be managed at tenant or
   capacity level (delegated to capacity admins).

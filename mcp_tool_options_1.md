@@ -1,0 +1,129 @@
+# SQL Server question — Model and MCP Tool Options 1
+
+## Statement
+
+Halden Freight keeps its dispatch database `FreightOps` on a development SQL Server. A developer opens the repository in Visual Studio Code with the **MSSQL** extension, **GitHub Copilot** and **GitHub Copilot Chat** installed, and is connected to `FreightOps` through a saved MSSQL connection profile named `HaldenDev`.
+
+The shared workspace file `.vscode/mcp.json` already defines two MCP servers that every developer gets when they open the repository:
+
+```json
+{
+    "inputs": [
+        {
+            "id": "docs-token",
+            "type": "promptString",
+            "description": "Bearer token for the Halden internal docs MCP server",
+            "password": true
+        }
+    ],
+    "servers": {
+        "halden-docs": {
+            "type": "http",
+            "url": "https://docs.halden.internal/mcp",
+            "headers": { "Authorization": "Bearer ${input:docs-token}" }
+        },
+        "shell-tools": {
+            "type": "stdio",
+            "command": "node",
+            "args": ["./tools/shell-mcp/index.js"]
+        }
+    }
+}
+```
+
+`halden-docs` exposes read-only search tools over the company's T-SQL coding standards. `shell-tools` exposes a `run_shell` tool that executes arbitrary operating-system commands.
+
+The developer wants to run **one chat session** that refactors the six stored procedures in `sql/dispatch/` so that they follow the coding standards, and defines these requirements for that session:
+
+1. Copilot must work **autonomously**: connect to `HaldenDev`, inspect the schema, run validation `SELECT` queries, look up the standards, and edit the `.sql` files — chaining the steps itself, without the developer typing each one.
+2. Only the MSSQL extension's database tools and the `halden-docs` tools may be callable in this session. `shell-tools` must **not** be callable, but its definition must stay in the shared `.vscode/mcp.json` for the other teams that need it.
+3. Every `mssql_run_query` invocation must be **confirmed individually** by the developer. The read-only schema tools (`mssql_list_tables`, `mssql_show_schema`, `mssql_list_views`) may be approved once and then run without prompts for this repository.
+4. The `halden-docs` bearer token must never be committed.
+5. The developer is on a legacy premium-request plan and wants the exploratory prompts to use a low-multiplier model and only the final refactoring prompt to use a reasoning model.
+
+Which way of configuring the chat session meets all five requirements?
+
+### a.
+
+In the Chat view select **Agent** in the mode picker. Open the tools picker (**Configure Tools**) and deselect the `shell-tools` server for this session, leaving the MSSQL tools and `halden-docs` selected. Keep the default approval behaviour; when the confirmation dialog appears for `mssql_list_tables`, `mssql_show_schema` or `mssql_list_views`, choose **Allow in this Workspace**, and for `mssql_run_query` approve each invocation with the single-use option. Leave the committed `.vscode/mcp.json` as it is; Visual Studio Code prompts for `docs-token` when the server starts. In the model picker choose a 0.33x model (for example GPT-5 mini) for the exploratory prompts and switch to a reasoning model such as Claude Sonnet for the refactoring prompt.
+
+### b.
+
+In the Chat view select **Edit** in the mode picker, because the goal is to change files. Attach the six `.sql` files as context and write the prompt with explicit tool references — `#mssql_connect`, `#mssql_show_schema`, `#mssql_run_query` and `#halden-docs` — so that Copilot invokes those tools while it edits the files. Because Edit mode never shows `shell-tools`, requirement 2 is satisfied without touching the tools picker. Approve the tools as in option a and pick the models as in option a.
+
+### c.
+
+In the Chat view select **Agent**. To avoid the repeated confirmation dialogs, set `"chat.tools.global.autoApprove": true` in the workspace settings (or run `/yolo` in chat), since the `HaldenDev` connection uses a login that only has `db_datareader` anyway. Deselect `shell-tools` in the tools picker. To stop the token prompt at every server start, replace `${input:docs-token}` in `.vscode/mcp.json` with the actual bearer token. Pick the models as in option a.
+
+### d.
+
+In the Chat view select **Agent**. Instead of using the tools picker, add `"chat.mcp.access": "none"` to `.vscode/settings.json` so that `shell-tools` cannot run, and reference `#halden-docs` in the prompt so that the docs tools are still available. When the confirmation dialog appears for `mssql_run_query`, choose **Always allow** — it only applies to the current workspace, so it satisfies requirement 3 while removing the noise. Leave `.vscode/mcp.json` unchanged and pick the models as in option a.
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+The correct answer is **a**. The question tests four separate controls that all live inside the chat session rather than in the database: the **mode picker**, the **tools picker**, the **tool-approval scopes**, and the **model picker** — plus the way MCP server definitions and secrets are shared through `.vscode/mcp.json`.
+
+| Requirement | a | b (Edit mode) | c (global auto-approve, token in file) | d (`chat.mcp.access: none`, Always allow) |
+|---|---|---|---|---|
+| 1. Autonomous multi-step tool use | satisfied | **violated** | satisfied | satisfied |
+| 2. Exclude `shell-tools` for this session only | satisfied | **violated** | satisfied | **violated** (kills `halden-docs` too) |
+| 3. Per-invocation approval of `mssql_run_query` | satisfied | satisfied | **violated** | **violated** |
+| 4. Token never committed | satisfied | satisfied | **violated** | satisfied |
+| 5. Model per prompt | satisfied | satisfied | satisfied | satisfied |
+
+### Why option a is correct
+
+**Agent mode is the only mode that invokes tools.** Visual Studio Code's chat modes divide the work as follows: *Ask* answers questions and proposes code but "does not edit files or run terminal commands"; *Edit* applies multi-file edits to the files you put in context; *Agent* "determines which files to make changes to, offers code changes and terminal commands to complete the task, and iterates to remediate issues until the original task is complete", calling built-in, extension-contributed and MCP tools along the way. (Newer builds add *Plan*, which researches with read-only tools and produces a plan without changing anything.) The MSSQL documentation says the same from its side: "Agent mode picks up MSSQL extension tools automatically. No `@mssql` mention required", and "Every tool call requires your approval before execution."
+
+**The tools picker scopes what the session can call.** The **Configure Tools** button in the chat input lists every available tool grouped by source — built-in tools, extension tools such as the MSSQL set, and each MCP server — and you "select or deselect tools to control which ones are available for the current request". Deselecting the `shell-tools` server removes `run_shell` from the session without editing the shared `.vscode/mcp.json`, which is exactly what requirement 2 asks for. A request can have at most **128 tools** enabled at a time, and tools or servers can be referenced explicitly with `#` (for example `#mssql_connect` or `#halden-docs`); related tools can also be grouped into a reusable **tool set** in a `.toolsets.jsonc` file and referenced as `#<toolset-name>`.
+
+**Approval scopes are per tool.** When a tool needs confirmation, the dialog lets you choose the scope: a single use, the current session, the current workspace, or all future invocations — the MSSQL documentation names the options **Allow in this session**, **Allow in this workspace** and **Always allow**. Choosing *Allow in this Workspace* for the read-only schema tools satisfies the second half of requirement 3, while approving `mssql_run_query` one invocation at a time satisfies the first half. Saved approvals can be reviewed with **Chat: Manage Tool Approval** and cleared with **Chat: Reset Tool Confirmations**.
+
+**The MSSQL tools are extension tools, not an MCP server.** The extension "contributes" the tools (`connect`, `disconnect`, `change_database`, `get_connection_details`, `list_servers`, `list_databases`, `show_schema`, `list_schemas`, `list_tables`, `list_views`, `list_functions`, `run_query`, exposed in chat as `#mssql_connect`, `#mssql_run_query`, and so on) as extension-contributed language model tools. They "use the same connection context and credentials as the MSSQL extension"; agent mode "doesn't introduce another authentication or permission changes". They therefore appear in the tools picker regardless of any MCP setting.
+
+**Secrets stay out of the repository.** The `inputs` array with `"type": "promptString"` and `"password": true` makes Visual Studio Code prompt for `docs-token` (hidden typing) when the server starts and substitute it into the `${input:docs-token}` placeholder; the committed file holds only the placeholder.
+
+**Models are chosen per request.** The model picker in the chat input lets you change the model at any prompt (**Chat: Manage Language Models** shows every model with its capabilities and billing information; the eye icon hides models you never use). On the legacy premium-request plans each model carries a multiplier — small models such as GPT-5 mini, Claude Haiku 4.5 or GPT-4o mini at 0.33x, larger reasoning models at higher multipliers — and, importantly for agent mode, "only the prompts you send count as premium requests; actions Copilot takes autonomously to complete your task, such as tool calls, do not". A long agentic run with dozens of `mssql_run_query` calls is billed as one request at the chosen model's multiplier, so the cost lever is the model you pick for each prompt, not the number of tools.
+
+### Why option b is wrong
+
+Edit mode is for applying edits to files you have placed in context; it does not run the tool loop. A `#mssql_run_query` reference in an Edit-mode prompt attaches nothing that can execute — the connection, schema inspection and query execution steps of requirement 1 never happen, and the "chain the steps itself" part is precisely what agent mode exists for. The claim that Edit mode "never shows `shell-tools`" is also backwards: the server is not excluded, the mode simply cannot call any tool, so requirement 2 is met only by accident while requirement 1 is broken.
+
+### Why option c is wrong
+
+`chat.tools.global.autoApprove` is documented as "Automatically approve all tools — this setting disables critical security protections"; `/yolo` (alias `/autoApprove`) toggles the same setting from chat. With it on, `mssql_run_query` — and every other tool, including any that reach the session later — runs without a prompt, which directly violates requirement 3. A read-only SQL login limits what a query can do to the database; it does not restore the per-invocation review the requirement demands, and it does nothing for the non-SQL tools. Pasting the bearer token into `.vscode/mcp.json` violates requirement 4: the file is committed, and the documentation's guidance is to "avoid hardcoding sensitive information like API keys. Use input variables or environment files instead."
+
+### Why option d is wrong
+
+Two mistakes. `chat.mcp.access` is the setting behind the enterprise `ChatMCP` policy and takes `all` ("Developers can run MCP servers from any source"), `registry` ("only ... from the configured registry") or `none` ("MCP server support is disabled"). Setting it to `none` switches off **every** MCP server — `halden-docs` disappears along with `shell-tools`, so requirement 2 fails; a `#halden-docs` reference cannot resurrect a server that is not allowed to start. (The MSSQL tools would survive, because they are extension tools, not MCP tools — which is why the session would look half-working.) The second mistake is the approval scope: **Always allow** approves the tool for **all future invocations** in every workspace; the workspace-scoped choice is *Allow in this Workspace*. Either way, a standing approval for `mssql_run_query` contradicts the "confirmed individually" requirement — the option only allowed for the read-only tools.
+
+Conceptual question (Azure / tooling); not executed against an engine.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Mode picker      Ask   -> answers, no edits, no tools
+                 Edit  -> edits the files in context, no tool loop
+                 Agent -> autonomous; built-in + extension + MCP tools, terminal, iterates
+Tools picker     "Configure Tools": select/deselect per session, grouped by source
+                 #tool / #server / #toolset references; <= 128 tools per request
+                 tool sets: *.toolsets.jsonc, referenced as #name
+Approvals        single use | Allow in this Session | Allow in this Workspace | Always allow
+                 chat.tools.global.autoApprove (= /yolo) disables ALL prompts - avoid
+                 chat.tools.terminal.autoApprove for terminal commands
+                 Chat: Manage Tool Approval / Chat: Reset Tool Confirmations
+MCP config       .vscode/mcp.json  "servers" (stdio | http | sse) + "inputs" (promptString, password)
+                 chat.mcp.access = all | registry | none   (enterprise policy ChatMCP)
+MSSQL tools      contributed by the extension (not MCP): #mssql_connect, #mssql_list_tables,
+                 #mssql_show_schema, #mssql_run_query ...; same connection + permissions as the
+                 extension; @mssql participant = Ask mode; agent mode needs no @mssql
+Model picker     per prompt; Chat: Manage Language Models; legacy premium-request multipliers
+                 (0.33x small models ... higher for reasoning models); tool calls inside an
+                 agent run are NOT extra premium requests - only your prompts are
+```
+
+Put the control where the risk is: the **mode** decides whether tools run at all, the **tools picker** decides which tools this session can see, the **approval scope** decides how often a human looks at a call, and the **model picker** decides what each prompt costs. Never trade the approval scope for convenience with a global auto-approve, and never trade `inputs` for a hard-coded secret.

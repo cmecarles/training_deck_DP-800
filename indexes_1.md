@@ -159,6 +159,8 @@ Sort(ORDER BY:(Price ASC))
 
 Forcing the index with `WITH (INDEX(IX_Listings_Search))` shows why it refused: a seek on the 805 qualifying rows followed by **805 `Key Lookup` executions** into `PK_Listings` (`Clustered Index Seek ... LOOKUP`, executed 805 times) — **2,480 logical reads** versus 10 for option b. Either way, requirement 2 fails.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 Placement inside a nonclustered index is a three-tier hierarchy, and each tier can do strictly less:

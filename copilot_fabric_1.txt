@@ -32,9 +32,9 @@ keep USERS CAN USE COPILOT AND OTHER FEATURES POWERED BY AZURE
 OPENAI enabled but scope it to sg-aurora-copilot; enable DATA SENT
 TO AZURE OPENAI CAN BE PROCESSED OUTSIDE YOUR CAPACITY'S
 GEOGRAPHIC REGION, COMPLIANCE BOUNDARY, OR NATIONAL CLOUD
-INSTANCE, because Australia East is outside the US and the EU data
-boundary and Copilot stays disabled otherwise. Leave the workspace
-on the F8 capacity.
+INSTANCE, because Australia East is outside the US or France and
+Copilot stays disabled otherwise. Leave the workspace on the F8
+capacity.
 
 In Visual Studio Code, install the MSSQL extension plus GITHUB
 COPILOT and GITHUB COPILOT CHAT (an active Copilot subscription is
@@ -192,14 +192,14 @@ Why option b is wrong
 Two factual errors. "Copilot in Microsoft Fabric isn't supported
 on trial SKUs. Only paid SKUs (F2 or higher, or P1 or higher) are
 supported" — moving to a trial capacity switches Copilot off. And
-the cross-geo claim is backwards: outside the US and the EU data
-boundary, Copilot requests may need to be processed in another
-region, which is exactly why the tenant admin must consciously
-enable Data sent to Azure OpenAI can be processed outside your
-capacity's geographic region...; without it, Copilot stays
-disabled for an Australia East capacity. Enabling for the whole
-organization also ignores requirement 1 (and the documentation's
-warning to roll out by security group).
+the cross-geo claim is backwards: outside the US or France,
+Copilot requests may need to be processed in another region, which
+is exactly why the tenant admin must consciously enable Data sent
+to Azure OpenAI can be processed outside your capacity's
+geographic region...; without it, Copilot stays disabled for an
+Australia East capacity. Enabling for the whole organization also
+ignores requirement 1 (and the documentation's warning to roll out
+by security group).
 
 Why option c is wrong
 ---------------------
@@ -301,10 +301,10 @@ DP-800 Exam Rule to Remember
 Copilot in Fabric (admin portal > Tenant settings > Copilot and AI)
   "Users can use Copilot and other features powered by Azure OpenAI"      ON by default; scope to security groups
   "Data sent to Azure OpenAI can be processed outside your capacity's geographic region..."  OFF by default;
-       REQUIRED outside US / EU data boundary (else Copilot is disabled there)
+       REQUIRED outside the US or France (else Copilot is disabled there)
   "...can be stored outside..."  OFF by default; only for notebooks / data agents (conversation history)
-  Paid capacity only: F2+ or P1+; trial SKUs and Pro/PPU workspaces do NOT support Copilot; settings can be
-  delegated to capacity admins.
+  Paid capacity only: F2+ or P1+; trial SKUs do NOT support Copilot; settings can be managed at tenant or
+  capacity level (delegated to capacity admins).
 Copilot for SQL database in Fabric sees: schema, your prompt, chat history, executed query text + errors.
   It never reads table data; prompts are not used to train models; portal Copilot never runs queries by itself.
 GitHub Copilot + MSSQL extension (VS Code): needs GitHub Copilot + Copilot Chat + subscription + a connection.

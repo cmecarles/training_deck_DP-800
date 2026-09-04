@@ -1,0 +1,204 @@
+# SQL Server question — Azure SQL External Model and Vector Index 1
+
+## Statement
+
+A seed bank catalogues heirloom vegetable varieties in an **Azure SQL Database** named `SeedVault` and wants semantic search over the variety descriptions, computed entirely inside the database: an `EXTERNAL MODEL` that calls an **Azure OpenAI** `text-embedding-3-small` deployment with the server's **system-assigned managed identity** (no API key anywhere), a `vector(1536)` column, and a DiskANN vector index.
+
+This is a **hands-on** question: provision, run steps S1–S9, and predict the deterministic outcomes (the embedding values themselves vary between runs; the question never depends on them).
+
+### Provisioning (Azure CLI, bash; `az login` first)
+
+```bash
+LOCATION="swedencentral"            # a region that offers text-embedding-3-small with the Standard SKU
+SUFFIX=$RANDOM
+RG="rg-dp800-seedvault-$SUFFIX"
+SQL="sql-seedvault-$SUFFIX"
+DB="SeedVault"
+AOAI="aoai-seedvault-$SUFFIX"       # globally unique; also becomes the custom domain
+ADMIN_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+ADMIN_OID=$(az ad signed-in-user show --query id -o tsv)
+MYIP=$(curl -s https://api.ipify.org)
+
+az group create -n $RG -l $LOCATION
+# Azure OpenAI resource (custom domain is required for Entra-token access) + embedding deployment
+az cognitiveservices account create -g $RG -n $AOAI -l $LOCATION --kind OpenAI --sku S0 --custom-domain $AOAI --yes
+az cognitiveservices account deployment create -g $RG -n $AOAI --deployment-name embed-small \
+  --model-name text-embedding-3-small --model-version "1" --model-format OpenAI --sku-name Standard --sku-capacity 1
+  # if your region rejects the Standard SKU for this model, repeat with --sku-name GlobalStandard
+AOAI_EP=$(az cognitiveservices account show -g $RG -n $AOAI --query properties.endpoint -o tsv)   # https://<AOAI>.openai.azure.com/
+AOAI_ID=$(az cognitiveservices account show -g $RG -n $AOAI --query id -o tsv)
+
+# Logical server with a system-assigned managed identity, Entra admin = you; serverless 1 vCore database
+az sql server create -g $RG -n $SQL -l $LOCATION --enable-ad-only-auth --assign-identity --identity-type SystemAssigned \
+  --external-admin-principal-type User --external-admin-name "$ADMIN_UPN" --external-admin-sid $ADMIN_OID
+az sql server firewall-rule create -g $RG -s $SQL -n client --start-ip-address $MYIP --end-ip-address $MYIP
+az sql db create -g $RG -s $SQL -n $DB -e GeneralPurpose -f Gen5 -c 1 --compute-model Serverless \
+  --auto-pause-delay 60 --min-capacity 0.5 --backup-storage-redundancy Local
+SQL_FQDN=$(az sql server show -g $RG -n $SQL --query fullyQualifiedDomainName -o tsv)
+SQL_MI=$(az sql server show -g $RG -n $SQL --query identity.principalId -o tsv)
+
+# Least-privilege inference role for the server identity on the Azure OpenAI resource
+az role assignment create --assignee-object-id $SQL_MI --assignee-principal-type ServicePrincipal \
+  --role "Cognitive Services OpenAI User" --scope $AOAI_ID
+echo "Endpoint: $AOAI_EP"
+```
+
+Connect with sqlcmd (Go): `sqlcmd -S $SQL_FQDN -d $DB --authentication-method ActiveDirectoryDefault -I` (ODBC sqlcmd: `-G -U "$ADMIN_UPN" -I`). Replace `<AOAI_EP>` with the printed endpoint (keep the trailing slash) and run:
+
+```sql
+IF NOT EXISTS (SELECT 1 FROM sys.symmetric_keys WHERE name = '##MS_DatabaseMasterKey##')
+    CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'Str0ng!Passw0rd#2026';
+GO
+CREATE DATABASE SCOPED CREDENTIAL [<AOAI_EP>]
+    WITH IDENTITY = 'Managed Identity', SECRET = '{"resourceid":"https://cognitiveservices.azure.com"}';
+GO
+CREATE EXTERNAL MODEL SeedEmbedder
+WITH (LOCATION = '<AOAI_EP>openai/deployments/embed-small/embeddings?api-version=2024-02-01',
+      API_FORMAT = 'Azure OpenAI', MODEL_TYPE = EMBEDDINGS, MODEL = 'text-embedding-3-small',
+      CREDENTIAL = [<AOAI_EP>]);
+GO
+CREATE SCHEMA Catalog;
+GO
+CREATE TABLE Catalog.Varieties
+(
+    VarietyId   INT           NOT NULL PRIMARY KEY CLUSTERED,
+    Crop        VARCHAR(20)   NOT NULL,
+    Name        NVARCHAR(60)  NOT NULL,
+    Description NVARCHAR(400) NOT NULL,
+    Embedding   VECTOR(1536)  NULL
+);
+-- 120 varieties (the index needs at least 100 rows with non-NULL vectors)
+INSERT INTO Catalog.Varieties (VarietyId, Crop, Name, Description)
+SELECT value,
+       CHOOSE(value % 4 + 1, 'tomato', 'bean', 'squash', 'pepper'),
+       CONCAT(N'Variety ', value),
+       CONCAT(N'A ', CHOOSE(value % 3 + 1, N'sweet', N'tart', N'smoky'), N' ', CHOOSE(value % 4 + 1, 'tomato', 'bean', 'squash', 'pepper'),
+              N' that ripens ', CHOOSE(value % 2 + 1, N'early', N'late'), N' and tolerates ', CHOOSE(value % 5 + 1, N'drought', N'frost', N'heat', N'shade', N'wind'), N'.')
+FROM GENERATE_SERIES(1, 120);
+GO
+```
+
+### The steps (each in its own batch)
+
+```sql
+-- S1
+UPDATE Catalog.Varieties SET Embedding = AI_GENERATE_EMBEDDINGS(CONCAT(Name, N': ', Description) USE MODEL SeedEmbedder);
+SELECT COUNT(*) AS Embedded, MIN(DATALENGTH(Embedding)) AS Bytes,
+       MIN(VECTORPROPERTY(Embedding, 'Dimensions')) AS Dims, MIN(VECTORPROPERTY(Embedding, 'BaseType')) AS BaseType
+FROM Catalog.Varieties WHERE Embedding IS NOT NULL;
+
+-- S2
+DECLARE @p JSON = N'{"dimensions":512}';
+INSERT INTO Catalog.Varieties (VarietyId, Crop, Name, Description, Embedding)
+VALUES (121, 'tomato', N'Shortcut', N'A test row', AI_GENERATE_EMBEDDINGS(N'A test row' USE MODEL SeedEmbedder PARAMETERS @p));
+
+-- S3
+CREATE VECTOR INDEX VX_Varieties ON Catalog.Varieties (Embedding) WITH (METRIC = 'cosine', TYPE = 'diskann');
+SELECT JSON_VALUE(v.build_parameters, '$.Version') AS index_version, v.distance_metric
+FROM sys.vector_indexes AS v JOIN sys.indexes AS i ON i.object_id = v.object_id AND i.index_id = v.index_id
+WHERE i.name = 'VX_Varieties';
+
+-- S4
+INSERT INTO Catalog.Varieties (VarietyId, Crop, Name, Description, Embedding)
+VALUES (121, 'pepper', N'Late Ember', N'A smoky pepper that ripens late and tolerates heat.',
+        AI_GENERATE_EMBEDDINGS(N'Late Ember: A smoky pepper that ripens late and tolerates heat.' USE MODEL SeedEmbedder));
+
+-- S5
+DECLARE @q VECTOR(1536) = AI_GENERATE_EMBEDDINGS(N'late smoky pepper for hot climates' USE MODEL SeedEmbedder);
+SELECT TOP (3) t.VarietyId, t.Name, r.distance
+FROM VECTOR_SEARCH(TABLE = Catalog.Varieties AS t, COLUMN = Embedding, SIMILAR_TO = @q, METRIC = 'cosine', TOP_N = 3) AS r
+ORDER BY r.distance;
+
+-- S6
+DECLARE @q VECTOR(1536) = AI_GENERATE_EMBEDDINGS(N'late smoky pepper for hot climates' USE MODEL SeedEmbedder);
+SELECT TOP (3) WITH APPROXIMATE t.VarietyId, t.Name, r.distance
+FROM VECTOR_SEARCH(TABLE = Catalog.Varieties AS t, COLUMN = Embedding, SIMILAR_TO = @q, METRIC = 'cosine') AS r
+ORDER BY r.distance;
+
+-- S7
+DECLARE @q VECTOR(1536) = AI_GENERATE_EMBEDDINGS(N'late smoky pepper for hot climates' USE MODEL SeedEmbedder);
+SELECT TOP (3) WITH APPROXIMATE t.VarietyId, t.Name, r.distance
+FROM VECTOR_SEARCH(TABLE = Catalog.Varieties AS t, COLUMN = Embedding, SIMILAR_TO = @q, METRIC = 'cosine') AS r
+ORDER BY r.distance, t.Name;
+
+-- S8
+DECLARE @q VECTOR(1536) = AI_GENERATE_EMBEDDINGS(N'late smoky pepper for hot climates' USE MODEL SeedEmbedder);
+SELECT TOP (3) t.VarietyId, t.Name, r.distance
+FROM VECTOR_SEARCH(TABLE = Catalog.Varieties AS t, COLUMN = Embedding, SIMILAR_TO = @q, METRIC = 'euclidean') AS r
+ORDER BY r.distance;
+
+-- S9
+TRUNCATE TABLE Catalog.Varieties;
+```
+
+For S1–S9 state whether the batch **succeeds or fails** and, for the deterministic parts, what it returns (counts, byte sizes, dimension counts, the index version, error numbers). For S5–S8 you are only asked *whether* rows come back and whether the vector index is used, not which varieties.
+
+**Cost and cleanup.** Azure OpenAI S0 has no fixed charge; the 122 embedding calls cost well under one cent. The serverless database bills only while running. Delete the group, then purge the soft-deleted OpenAI account so its name is released:
+
+```bash
+az group delete -n $RG --yes
+az cognitiveservices account purge -g $RG -n $AOAI -l $LOCATION
+```
+
+## Correct Answer
+
+| Step | Outcome | Detail |
+|---|---|---|
+| S1 | **Succeeds** | `Embedded = 120`, `Bytes = 6152`, `Dims = 1536`, `BaseType = float32` |
+| S2 | **Fails** | `Msg 42204` — `The vector dimensions 1536 and 512 do not match.` (the model returned 512 values because of `PARAMETERS`) |
+| S3 | **Succeeds** | index created; `index_version = 3`, `distance_metric = COSINE` (latest DiskANN format; `PREVIEW_FEATURES` not required on Azure SQL Database) |
+| S4 | **Succeeds** | `(1 rows affected)` — with a latest-version index the table is **not** read-only |
+| S5 | **Fails** | `Msg 42274` — `Vector search with version 3 index does not support explicit TOP_N parameter.` |
+| S6 | **Succeeds** | 3 rows, approximate search through `VX_Varieties` |
+| S7 | **Fails** | `Msg 42271` — `TOP WITH APPROXIMATE and VECTOR_SEARCH requires ORDER BY on distance column ascending, and no other columns` |
+| S8 | **Succeeds** | 3 rows — no cosine/euclidean index match, so a **warning** is raised and an exact kNN scan runs instead |
+| S9 | **Fails** | `TRUNCATE TABLE` is not allowed on a table with a vector index; drop the index, truncate, reload ≥ 100 rows, recreate |
+
+## Explanation
+
+### S1 — the passwordless model call and the vector's shape
+
+`CREATE DATABASE SCOPED CREDENTIAL [https://<aoai>.openai.azure.com/] WITH IDENTITY = 'Managed Identity', SECRET = '{"resourceid":"https://cognitiveservices.azure.com"}'` makes the engine obtain a bearer token for the Azure AI services audience with the logical server's system-assigned identity; the credential name must be a valid URL whose scheme and host match the model `LOCATION` and whose path is a prefix of it, with no query string — hence the naked endpoint. **Cognitive Services OpenAI User** is the minimum role that can "make inference API calls with Microsoft Entra ID" (Cognitive Services Contributor explicitly cannot). `AI_GENERATE_EMBEDDINGS(text USE MODEL m)` returns the model's array; `text-embedding-3-small` emits **1,536** dimensions by default, and a `vector(1536)` value is stored as 4 bytes per dimension plus an 8-byte header = **6,152** bytes (verified: `DATALENGTH` 6152, `VECTORPROPERTY` `Dimensions` 1536, `BaseType` `float32`). `sp_invoke_external_rest_endpoint`/`AI_GENERATE_EMBEDDINGS` need no `sp_configure` on Azure SQL Database ("external rest endpoint enabled" is on by default).
+
+### S2 — `PARAMETERS` overrides the model, the column does not stretch
+
+The optional JSON is appended to the request body, so Azure OpenAI honours `"dimensions": 512` and returns 512 values. Assigning them to a `vector(1536)` column fails at conversion time with `Msg 42204` (verified locally with a mismatched literal). To shorten embeddings you declare the column with the shortened size (`vector(512)`) or fix `PARAMETERS` on the `EXTERNAL MODEL` itself; a `vector` column has exactly one dimensionality.
+
+### S3 — the current Azure SQL Database vector index
+
+`CREATE VECTOR INDEX ... WITH (METRIC = 'cosine', TYPE = 'diskann')` needs a clustered primary key, at least **100 rows with non-NULL vectors** (fewer → `Msg 42266`), and on Azure SQL Database no `PREVIEW_FEATURES` switch (the feature is in preview, but the switch is a SQL Server 2025 requirement). New indexes are created in the **latest format**, reported as `$.Version = 3` in `sys.vector_indexes.build_parameters`; earlier-format indexes are deprecated and must be dropped and recreated.
+
+### S4 — full DML support
+
+The latest format removes the read-only restriction: `INSERT`, `UPDATE`, `DELETE` and `MERGE` are allowed and the index is maintained automatically ("Changes are visible to vector search queries after the transaction commits"). This is the key difference from SQL Server 2025 RTM, where the first-version index makes the table read-only (`Msg 42231`) until the index is dropped, and from earlier Azure indexes that needed `ALLOW_STALE_VECTOR_INDEX`.
+
+### S5, S6, S7 — the syntax follows the index version
+
+With a version-3 index, `TOP_N` inside `VECTOR_SEARCH` is rejected with `Msg 42274`; approximate search is requested with `SELECT TOP (n) WITH APPROXIMATE ... ORDER BY r.distance` (S6). That `ORDER BY` is mandatory and must be *only* the `distance` column, ascending — adding `t.Name` (S7) raises `Msg 42271`, omitting `ORDER BY` raises `Msg 42248`. Sort by extra columns in an outer query around the approximate subquery. `WHERE` predicates, by contrast, are welcome: version-3 indexes apply them *during* the search (iterative filtering), so `TOP (3)` returns 3 qualifying rows without oversampling.
+
+### S8 — metric mismatch is a fallback on Azure, an error on SQL Server 2025 RTM
+
+"An ANN index is used only if a matching ANN index, with the same metric and on the same column, is found. If there are no compatible ANN indexes, a warning is raised and the kNN algorithm is used." Without `WITH APPROXIMATE`, `TOP (3) ... ORDER BY r.distance` is an exact kNN search anyway, so S8 returns the exact three euclidean neighbours after a full scan of 121 vectors. On SQL Server 2025 RTM the same query fails with `Msg 42227 Cannot find a vector index with metric 'euclidean' on column 'Embedding'.`
+
+### S9 — TRUNCATE is still blocked
+
+Even with DML support, "Tables with vector indexes can't be truncated using `TRUNCATE TABLE`". The documented workflow is drop index → truncate → reload at least 100 rows → recreate index; the same limitation is why vector indexes cannot be deployed through DacPac/BACPAC imports, which create the index before loading data.
+
+Hands-on question (Azure subscription required); the T-SQL fragments that do not depend on Azure were checked on SQL Server 2025 RTM 17.0.1000.7; Azure-side behaviour is taken from the official documentation.
+
+## DP-800 Exam Rule to Remember
+
+```text
+Passwordless model call: server SMI + "Cognitive Services OpenAI User" on the AOAI resource
+  CREDENTIAL [https://<host>/] IDENTITY='Managed Identity' SECRET='{"resourceid":"https://cognitiveservices.azure.com"}'
+  CREATE EXTERNAL MODEL (LOCATION=.../deployments/<dep>/embeddings?api-version=..., API_FORMAT='Azure OpenAI', MODEL_TYPE=EMBEDDINGS)
+  AI_GENERATE_EMBEDDINGS(text USE MODEL m [PARAMETERS '{"dimensions":n}'])  -> vector(n) must match (42204)
+  text-embedding-3-small = 1536 dims = 6152 bytes; cap 1998 dims
+
+Vector index, Azure SQL Database (preview, latest format, $.Version = 3):
+  CREATE VECTOR INDEX ... WITH (METRIC='cosine'|'dot'|'euclidean', TYPE='diskann')
+  clustered PK, >= 100 non-NULL vectors (42266), no PREVIEW_FEATURES needed, FULL DML, TRUNCATE blocked
+  query: SELECT TOP (n) WITH APPROXIMATE ... FROM VECTOR_SEARCH(TABLE, COLUMN, SIMILAR_TO, METRIC) ORDER BY distance
+         TOP_N -> 42274 | extra ORDER BY column -> 42271 | no ORDER BY -> 42248 | wrong metric -> warning + kNN
+SQL Server 2025 RTM: PREVIEW_FEATURES ON, first-format index = table READ-ONLY (42231), TOP_N syntax, wrong metric -> 42227
+```

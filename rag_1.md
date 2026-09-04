@@ -292,6 +292,8 @@ So option d also runs cleanly and returns `Answer = NULL`.
 
 `JSON_QUERY` would be the right tool one level up — for example, `JSON_QUERY(@response, '$.result.choices[0].message')` returns the whole `{"role":"assistant","content":"..."}` object, and the documentation's own Azure OpenAI example uses `JSON_QUERY(@response, '$.result.data[0].embedding')` because an embedding is an **array**.
 
+Conceptual question (Azure / tooling); not executed against an engine.
+
 ## DP-800 Exam Rule to Remember
 
 The T-SQL glue of RAG with `sp_invoke_external_rest_endpoint` has three checkpoints:

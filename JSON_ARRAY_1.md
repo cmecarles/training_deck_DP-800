@@ -124,6 +124,8 @@ Option d renders `Is3D` as the number `0`. The JSON constructors follow the `FOR
 - `JSON_ARRAY(s.FilmTitle, s.ScreenNo, s.Rating, s.RuntimeMin, s.Is3D, JSON_ARRAY(s.SubLang1, s.SubLang2 NULL ON NULL) ABSENT ON NULL)` is exactly equivalent to the query shown — it only spells out the outer default.
 - To keep the feed positionally stable, the fix is `... s.Is3D, JSON_ARRAY(...) NULL ON NULL)` on the **outer** constructor, which would emit `["Midnight \"8\"",1,null,95,false,["es",null]]` (option a's string — correct output for a *different* query).
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `JSON_ARRAY` defaults to **`ABSENT ON NULL`**: a SQL `NULL` element disappears without a trace and the array **changes length**. `JSON_OBJECT` defaults to the opposite (`NULL ON NULL`). Memorize the pair:

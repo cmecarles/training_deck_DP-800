@@ -142,9 +142,11 @@ Why option a is correct
   (preview), which relied on a Telegraf monitoring VM, was RETIRED
   ON 31 DECEMBER 2024; Azure SQL Analytics is a legacy workspace
   solution "no longer in active development". The current
-  agentless estate-level option is DATABASE WATCHER, which stores
-  data in Azure Data Explorer/Fabric rather than a Log Analytics
-  workspace — a valid extra, but not required here.)
+  estate-level option with nothing for you to deploy is DATABASE
+  WATCHER (Microsoft-managed collection, managed-identity login),
+  which stores data in Azure Data Explorer/Fabric Real-Time
+  Intelligence rather than a Log Analytics workspace — a valid
+  extra, but not required here.)
 
 Why option b is wrong
 ---------------------
@@ -254,6 +256,6 @@ Log categories: SQLInsights,       → Storage account          (insights-logs-*
   evaluation, needed when the signal only exists in logs (deadlock
   events, errors, Intelligent Insights text).
 - Retired/legacy: SQL Insights (preview, monitoring VM) retired 31
-  Dec 2024; Azure SQL Analytics is legacy. Current agentless
-  estate monitoring: DATABASE WATCHER (managed identity,
-  ADX/Fabric store).
+  Dec 2024; Azure SQL Analytics is legacy. Current estate
+  monitoring with no VM/agent to deploy: DATABASE WATCHER (managed
+  identity, ADX/Fabric store).

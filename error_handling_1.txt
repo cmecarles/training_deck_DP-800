@@ -5,12 +5,12 @@
 Statement
 ---------
 
-A parcel-shipping company validates shipping labels in the database
-ParcelFlow before they are handed to the carrier. The validation
-pipeline runs as a sequence of T-SQL batches; some of them are
-expected to hit errors (bad weights, duplicate label IDs), and the
-team wants to be certain about exactly what each error-handling
-construct does.
+A parcel-shipping company validates shipping labels in the
+database ParcelFlow before they are handed to the carrier. The
+validation pipeline runs as a sequence of T-SQL batches; some of
+them are expected to hit errors (bad weights, duplicate label
+IDs), and the team wants to be certain about exactly what each
+error-handling construct does.
 
 The following script is executed top to bottom, in one session, in
 SQL Server Management Studio. (In sqlcmd the output is identical
@@ -107,8 +107,8 @@ ORDER BY LabelID;
 GO
 
 Predict the complete output of batches 1 through 5: every PRINT
-line, every message, and the exact result set of the final SELECT —
-including which rows physically survive in Ship.Labels.
+line, every message, and the exact result set of the final SELECT
+— including which rows physically survive in Ship.Labels.
 
 Correct Answer
 --------------
@@ -125,7 +125,7 @@ Batch 4: caught error 2627
 Msg 2627, Level 14, State 1, Line 4
 Violation of PRIMARY KEY constraint 'PK_Labels'. Cannot insert duplicate key in object 'Ship.Labels'. The duplicate key value is (7).
 
-'Batch 3: after THROW' and 'Batch 4: completed' are NEVER printed.
+Batch 3: after THROW and Batch 4: completed are NEVER printed.
 
 Result set of Batch 5 (exactly two rows survive):
 
@@ -142,80 +142,79 @@ Explanation
 -----------
 
 Batch 1 — XACT_ABORT OFF: a constraint violation only kills the statement
-.........................................................................
+-------------------------------------------------------------------------
 
 Label 1 inserts. Label 2 violates CK_Labels_WeightKg (error 547,
 severity 16). With SET XACT_ABORT OFF, a constraint violation is a
 statement-terminating error: only the failing INSERT is rolled
 back, the surrounding transaction stays alive and committable.
-Control jumps to the CATCH block immediately, which means label 3's
-INSERT — and the COMMIT inside the TRY — NEVER execute. In the
+Control jumps to the CATCH block immediately, which means label
+3's INSERT — and the COMMIT inside the TRY — NEVER EXECUTE. In the
 CATCH, XACT_STATE() returns 1 ("active, committable user
-transaction"), so the first IF fires, prints
-'Batch 1: committable, committing', and commits what is left of the
-transaction: label 1 alone is persisted. Two classic traps in one
-batch: a caught error still skips the rest of the TRY block, and
-committing in the CATCH keeps the pre-error work.
+transaction"), so the first IF fires, prints Batch 1: committable,
+committing, and commits what is left of the transaction: LABEL 1
+ALONE IS PERSISTED. Two classic traps in one batch: a caught error
+still skips the rest of the TRY block, and committing in the CATCH
+keeps the pre-error work.
 
 Batch 2 — XACT_ABORT ON: the same error dooms the whole transaction
-...................................................................
+-------------------------------------------------------------------
 
-Same shape, but now SET XACT_ABORT ON. Per the TRY...CATCH docs, an
-error that would ordinarily just terminate the statement instead
-makes the transaction UNCOMMITTABLE (doomed) when it happens inside
-a TRY block with XACT_ABORT ON. In the CATCH, XACT_STATE() returns
--1: the transaction still exists (locks held) but can only perform
-reads or ROLLBACK TRANSACTION; any write or COMMIT would fail with
-error 3930. So the -1 branch prints 'Batch 2: doomed, rolling back'
-and rolls back — label 4's successful insert is undone, and NO row
-from batch 2 survives. After the ROLLBACK, XACT_STATE() is 0 (no
-active user transaction), so the third IF also fires and prints
-'Batch 2: no open transaction remains'. That is all three
-XACT_STATE() values — 1, -1, 0 — observed in two batches.
+Same shape, but now SET XACT_ABORT ON. Per the TRY...CATCH docs,
+an error that would ordinarily just terminate the statement
+instead makes the transaction UNCOMMITTABLE (DOOMED) when it
+happens inside a TRY block with XACT_ABORT ON. In the CATCH,
+XACT_STATE() returns -1: the transaction still exists (locks held)
+but can only perform reads or ROLLBACK TRANSACTION; any write or
+COMMIT would fail with error 3930. So the -1 branch prints Batch
+2: doomed, rolling back and rolls back — label 4's successful
+insert is undone, and NO ROW FROM BATCH 2 SURVIVES. After the
+ROLLBACK, XACT_STATE() is 0 (no active user transaction), so the
+third IF also fires and prints Batch 2: no open transaction
+remains. That is all three XACT_STATE() values — 1, -1, 0 —
+observed in two batches.
 
 Batch 3 — RAISERROR severity 10 vs THROW
-........................................
+----------------------------------------
 
 - RAISERROR('Routine label audit notice.', 10, 1) has severity 10.
   TRY...CATCH "catches all execution errors that have a severity
   higher than 10" — severity 10 and below are informational
-  messages, not errors. So the text 'Routine label audit notice.'
-  is simply printed to the messages stream, the CATCH is NOT
-  entered, and execution continues to print
-  'Batch 3: after RAISERROR'.
+  messages, not errors. So the text Routine label audit notice. is
+  simply printed to the messages stream, the CATCH is NOT entered,
+  and execution continues to print Batch 3: after RAISERROR.
 - THROW 50001, 'Label audit failed.', 1; raises a real exception.
   When THROW initiates an error, the severity is always 16 (there
   is no severity parameter). It is caught, and the CATCH prints
-  'Batch 3: caught error 50001, severity 16'.
-  'Batch 3: after THROW' is unreachable.
+  Batch 3: caught error 50001, severity 16. Batch 3: after THROW
+  is unreachable.
 
-Note the required syntax detail: the statement BEFORE a THROW must
-be terminated with a semicolon. Here the preceding
-PRINT 'Batch 3: after RAISERROR'; is properly terminated; without
-the semicolon, THROW can be misparsed (for example as a column
-alias after a SELECT), which is the reason the docs mandate the
-terminator.
+Note the required syntax detail: the statement before a THROW must
+be terminated with a semicolon. Here the preceding PRINT 'Batch 3:
+after RAISERROR'; is properly terminated; without the semicolon,
+THROW can be misparsed (for example as a column alias after a
+SELECT), which is the reason the docs mandate the terminator.
 
 Batch 4 — autocommit, plus a parameterless THROW re-throw
-.........................................................
+---------------------------------------------------------
 
-There is no BEGIN TRANSACTION, so each INSERT is its own autocommit
-transaction. Label 7's first insert commits immediately — that row
-is durable BEFORE anything fails. The second insert violates
-PK_Labels (error 2627, severity 14) and is caught: the CATCH prints
-'Batch 4: caught error 2627', then executes THROW; with no
-arguments — legal only inside a CATCH block — which re-raises the
-ORIGINAL error to the client with its original number, severity,
-and state (2627 / Level 14 / State 1 — not 16, because a re-throw
-preserves the caught error's severity, unlike a new THROW).
-Re-raising an error from a THROW statement terminates the batch, so
-PRINT 'Batch 4: completed' never runs. The reported Line 4 is the
-line of the failing INSERT within the batch (the batch starts at
-the -- Batch 4 comment line, since a comment after GO belongs to
-the next batch).
+There is no BEGIN TRANSACTION, so each INSERT is its own
+autocommit transaction. Label 7's first insert commits immediately
+— that row is durable before anything fails. The second insert
+violates PK_Labels (error 2627, severity 14) and is caught: the
+CATCH prints Batch 4: caught error 2627, then executes THROW; with
+no arguments — legal only inside a CATCH block — which re-raises
+the original error to the client with its original number,
+severity, and state (2627 / Level 14 / State 1 — not 16, because a
+re-throw preserves the caught error's severity, unlike a new
+THROW). Re-raising an error from a THROW statement terminates the
+batch, so PRINT 'Batch 4: completed' never runs. The reported Line
+4 is the line of the failing INSERT within the batch (the batch
+starts at the -- Batch 4 comment line, since a comment after GO
+belongs to the next batch).
 
 Batch 5 — who survived
-......................
+----------------------
 
 - Batch 1: committed label 1 from the CATCH block (labels 2 and 3
   never made it).
@@ -226,6 +225,9 @@ Batch 5 — who survived
 
 Hence exactly (1, PKG0000001, 2.50) and (7, PKG0000007, 4.10), in
 ORDER BY LabelID.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
 
 DP-800 Exam Rule to Remember
 ----------------------------
@@ -240,23 +242,27 @@ after ROLLBACK / no transaction          → XACT_STATE() = 0
 
 And the THROW vs RAISERROR scorecard:
 
-                          | RAISERROR                      | THROW
---------------------------+--------------------------------+-------------------------------
-Severity                  | caller chooses; severity ≤ 10  | always 16 when initiating; a
-                          | is informational and is NOT    | parameterless re-throw keeps
-                          | caught by TRY...CATCH          | the original severity
-
-Re-throw the caught error | impossible (must rebuild it    | THROW; — allowed ONLY inside
-                          | from ERROR_*())                | a CATCH block
-
-Statement terminator      | none required                  | the PREVIOUS statement must
-                          |                                | end with ;
-
-Honors SET XACT_ABORT     | no                             | yes
-
-After it fires in a CATCH | execution can continue         | the batch is terminated
+                      | RAISERROR             | THROW
+----------------------+-----------------------+-----------------------
+Severity              | caller chooses;       | always 16 when
+                      | SEVERITY ≤ 10 IS      | initiating; a
+                      | INFORMATIONAL AND IS  | parameterless re-throw
+                      | NOT CAUGHT BY         | keeps the original
+                      | TRY...CATCH           | severity
+----------------------+-----------------------+-----------------------
+Re-throw the caught   | impossible (must      | THROW; — allowed ONLY
+error                 | rebuild it from       | INSIDE A CATCH BLOCK
+                      | ERROR_*())            |
+----------------------+-----------------------+-----------------------
+Statement terminator  | none required         | the previous statement
+                      |                       | must end with ;
+----------------------+-----------------------+-----------------------
+Honors SET XACT_ABORT | no                    | yes
+----------------------+-----------------------+-----------------------
+After it fires in a   | execution can         | the batch is
+CATCH                 | continue              | terminated
 
 Finally, remember that in autocommit mode every statement commits
-on its own: rows inserted BEFORE a failing statement in the same
+on its own: rows inserted before a failing statement in the same
 batch — but not in the same explicit transaction — are already
 durable, no matter what the CATCH block does afterward.

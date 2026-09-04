@@ -125,6 +125,8 @@ A pattern that can match empty therefore never returns 0 for a non-NULL string �
 - `Tags` ≡ `REGEXP_COUNT(Body, '#[A-Za-z0-9_]+')` — `\w` is letters, digits, and underscore.
 - `TagsFrom13` ≡ `REGEXP_COUNT(SUBSTRING(Body, 13, LEN(Body)), '#\w+')` — with `REGEXP_COUNT` (unlike `REGEXP_INSTR`) no absolute positions are returned, so shifting the string changes nothing.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `REGEXP_COUNT(string, pattern, start, flags)`:

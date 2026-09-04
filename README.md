@@ -55,6 +55,13 @@ Each question is self-contained (own database, schema, and tables), deterministi
 | Implement programmability objects | [table_valued_functions_1.md](table_valued_functions_1.md) | Inline vs multi-statement TVF, ORDER BY rule (1033), CROSS/OUTER APPLY vs JOIN (4104), interleaved execution estimates, updatability (270) — db `ShiftPlanner` |
 | Implement programmability objects | [stored_procedures_1.md](stored_procedures_1.md) | OUTPUT at call site, defaults (201), RETURN NULL → 0 (282), `sp_` resolution to system proc, NOCOUNT, EXECUTE AS OWNER, WITH RECOMPILE, `INSERT ... EXEC` — db `WarrantyDesk` |
 | Design and implement SQL solutions by using AI-assisted tools | [copilot_fabric_1.md](copilot_fabric_1.md) | Copilot in Fabric tenant/capacity settings, cross-geo processing, what Copilot for SQL database sends to Azure OpenAI, GitHub Copilot + MSSQL `@mssql` agent-mode tools, Fabric Data Warehouse MCP server for the lakehouse — scenario Aurora Retail |
+| Design and implement database objects | [data_types_1.md](data_types_1.md) | `varchar` vs `nvarchar` conversion and precedence, `LEN` vs `DATALENGTH`, `DECIMAL` arithmetic precision/scale rules, `MONEY` truncating division, `DATETIME` .999 rollover vs `DATETIME2(n)` sizes, Msg 2628 / 220 / 1731 / 271 / 4936, row-size 1701 / 1708 / 511 vs row-overflow — db `SeedBank` |
+| Design and implement database objects | [ledger_verification_1.md](ledger_verification_1.md) | Ledger database (`WITH LEDGER = ON`), digests (`sp_generate_database_ledger_digest`), `sp_verify_database_ledger` (needs snapshot isolation, 37498), tampered digest 37368/37392, `sys.database_ledger_blocks`/`_transactions`, automatic digest storage, blocked statements — db `BondRegistry` |
+| Design and implement database objects | [fabric_sql_database_1.md](fabric_sql_database_1.md) | **Hands-on (Fabric).** SQL database in Fabric: creation, SQL analytics endpoint + automatic OneLake mirroring, Entra-only identity, unsupported features (ledger, in-memory, CDC, `EXECUTE AS`), mirroring rules, git integration — workspace `ws-dp800-tidepool`, db `TidePoolOps` |
+| Implement programmability objects | [views_2.md](views_2.md) | Identity columns and inserts through a view: error 544 (`IDENTITY_INSERT` OFF), `SET IDENTITY_INSERT` targets a table only (8105), "most wrong statements" MCQ — db `CampusReg` (shares the views_1 scenario by design) |
+| Design and implement SQL solutions by using AI-assisted tools | [mcp_tool_options_1.md](mcp_tool_options_1.md) | VS Code chat session options: Ask/Edit/Agent, tools picker (`#tool`, tool sets, 128-tool cap), approval scopes vs `chat.tools.global.autoApprove`, `.vscode/mcp.json` `inputs`, `chat.mcp.access`, MSSQL extension tools, model picker — scenario Halden Freight |
+| Design and implement SQL solutions by using AI-assisted tools | [fabric_copilot_sql_1.md](fabric_copilot_sql_1.md) | **Hands-on (Fabric).** Copilot and AI tenant settings (defaults, cross-geo processed vs stored), paid F2+/P1+ only, SQL database chat pane execution modes, Explain/Fix, completions toggle, what is sent to Azure OpenAI — workspace `ws-dp800-orchard`, db `OrchardCrm` |
+| Design and implement SQL solutions by using AI-assisted tools | [fabric_mcp_lakehouse_1.md](fabric_mcp_lakehouse_1.md) | **Hands-on (Fabric).** MSSQL agent-mode tools vs Fabric Data Warehouse MCP server (`executeSQL`, item-scoped URL, Entra sign-in), which client reaches which item, Read/ReadData/ReadAll vs Viewer, engine-enforced least privilege — workspace `ws-dp800-canopy` |
 
 ### Secure, optimize, and deploy database solutions (35–40%)
 
@@ -86,6 +93,21 @@ Each question is self-contained (own database, schema, and tables), deterministi
 | Integrate SQL solutions with Azure services | [dab_deployment_1.md](dab_deployment_1.md) | `dab init/add/validate/start`, `@env()` + `.env`, `runtime.host.mode`, `rest.path`/`graphql.path`, `allow-introspection`, CORS, `/health`, Container Apps image — db `RiverFerry` |
 | Integrate SQL solutions with Azure services | [azure_monitor_1.md](azure_monitor_1.md) | Diagnostic-setting categories → Log Analytics vs storage vs Event Hubs, App Insights SQL dependencies, DAB `runtime.telemetry.application-insights`, metric vs log alerts, KQL — db `SkyFare` |
 | Integrate SQL solutions with Azure services | [change_event_streaming_1.md](change_event_streaming_1.md) | CES vs CDC vs Change Tracking vs Functions SQL trigger vs Logic Apps: `sp_enable_event_stream`, `CHANGETABLE`, `cdc.<schema>_<table>_CT`, `__$operation`, Agent jobs — db `ClaimStream` |
+| Implement data security and compliance | [audit_retention_1.md](audit_retention_1.md) | Azure SQL auditing storage lifecycle: retention days, locked time-based immutability vs legal hold, protected append writes, Log Analytics retention, Microsoft support operations audit, server vs database policies, `sys.fn_get_audit_file_v2` — db `PharmaTrace` |
+| Implement data security and compliance | [azure_sql_entra_managed_identity_1.md](azure_sql_entra_managed_identity_1.md) | **Hands-on (Azure).** Entra-only logical server, user-assigned managed identity on a container connecting with `ActiveDirectoryManagedIdentity`, 18456 `<token-identified principal>` before `CREATE USER ... FROM EXTERNAL PROVIDER`, `az sql server ad-only-auth` — db `BerthBook` |
+| Implement data security and compliance | [azure_sql_auditing_log_analytics_1.md](azure_sql_auditing_log_analytics_1.md) | **Hands-on (Azure).** Server- and database-level `audit-policy update` to Log Analytics, `AzureDiagnostics` / `SQLSecurityAuditEvents` KQL, side-by-side audits, `QueryStoreRuntimeStatistics` / `Deadlocks` diagnostic categories — db `CourtDocket` |
+| Optimize database performance | [service_tiers_1.md](service_tiers_1.md) | Azure SQL Database vCore tiers: General Purpose vs Business Critical vs Hyperscale, serverless auto-pause, read scale-out, zone redundancy, named replicas, feature gating — server `northpier-sql` |
+| Optimize database performance | [automatic_tuning_iqp_1.md](automatic_tuning_iqp_1.md) | Intelligent Query Processing gated by compatibility level (140/150/160/170), `USE HINT('DISABLE_TSQL_SCALAR_UDF_INLINING')`, `sys.dm_exec_valid_use_hints`, `QUERY_OPTIMIZER_COMPATIBILITY_LEVEL_n`, Azure automatic-tuning defaults, Msg 15707 on SQL Server — db `QuarryOps` |
+| Optimize database performance | [optimized_locking_1.md](optimized_locking_1.md) | Optimized locking: ADR prerequisite (12133/12134), transaction-ID locking (`XACT` resource in `sys.dm_tran_locks`), lock-after-qualification under RCSI, `LCK_M_S_XACT_MODIFY`, Msg 1222, side-by-side with `OPTIMIZED_LOCKING = OFF` — db `RailSlots` |
+| Optimize database performance | [azure_sql_qpi_automatic_tuning_1.md](azure_sql_qpi_automatic_tuning_1.md) | **Hands-on (Azure).** Query Store defaults, parameter-sniffing regression generator, Query Performance Insight dependence on Query Store, `SET AUTOMATIC_TUNING`, `sys.database_automatic_tuning_options`, `sys.dm_db_tuning_recommendations` — db `CraneYard` |
+| Implement CI/CD by using SQL Database Projects | [azure_devops_pipelines_1.md](azure_devops_pipelines_1.md) | Azure Pipelines YAML for a SQL project: `DotNetCoreCLI@2`, `SqlAzureDacpacDeployment@1`, workload identity federation service connection, environments with approvals and checks, Azure Repos branch policies — db `MarinaBerth` |
+| Implement CI/CD by using SQL Database Projects | [ssdt_unit_tests_1.md](ssdt_unit_tests_1.md) | SSDT SQL Server unit tests: `SqlDatabaseTestClass`, pre/test/post scripts, test conditions (Scalar Value, Row Count, Empty ResultSet, Expected Schema, Execution Time, Checksum, Inconclusive), `[ExpectedSqlException]`, execution vs privileged connection contexts, `vstest.console` in CI — db `RidgeMeters` |
+| Integrate SQL solutions with Azure services | [dab_pagination_filtering_1.md](dab_pagination_filtering_1.md) | DAB REST `$first`/`$after`/`$filter`/`$orderby`/`$select`/`nextLink`, GraphQL `first`/`after`/`filter`/`orderBy`/`hasNextPage`, `runtime.pagination` limits, `depth-limit` — db `SproutHouse` |
+| Integrate SQL solutions with Azure services | [platform_selection_1.md](platform_selection_1.md) | Choosing Azure SQL Database vs Managed Instance vs SQL Server on Azure VM vs SQL database in Fabric vs Fabric mirroring for stated requirements (Agent, cross-database queries, CLR, OS control, OneLake analytics, near-real-time analytic copy) |
+| Integrate SQL solutions with Azure services | [azure_sql_dab_container_app_1.md](azure_sql_dab_container_app_1.md) | **Hands-on (Azure).** DAB on Azure Container Apps with a user-assigned managed identity, `EntraID` provider with `jwt.audience`/`jwt.issuer`, app roles, bearer tokens from `az account get-access-token`, `X-MS-API-ROLE` 200/403/401 matrix — db `OrchardStock` |
+| Integrate SQL solutions with Azure services | [azure_sql_change_event_streaming_1.md](azure_sql_change_event_streaming_1.md) | **Hands-on (Azure).** Change Event Streaming to Event Hubs (Kafka :9093, Data Sender role), `sp_enable_event_stream` → `sp_create_event_stream_group` → `sp_add_object_to_event_stream_group`, CloudEvents payload, no seeding / no DDL events, TRUNCATE 23663, CES vs CDC — db `LiftPass` |
+| Integrate SQL solutions with Azure services | [fabric_lakehouse_sql_endpoint_1.md](fabric_lakehouse_sql_endpoint_1.md) | **Hands-on (Fabric).** Lakehouse Load to Tables, read-only SQL analytics endpoint (DML and CREATE TABLE fail; views/procs OK), three-part-name joins to a warehouse, `OPENROWSET(BULK '/Files/...')`, Delta type mapping, metadata sync, Direct Lake — workspace `ws-dp800-glacier` |
+| Integrate SQL solutions with Azure services | [fabric_mirroring_azure_sql_1.md](fabric_mirroring_azure_sql_1.md) | **Hands-on (Fabric).** Mirror an Azure SQL Database: managed identity, `ALTER ANY EXTERNAL MIRROR`, CDC blocks mirroring, table and column eligibility, DDL re-snapshot, free compute, mirroring vs CES vs CDC — workspace `ws-dp800-beacon`, db `BeaconTickets` |
 
 ### Implement AI capabilities in database solutions (25–30%)
 
@@ -106,6 +128,10 @@ Each question is self-contained (own database, schema, and tables), deterministi
 | Design and implement retrieval-augmented generation (RAG) | [rag_use_cases_1.md](rag_use_cases_1.md) | RAG vs fine-tuning vs prompt-only vs deterministic SQL: freshness, private data, citations, cost — db `LumenLegal` |
 | Design and implement retrieval-augmented generation (RAG) | [rag_structured_to_json_1.md](rag_structured_to_json_1.md) | `FOR JSON PATH`/`JSON_ARRAYAGG`/`STRING_AGG` → `JSON_OBJECT` payload, escaping traps (`JSON_QUERY`, `STRING_ESCAPE`), `sp_invoke_external_rest_endpoint` `@headers`/`@credential`/`@timeout` — db `LoanAdvisor` |
 | Design and implement retrieval-augmented generation (RAG) | [rag_extract_responses_1.md](rag_extract_responses_1.md) | Envelope `$.result`/`$.response.status.http.code`, `JSON_VALUE` vs `JSON_QUERY` vs `OPENJSON WITH`, 4000-char limit (Msg 13625), structured output parsed twice — db `RepairPilot` |
+| Design and implement models and embeddings | [azure_sql_external_model_vector_1.md](azure_sql_external_model_vector_1.md) | **Hands-on (Azure).** Azure OpenAI embedding deployment, managed-identity credential, `CREATE EXTERNAL MODEL`, `AI_GENERATE_EMBEDDINGS`, `vector(1536)` storage, version-3 DiskANN index (100-row minimum, full DML, `WITH APPROXIMATE`), `TOP_N` 42274 — db `SeedVault` |
+| Design and implement models and embeddings | [foundry_embedding_maintenance_1.md](foundry_embedding_maintenance_1.md) | Microsoft Foundry in the embedding pipeline: Azure OpenAI → Foundry resource upgrade, Cohere `embed-v-4-0` from the catalog, `CREATE EXTERNAL MODEL` stays on `*.openai.azure.com` (Foundry FQDN not allow-listed), managed identity + `disableLocalAuth`, routines vs Logic Apps vs retiring prompt flow — db `TransitTimes` |
+| Design and implement intelligent search | [full_text_search_2.md](full_text_search_2.md) | `FORMSOF(INFLECTIONAL)` vs `FORMSOF(THESAURUS)`, `tsenu.xml` expansion vs replacement sets, `sp_fulltext_load_thesaurus_file`, `FREETEXT` implicit stemming, `LANGUAGE 0x0`, `ISABOUT ... WEIGHT`, stoplists — db `AtlasGuides` |
+| Design and implement intelligent search | [search_evaluation_1.md](search_evaluation_1.md) | precision@k, recall@k, reciprocal rank, nDCG@3 over a relevance-judged set, weighted RRF in T-SQL, why P@k ties while RR/nDCG separate — db `DocForge` |
 
 ## Conventions
 
@@ -123,8 +149,8 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 
 | Bullet | Status before | Added |
 |---|---|---|
-| Tables, data types, columns, indexes, column store indexes | Covered | — |
-| Specialized tables: in-memory, temporal, external, ledger, graph | Partial (temporal, graph) | in_memory_tables_1, ledger_tables_1, external_tables_1 |
+| Tables, data types, columns, indexes, column store indexes | Partial (no data-type question) | data_types_1 |
+| Specialized tables: in-memory, temporal, external, ledger, graph | Partial (temporal, graph) | in_memory_tables_1, ledger_tables_1, ledger_verification_1, external_tables_1, fabric_sql_database_1 |
 | JSON columns and indexes | Missing | json_type_and_indexes_1 |
 | Constraints: PK, FK, UNIQUE, CHECK, DEFAULT | Missing | constraints_1 |
 | SEQUENCES | Covered | — |
@@ -143,10 +169,10 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 | Correlated queries | Covered | — |
 | Error handling | Covered | — |
 | Security impact of AI-assisted tools | Partial | copilot_fabric_1 |
-| Enable GitHub Copilot and Copilot in Fabric | Missing | copilot_fabric_1 |
-| Model and MCP tool options in a chat session | Partial | (copilot_mcp_1) |
+| Enable GitHub Copilot and Copilot in Fabric | Missing | copilot_fabric_1, fabric_copilot_sql_1 |
+| Model and MCP tool options in a chat session | Partial | mcp_tool_options_1 |
 | GitHub Copilot instruction files | Covered | — |
-| Connect to MCP endpoints: SQL Server, Fabric lakehouse | Partial (SQL Server only) | copilot_fabric_1 |
+| Connect to MCP endpoints: SQL Server, Fabric lakehouse | Partial (SQL Server only) | copilot_fabric_1, fabric_mcp_lakehouse_1 |
 
 ### Secure, optimize, and deploy database solutions (35–40%)
 
@@ -156,13 +182,13 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 | Dynamic Data Masking | Covered | — |
 | Row-Level Security | Covered | — |
 | Object-level permissions | Missing | object_level_permissions_1 |
-| Secure access incl. passwordless | Missing | passwordless_access_1 |
-| Auditing | Missing | auditing_1 |
+| Secure access incl. passwordless | Missing | passwordless_access_1, azure_sql_entra_managed_identity_1 |
+| Auditing | Missing | auditing_1, audit_retention_1, azure_sql_auditing_log_analytics_1 |
 | Secure model endpoints incl. Managed Identity | Missing | secure_model_endpoints_1 |
 | Secure GraphQL, REST, MCP endpoints | Missing | secure_api_endpoints_1 |
-| Recommend database configurations | Missing | database_configurations_1 |
-| Isolation levels and concurrency controls | Covered | — |
-| Execution plans, DMVs, Query Store, Query Performance Insight | Missing | execution_plans_dmvs_1, query_store_1 |
+| Recommend database configurations | Missing | database_configurations_1, service_tiers_1, automatic_tuning_iqp_1 |
+| Isolation levels and concurrency controls | Covered | optimized_locking_1 (added depth) |
+| Execution plans, DMVs, Query Store, Query Performance Insight | Missing | execution_plans_dmvs_1, query_store_1, azure_sql_qpi_automatic_tuning_1 |
 | Blocking and deadlocks | Missing | blocking_deadlocks_1 |
 | Testing strategy: unit and integration tests | Missing | sql_projects_testing_1 |
 | Reference/static data in source control | Missing | reference_data_1 |
@@ -172,14 +198,14 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 | Secrets management | Missing | secrets_and_branching_1 |
 | Detect schema drift | Covered | — |
 | Update a project and deploy changes | Partial | deploy_and_pipeline_controls_1 |
-| Deployment pipeline controls: branch policies, approvals, code owners | Missing | deploy_and_pipeline_controls_1 |
+| Deployment pipeline controls: branching policies, triggers in approvals, authentication tables, code owners | Missing | deploy_and_pipeline_controls_1, azure_devops_pipelines_1 |
 | DAB configuration files | Covered | — |
-| Entities for REST/GraphQL: caching, pagination, filtering | Covered | — |
+| Entities for REST/GraphQL: caching, pagination, filtering | Partial (caching only) | dab_pagination_filtering_1 |
 | Configure REST or GraphQL endpoints | Partial | dab_deployment_1 |
 | Expose objects, procedures, views incl. GraphQL relationships | Partial (no relationships) | dab_graphql_relationships_1 |
-| DAB deployment | Missing | dab_deployment_1 |
+| DAB deployment | Missing | dab_deployment_1, azure_sql_dab_container_app_1 |
 | Azure Monitor: Application Insights, Log Analytics | Missing | azure_monitor_1 |
-| CES, CDC, Change Tracking, Functions SQL trigger, Logic Apps | Partial (compared in embeddings_1) | change_event_streaming_1 |
+| CES, CDC, Change Tracking, Functions SQL trigger, Logic Apps | Partial (compared in embeddings_1) | change_event_streaming_1, azure_sql_change_event_streaming_1, fabric_mirroring_azure_sql_1, fabric_lakehouse_sql_endpoint_1 |
 
 ### Implement AI capabilities in database solutions (25–30%)
 
@@ -187,12 +213,12 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 |---|---|---|
 | Evaluate external models: multimodal, multilanguage, sizes, structured output | Missing | external_models_evaluate_1 |
 | Create and manage external models | Partial (used, not taught) | create_external_model_1 |
-| Embedding maintenance method | Covered | — |
+| Embedding maintenance method | Covered | foundry_embedding_maintenance_1 (Foundry option added) |
 | Which columns to include in embeddings | Missing | embedding_columns_1 |
 | Chunks for embeddings | Missing | chunking_1 |
-| Generate embeddings | Partial | generate_embeddings_1 |
+| Generate embeddings | Partial | generate_embeddings_1, azure_sql_external_model_vector_1 |
 | Choose full-text, vector, or hybrid search | Missing | search_strategy_1 |
-| Implement full-text search | Missing | full_text_search_1 |
+| Implement full-text search | Missing | full_text_search_1, full_text_search_2 |
 | Vector data type, indexes, size | Partial | vector_index_1 |
 | VECTOR_NORMALIZE, VECTOR_DISTANCE, VECTORPROPERTY, VECTOR_SEARCH | Partial | vector_index_1 |
 | ANN vs ENN | Covered | — |
@@ -200,9 +226,27 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 | Implement vector search | Covered | — |
 | Hybrid search | Missing | hybrid_search_rrf_1 |
 | Reciprocal rank fusion | Missing | hybrid_search_rrf_1 |
-| Evaluate performance of vector and hybrid search | Missing | search_strategy_1 |
+| Evaluate performance of vector and hybrid search | Missing | search_strategy_1, search_evaluation_1 |
 | Use cases for RAG | Missing | rag_use_cases_1 |
 | Prompt via sp_invoke_external_rest_endpoint | Covered | — |
 | Convert structured data to JSON | Partial | rag_structured_to_json_1 |
 | Send results to language model | Covered | — |
 | Extract language model responses | Partial | rag_extract_responses_1 |
+
+## Learning-path audit and second batch (2026-09-04)
+
+The 17 conceptual questions of the first batch were re-checked claim by claim against the current Microsoft Learn, GitHub and Data API builder documentation; nine files received small corrections (none changed an answer). Microsoft's practice assessment for DP-800 requires sign-in and could not be read, so the deck was compared instead against the 11 modules and knowledge checks of the official DP-800 learning paths. That comparison, plus the two bullets still marked Partial above, produced the second batch:
+
+- Bullets closed or deepened: data types and sizes, MCP tool options in a chat session, ledger databases and digests, Azure SQL service tiers, DAB pagination and filtering, Azure DevOps pipelines, audit retention, IQP by compatibility level, optimized locking, thesaurus and inflectional full-text search, search evaluation metrics.
+- **Hands-on questions** (`azure_sql_*` and `fabric_*`): lab questions to run from your own Azure subscription or Fabric capacity. Their Statement contains the provisioning steps (Azure CLI or Fabric portal), a cost/cleanup note and teardown; the question then asks about deterministic outcomes. They are docs-based, not engine-verified, and each says so in its closing line.
+- Still to be added from the learning-path audit: `window_functions_2`, `triggers_2`, `query_store_hints_1`, `deadlock_xevents_retry_1`, `vector_search_2`, `columnstore_maintenance_1`.
+
+## Instructor-Examiner companions
+
+Every question `<name>.md` has a companion `<name>_INSTRUCTOR_EXAMINER.md`. It is a self-contained script for an AI assistant that quizzes and teaches the learner **by voice over the telephone**, written for assistants with reduced capabilities (no tools, no files, no screen). Each companion contains:
+
+1. The rules of the session: read the scenario in small pieces and repeat on request, ask the question, judge each answer only as right or wrong, give the hints one at a time from gentle to nearly revealing, and **never state the complete answer unless the learner explicitly asks for it**.
+2. The scenario in spoken prose (every table, column, row, object, statement and option described in words), the verbatim setup script for reference, and the exact question.
+3. The answer key, a graded hint ladder, a table of common wrong answers with the response to give, teaching notes with a memory hook, follow-up oral questions, and direct links to Microsoft Learn, GitHub or code.visualstudio.com only.
+
+`views_1_INSTRUCTOR_EXAMINER.md` is the reference layout. Hands-on companions first ask whether the learner has run the lab and adapt accordingly.

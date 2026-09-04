@@ -107,6 +107,8 @@ Row 3 shows road one (pattern never matches). C1/C4 on row 2 show road two (occu
 - C1 could be written with the flags spelled explicitly: `(LogLine, pattern, 1, 2, 'c', 0)` — `c` and group 0 are the defaults.
 - Contrast function: to *test* rather than extract, `REGEXP_LIKE` is the predicate form — but remember it alone requires compatibility level 170, while `REGEXP_SUBSTR` works at any compatibility level.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `REGEXP_SUBSTR(string, pattern [, start [, occurrence [, flags [, group]]]])`
