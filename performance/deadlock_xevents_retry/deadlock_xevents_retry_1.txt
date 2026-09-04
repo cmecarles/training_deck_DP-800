@@ -1,0 +1,297 @@
+============================================================
+ SQL Server question — Deadlock Extended Events and Retry 1
+============================================================
+
+Statement
+---------
+
+A sawmill schedules cutting work orders in a SQL Server 2025
+database named MillQueue. Two work orders are queued, and a cut
+log with 5,000 rows belongs to order 2:
+
+CREATE DATABASE MillQueue;
+GO
+USE MillQueue;
+GO
+CREATE SCHEMA Mill;
+GO
+CREATE TABLE Mill.WorkOrders
+(
+    OrderId INT         NOT NULL PRIMARY KEY,
+    Species VARCHAR(10) NOT NULL,
+    Status  VARCHAR(10) NOT NULL,
+    Crew    VARCHAR(10) NULL
+);
+CREATE TABLE Mill.CutLog
+(
+    CutId   INT NOT NULL PRIMARY KEY,
+    OrderId INT NOT NULL,
+    Boards  INT NOT NULL
+);
+INSERT INTO Mill.WorkOrders (OrderId, Species, Status) VALUES (1, 'OAK', 'QUEUED'), (2, 'PINE', 'QUEUED');
+INSERT INTO Mill.CutLog (CutId, OrderId, Boards)
+SELECT n, 2, 0
+FROM (SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+      FROM sys.all_columns a CROSS JOIN sys.all_columns b) AS x;
+GO
+-- planning screen: assigns two orders to a crew, with a retry loop for deadlocks
+CREATE PROCEDURE Mill.usp_AssignPair
+    @First INT, @Second INT, @Crew VARCHAR(10), @Delay CHAR(8) = '00:00:00'
+AS
+SET NOCOUNT ON;
+DECLARE @attempt INT = 1, @maxAttempts INT = 3;
+WHILE @attempt <= @maxAttempts
+BEGIN
+    BEGIN TRY
+        BEGIN TRAN;
+        UPDATE Mill.WorkOrders SET Status = 'ASSIGNED', Crew = @Crew WHERE OrderId = @First;
+        WAITFOR DELAY @Delay;
+        UPDATE Mill.WorkOrders SET Status = 'ASSIGNED', Crew = @Crew WHERE OrderId = @Second;
+        COMMIT;
+        PRINT CONCAT(@Crew, ': committed on attempt ', @attempt);
+        RETURN 0;
+    END TRY
+    BEGIN CATCH
+        DECLARE @err INT = ERROR_NUMBER(), @xs INT = XACT_STATE(), @tc INT = @@TRANCOUNT;
+        IF @xs <> 0 ROLLBACK;
+        IF @err = 1205 AND @attempt < @maxAttempts
+        BEGIN
+            PRINT CONCAT(@Crew, ': attempt ', @attempt, ' was the deadlock victim (error ', @err,
+                         ', XACT_STATE ', @xs, ', @@TRANCOUNT ', @tc, '); retrying');
+            SET @attempt += 1;
+            WAITFOR DELAY '00:00:00.500';
+        END
+        ELSE
+            THROW;
+    END CATCH
+END;
+PRINT CONCAT(@Crew, ': gave up after ', @maxAttempts, ' attempts');
+RETURN 1;
+GO
+-- the DBA also creates a dedicated Extended Events session for deadlock graphs
+CREATE EVENT SESSION MillDeadlocks ON SERVER
+ADD EVENT sqlserver.xml_deadlock_report
+ADD TARGET package0.event_file (SET filename = N'MillDeadlocks.xel', max_file_size = 5, max_rollover_files = 2)
+WITH (STARTUP_STATE = ON);
+ALTER EVENT SESSION MillDeadlocks ON SERVER STATE = START;
+GO
+
+To reproduce a production incident the DBA runs two sessions at
+the same time. Session A is the planning screen; session B is a
+yard tablet whose code has NO retry logic, logs the 5,000 cuts and
+then assigns the orders in the opposite order. B starts one second
+after A. Both sessions use the default READ COMMITTED isolation
+and the default deadlock priority.
+
+-- Session A (spid 54)                                                   -- Session B (spid 63), one batch of 8 lines
+EXEC Mill.usp_AssignPair @First = 1, @Second = 2,                       -- yard tablet: no retry logic
+     @Crew = 'CREW-A', @Delay = '00:00:04';                             BEGIN TRAN;
+                                                                         UPDATE Mill.CutLog SET Boards = Boards + 1 WHERE OrderId = 2;
+                                                                         UPDATE Mill.WorkOrders SET Status = 'ASSIGNED', Crew = 'CREW-B' WHERE OrderId = 2;
+                                                                         WAITFOR DELAY '00:00:01';
+                                                                         UPDATE Mill.WorkOrders SET Status = 'ASSIGNED', Crew = 'CREW-B' WHERE OrderId = 1;
+                                                                         COMMIT;
+                                                                         PRINT 'B committed';
+
+This is RUN 1. Afterwards the DBA resets the data (UPDATE
+Mill.WorkOrders SET Status = 'QUEUED', Crew = NULL; UPDATE
+Mill.CutLog SET Boards = 0;) and repeats the experiment as RUN 2
+with a single change: session A's batch begins with SET
+DEADLOCK_PRIORITY HIGH; before the EXEC.
+
+PART 1 (RUN 1). Which session is chosen as the deadlock victim,
+and by what rule? What does each session print? What are the final
+rows of Mill.WorkOrders and SELECT SUM(Boards) FROM Mill.CutLog?
+
+PART 2 (RUN 2). Which session is the victim now? What does session
+B receive (error number and text), and what are the final rows of
+Mill.WorkOrders and the SUM(Boards)?
+
+PART 3. In the CATCH block of the victim in run 1, what values do
+XACT_STATE() and @@TRANCOUNT have, and why must the procedure
+ROLLBACK and then re-run the WHOLE transaction rather than just
+the statement that failed?
+
+PART 4. Without the MillDeadlocks session, where is the deadlock
+graph already recorded, which function reads it from disk, and
+which two attributes of each <process> element explain the victim
+choice in runs 1 and 2?
+
+Correct Answer
+--------------
+
+PART 1. Session A is the victim: both sessions run at deadlock
+priority 0, so the engine kills the transaction that is CHEAPER TO
+ROLL BACK — A has written 300 bytes of log, B has written 600,304
+(the 5,000-row CutLog update). Session A prints
+
+CREW-A: attempt 1 was the deadlock victim (error 1205, XACT_STATE -1, @@TRANCOUNT 1); retrying
+CREW-A: committed on attempt 2
+
+Session B prints (5000 rows affected), (1 rows affected), (1 rows
+affected), B committed. Final state: both orders ASSIGNED with
+Crew = CREW-A (A's retry ran after B's commit and overwrote it),
+SUM(Boards) = 5000.
+
+PART 2. Session B is the victim: A now has priority 5 (HIGH), B
+has 0, and priority is compared before cost. B's batch ends with
+
+Msg 1205, Level 13, State 51, Line 6
+Transaction (Process ID 61) was deadlocked on lock resources with another process and has been
+chosen as the deadlock victim. Rerun the transaction.
+
+A prints CREW-A: committed on attempt 1. Final state: both orders
+ASSIGNED / CREW-A, SUM(Boards) = 0 — B's 5,000-row update was
+rolled back with the rest of its transaction.
+
+PART 3. XACT_STATE() = -1 and @@TRANCOUNT = 1: inside TRY...CATCH
+error 1205 does not end the batch; the victim's work is undone but
+the transaction is left open in an UNCOMMITTABLE state, so the
+CATCH must ROLLBACK before it can start a new transaction. Because
+the rollback undid the first UPDATE too (and another session may
+have committed in the meantime), the retry must re-issue
+everything from BEGIN TRAN.
+
+PART 4. In the always-on system_health Extended Events session
+(event xml_deadlock_report, in its ring buffer and its
+system_health_*.xel files), read with
+sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL,
+NULL). The attributes are priority (0 / 0 in run 1, 5 / 0 in run
+2) and logused (300 for A, 600304 for B).
+
+Explanation
+-----------
+
+Part 1 — the cheaper rollback loses when priorities tie
+-------------------------------------------------------
+
+A holds an X key lock on order 1 and asks for order 2; B holds
+order 2 and asks for order 1. X is incompatible with X, so the
+lock monitor finds a cycle (it wakes every 5 seconds, more often
+after a deadlock) and must pick a victim. The rule, in this order:
+(1) the session with the LOWEST DEADLOCK_PRIORITY; (2) among equal
+priorities, the session that is LESS EXPENSIVE TO ROLL BACK,
+measured by the log bytes written so far in each transaction — the
+logused attribute of the deadlock graph. Run 1 is verified
+literally in the report that system_health captured:
+
+process      | spid | priority | logused | trancount | waitresource | lockMode | isolationlev
+             |      |          |         |           |              |          | el
+-------------+------+----------+---------+-----------+--------------+----------+-------------
+process2afe9 | 54   | 0        | 300     | 2         | KEY: 20:7205 | X        | read
+17a868       |      |          |         |           | 759404723404 |          | committed
+(VICTIM)     |      |          |         |           | 8 (61a06abd4 |          | (2)
+             |      |          |         |           | 01c)         |          |
+-------------+------+----------+---------+-----------+--------------+----------+-------------
+process2b004 | 63   | 0        | 600304  | 2         | KEY: 20:7205 | X        | read
+44a478       |      |          |         |           | 759404723404 |          | committed
+             |      |          |         |           | 8 (819444328 |          | (2)
+             |      |          |         |           | 4a0)         |          |
+
+and a resource-list with two keylock entries on
+MillQueue.Mill.WorkOrders, index PK__WorkOrde__C3905BCFE37CD98A,
+mode="X", each owned by one process (owner mode="X") and requested
+by the other (waiter mode="X" requestType="wait"). A started first
+and was the "innocent" party, but it had done the least work, so
+it lost. B never saw an error: its blocked UPDATE of order 1 was
+granted the moment A's lock was released, and it committed — hence
+SUM(Boards) = 5000. A's second attempt then took both rows without
+contention and overwrote B's assignment: the retry pattern makes
+the last writer win, which is exactly why application code should
+re-read state inside the retried transaction if that matters.
+
+Part 2 — priority is checked before cost
+----------------------------------------
+
+SET DEADLOCK_PRIORITY accepts LOW (-5), NORMAL (0, default), HIGH
+(5) or any integer from -10 to 10. The session with the lowest
+value is the victim; cost only breaks ties. In run 2 the graph
+shows A with priority="5", B with priority="0", the same logused
+(300 vs 600304), and the victim is B — the process that had
+written 2,000 times more log. The 1205 message (Level 13, State
+51) is delivered to B's client; the batch stops at that statement
+(Line 6 of B's batch, counting the comment line) and B's COMMIT
+and PRINT never run, so everything B did — including the 5,000-row
+CutLog update — is gone (SUM(Boards) = 0). Raising A's priority
+reshapes who loses; it does not remove the deadlock, and B still
+has no retry.
+
+Part 3 — what the CATCH block sees
+----------------------------------
+
+The procedure printed XACT_STATE -1, @@TRANCOUNT 1. Outside
+TRY...CATCH, 1205 aborts the batch and rolls the transaction back.
+Inside TRY, control jumps to CATCH with the transaction still
+counted (@@TRANCOUNT = 1) but DOOMED (XACT_STATE() = -1): no
+further data modification is allowed and a COMMIT fails (verified
+on a doomed transaction: Msg 3930, Level 16, State 1 — The current
+transaction cannot be committed and cannot support operations that
+write to the log file. Roll back the transaction.), so the only
+legal move is ROLLBACK, which the procedure does (IF @xs <> 0
+ROLLBACK;). The other pieces of a correct retry pattern, all
+present in Mill.usp_AssignPair:
+
+- test ERROR_NUMBER() = 1205 (a transient error whose message
+  literally says "Rerun the transaction") and re-THROW anything
+  else;
+- a bounded loop (@maxAttempts = 3) with a short pause, so a
+  persistent conflict cannot spin forever;
+- RE-ISSUE THE WHOLE UNIT OF WORK starting at BEGIN TRAN. The
+  victim's rollback undid the first UPDATE as well as the failed
+  one; retrying only the failed statement would leave order 1
+  unassigned. And because the other transaction has committed in
+  the meantime, the retry may see different data (here it silently
+  overwrote CREW-B).
+
+Part 4 — reading the graph
+--------------------------
+
+No trace flag (1204/1222) and no dedicated session is needed:
+system_health captures xml_deadlock_report automatically to a ring
+buffer and to .xel files in the instance's Log folder. Verified
+queries:
+
+-- files on disk (all deadlocks on the instance; filter on currentdbname in the XML)
+SELECT CAST(event_data AS XML) AS ev
+FROM sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL)
+WHERE object_name = 'xml_deadlock_report';
+-- ring buffer
+SELECT CAST(t.target_data AS XML)
+FROM sys.dm_xe_sessions AS s
+JOIN sys.dm_xe_session_targets AS t ON t.event_session_address = s.address
+WHERE s.name = 'system_health' AND t.target_name = 'ring_buffer';
+
+XQuery on event/data/value/deadlock gives
+victim-list/victimProcess/@id, process-list/process (@spid,
+@priority, @logused, @waitresource, @lockMode, @isolationlevel,
+@currentdbname, inputbuf) and resource-list/keylock (@objectname,
+@indexname, owner-list, waiter-list). Two practical facts verified
+in this run: event timestamps are UTC (the 16:55 local deadlock is
+stamped 14:55:27), and an event_file target is written
+asynchronously — right after run 2 the MillDeadlocks*.xel file
+still showed 1 report while the ring buffer showed 2; thirty
+seconds later (the default MAX_DISPATCH_LATENCY) both showed 2. A
+dedicated session such as MillDeadlocks is useful because
+system_health's ring buffer is small and its files roll over; the
+same sys.fn_xe_file_target_read_file('MillDeadlocks*.xel', ...)
+reads it.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output (both deadlocks were
+reproduced with two concurrent sqlcmd sessions).
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Deadlock = lock cycle; lock monitor (every 5 s) kills ONE victim -> Msg 1205 "...chosen as the deadlock victim. Rerun the transaction."
+Victim choice:  1) lowest SET DEADLOCK_PRIORITY   LOW = -5, NORMAL = 0 (default), HIGH = 5, or -10..10
+                2) tie -> cheapest to roll back = fewest log bytes written (deadlock graph: process/@logused)
+                Priority only chooses the loser; it never prevents the deadlock.
+Read the graph: system_health XE session, event xml_deadlock_report  (ring buffer + system_health_*.xel, UTC timestamps)
+                sys.fn_xe_file_target_read_file('system_health*.xel', NULL, NULL, NULL) WHERE object_name = 'xml_deadlock_report'
+                victim-list / process-list (@spid @priority @logused @waitresource inputbuf) / resource-list (keylock owner/waiter)
+                Own session: CREATE EVENT SESSION x ON SERVER ADD EVENT sqlserver.xml_deadlock_report ADD TARGET package0.event_file
+                             (file is flushed after MAX_DISPATCH_LATENCY, default 30 s)
+Retry pattern:  TRY  BEGIN TRAN ... COMMIT  /  CATCH: 1205 leaves XACT_STATE() = -1, @@TRANCOUNT = 1 -> ROLLBACK first,
+                IF ERROR_NUMBER() = 1205 AND attempt < max -> re-run the WHOLE transaction (short pause), ELSE THROW.
+                Rollback undid every statement, and the other session may have committed: never retry a single statement.

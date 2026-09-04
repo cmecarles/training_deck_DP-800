@@ -1,0 +1,365 @@
+============================================================
+ SQL Server question — Vector Search 2
+============================================================
+
+Statement
+---------
+
+A herbal-remedies knowledge base stores, for each remedy, a tiny
+"effect profile" embedding in a SQL Server 2025 database named
+HerbIndex. For this exercise the embeddings are 4-dimensional; the
+four axes encode, in order, the strength of four effects:
+(calming, digestive, immune, stimulant). Small integer vectors are
+used on purpose so that every distance can be checked by hand. The
+database is built by the following complete script (the vector
+type and its functions need no preview flag):
+
+CREATE DATABASE HerbIndex;
+GO
+USE HerbIndex;
+GO
+CREATE SCHEMA Herbal;
+GO
+CREATE TABLE Herbal.Remedies
+(
+    RemedyId INT          NOT NULL CONSTRAINT PK_Remedies PRIMARY KEY CLUSTERED,
+    Name     NVARCHAR(60) NOT NULL,
+    Effect   VECTOR(4)    NULL
+);
+GO
+INSERT INTO Herbal.Remedies (RemedyId, Name, Effect) VALUES
+    (1, N'Chamomile',  '[2, 0, 0, 0]'),
+    (2, N'Peppermint', '[0, 3, 4, 0]'),
+    (3, N'Elderberry', '[3, 0, 4, 0]'),
+    (4, N'Valerian',   '[1, 1, 1, 1]'),
+    (5, N'Guarana',    '[-2, 0, 0, 0]'),
+    (6, N'Placebo',    NULL);
+GO
+
+A user asks for "something purely calming". The (toy) embedding of
+that request is Q = [1, 0, 0, 0]. The following eleven statements
+are then executed IN ORDER, EACH IN ITS OWN BATCH:
+
+-- S1
+INSERT INTO Herbal.Remedies (RemedyId, Name, Effect) VALUES (7, N'Ginger', '[1, 2, 3]');
+
+-- S2
+INSERT INTO Herbal.Remedies (RemedyId, Name, Effect) VALUES (7, N'Ginger', '1, 2, 3, 4');
+
+-- S3
+SELECT DATALENGTH(Effect) AS Bytes, CAST(Effect AS VARCHAR(100)) AS EffectText
+FROM Herbal.Remedies WHERE RemedyId = 2;
+
+-- S4
+DECLARE @q VECTOR(4) = '[1, 0, 0, 0]';
+SELECT RemedyId,
+       CAST(VECTOR_DISTANCE('cosine',    Effect, @q) AS DECIMAL(10,4)) AS Cos,
+       CAST(VECTOR_DISTANCE('euclidean', Effect, @q) AS DECIMAL(10,4)) AS Euc,
+       CAST(VECTOR_DISTANCE('dot',       Effect, @q) AS DECIMAL(10,4)) AS Dot
+FROM Herbal.Remedies ORDER BY RemedyId;
+
+-- S5
+SELECT RemedyId,
+       VECTOR_NORM(Effect, 'norm2')   AS L2,
+       VECTOR_NORM(Effect, 'norm1')   AS L1,
+       VECTOR_NORM(Effect, 'norminf') AS LInf
+FROM Herbal.Remedies ORDER BY RemedyId;
+
+-- S6
+DECLARE @q VECTOR(4) = '[1, 0, 0, 0]';
+SELECT VECTOR_DISTANCE('manhattan', Effect, @q) AS D FROM Herbal.Remedies WHERE RemedyId = 1;
+
+-- S7
+SELECT VECTOR_DISTANCE('cosine', Effect, '[1, 0, 0, 0]') AS D FROM Herbal.Remedies WHERE RemedyId = 1;
+
+-- S8
+SELECT RemedyId FROM Herbal.Remedies WHERE Effect = CAST('[2, 0, 0, 0]' AS VECTOR(4));
+
+-- S9
+DECLARE @q VECTOR(4) = '[1, 0, 0, 0]';
+SELECT TOP (3) RemedyId, Name, CAST(VECTOR_DISTANCE('cosine', Effect, @q) AS DECIMAL(10,4)) AS D
+FROM Herbal.Remedies ORDER BY D ASC, RemedyId ASC;
+
+-- S10
+DECLARE @q VECTOR(4) = '[1, 0, 0, 0]';
+SELECT TOP (3) RemedyId, Name, CAST(VECTOR_DISTANCE('cosine', Effect, @q) AS DECIMAL(10,4)) AS D
+FROM Herbal.Remedies WHERE Effect IS NOT NULL ORDER BY D ASC, RemedyId ASC;
+
+-- S11
+DECLARE @q VECTOR(4) = '[1, 0, 0, 0]';
+SELECT TOP (2) RemedyId, Name, CAST(VECTOR_DISTANCE('dot', Effect, @q) AS DECIMAL(10,4)) AS D
+FROM Herbal.Remedies WHERE Effect IS NOT NULL ORDER BY D ASC, RemedyId ASC;
+
+For each statement state whether it SUCCEEDS OR RAISES AN ERROR
+(with the error number), and give the exact result of every
+statement that returns rows.
+
+Correct Answer
+--------------
+
+Stmt | Outcome  | Detail
+-----+----------+-----------------------------------------------------
+S1   | FAILS    | Msg 42204 — The vector dimensions 4 and 3 do not
+     |          | match.
+-----+----------+-----------------------------------------------------
+S2   | FAILS    | Msg 13670 — Input JSON is not a valid Vector :
+     |          | 'Malformed JSON'.
+-----+----------+-----------------------------------------------------
+S3   | SUCCEEDS | Bytes = 24, EffectText = [0.0000000e+000,3.0000000e+
+     |          | 000,4.0000000e+000,0.0000000e+000]
+-----+----------+-----------------------------------------------------
+S4   | SUCCEEDS | six rows, see table below (NULL, NULL, NULL for
+     |          | Placebo)
+-----+----------+-----------------------------------------------------
+S5   | SUCCEEDS | six rows, see table below (NULL, NULL, NULL for
+     |          | Placebo)
+-----+----------+-----------------------------------------------------
+S6   | FAILS    | Msg 42201 — The requested distance metric
+     |          | 'manhattan' is not supported by vector_distance.
+     |          | Please provide a valid distance metric.
+-----+----------+-----------------------------------------------------
+S7   | FAILS    | Msg 8116 — Argument data type varchar is invalid for
+     |          | argument 3 of vector_distance function.
+-----+----------+-----------------------------------------------------
+S8   | FAILS    | Msg 8117 — Operand data type vector is invalid for
+     |          | equal to operator.
+-----+----------+-----------------------------------------------------
+S9   | SUCCEEDS | (6, Placebo, NULL), (1, Chamomile, 0.0000), (3,
+     |          | Elderberry, 0.4000) — the NULL row is the first
+     |          | "neighbour"
+-----+----------+-----------------------------------------------------
+S10  | SUCCEEDS | (1, Chamomile, 0.0000), (3, Elderberry, 0.4000), (4,
+     |          | Valerian, 0.5000)
+-----+----------+-----------------------------------------------------
+S11  | SUCCEEDS | (3, Elderberry, -3.0000), (1, Chamomile, -2.0000) —
+     |          | Elderberry beats the exactly-aligned Chamomile
+
+S4:
+
+RemedyId | Cos    | Euc    | Dot
+---------+--------+--------+--------
+1        | 0.0000 | 1.0000 | −2.0000
+2        | 1.0000 | 5.0990 | 0.0000
+3        | 0.4000 | 4.4721 | −3.0000
+4        | 0.5000 | 1.7321 | −1.0000
+5        | 2.0000 | 3.0000 | 2.0000
+6        | NULL   | NULL   | NULL
+
+S5:
+
+RemedyId | L2   | L1   | LInf
+---------+------+------+-----
+1        | 2    | 2    | 2
+2        | 5    | 7    | 4
+3        | 5    | 7    | 4
+4        | 2    | 4    | 1
+5        | 2    | 2    | 2
+6        | NULL | NULL | NULL
+
+Explanation
+-----------
+
+S1 — the declared dimension is a contract
+-----------------------------------------
+
+VECTOR(4) means exactly four float32 elements. A JSON array with
+three elements converts to a 3-dimensional vector, and assigning
+it to the column fails with error 42204: The vector dimensions 4
+and 3 do not match. The first number is always the declared
+(target) size, the second the supplied one — '[1, 2, 3, 4, 5]'
+gives 4 and 5, and DECLARE @q3 VECTOR(3) = '[1, 0, 0, 0]' gives 3
+and 4. The same error also fires when VECTOR_DISTANCE is handed
+two vectors of different sizes (a VECTOR(3) variable against the
+VECTOR(4) column -> The vector dimensions 4 and 3 do not match.).
+Nothing is padded or truncated: the length of the embedding
+model's output and the column size must agree.
+
+S2 — the string must be a JSON array of numbers
+-----------------------------------------------
+
+Conversion from varchar/nvarchar/json to vector parses a JSON
+array. '1, 2, 3, 4' has no brackets, so it fails with error 13670
+and the reason 'Malformed JSON'. The engine reports the specific
+reason in the same message: '[null, 2, 3, 4]' -> 'Null Not
+Supported', '["a", 2, 3, 4]' -> 'String not Supported',
+'{"v":[1,2,3,4]}' -> 'Object Not Supported', '[]' -> 'Empty Array
+not Supported', and a nested array '[[1, 2, 3, 4]]' -> 'Malformed
+JSON'. What is accepted: any JSON number, including decimals,
+negatives and exponents, with any surrounding whitespace — ' [
+1.5e0 ,2.25, -0.5,0 ] ' loads fine. JSON_ARRAY(1, 0, 0, 0) (type
+json) converts implicitly as well.
+
+S3 — storage size and the text form
+-----------------------------------
+
+DATALENGTH of a vector(4) is 4 × 4 + 8 = 24 bytes (an 8-byte
+header plus one float32 per dimension — the rule that also makes
+vector(1998) exactly 8,000 bytes). Cast back to a string, a vector
+is rendered as a compact JSON array in scientific notation:
+[0.0000000e+000,3.0000000e+000,4.0000000e+000,0.0000000e+000] — no
+spaces, e+000 exponents. This is also what a client without native
+vector support (sqlcmd included) receives when it selects the
+column directly; it is not corruption, it is the float32 -> text
+rendering. (A CAST(... AS JSON) renders
+[0.0000000000,3.0000000000,...] instead.)
+
+S4 — three metrics, one query vector
+------------------------------------
+
+With q = (1, 0, 0, 0) the dot product v · q is simply the first
+component of v, and ‖q‖ = 1, so each metric is easy to compute:
+
+Remedy       | v            | v · q | ‖v‖ | cosine = 1 − | euclidean =  | dot = −(v ·
+             |              |       |     | (v·q)/(‖v‖·‖ | ‖v − q‖      | q)
+             |              |       |     | q‖)          |              |
+-------------+--------------+-------+-----+--------------+--------------+-------------
+1 Chamomile  | (2, 0, 0, 0) | 2     | 2   | 1 − 1 = 0    | ‖(1,0,0,0)‖  | −2
+             |              |       |     |              | = 1          |
+-------------+--------------+-------+-----+--------------+--------------+-------------
+2 Peppermint | (0, 3, 4, 0) | 0     | 5   | 1 − 0 = 1    | √(1+9+16) =  | 0
+             |              |       |     |              | √26 ≈ 5.0990 |
+-------------+--------------+-------+-----+--------------+--------------+-------------
+3 Elderberry | (3, 0, 4, 0) | 3     | 5   | 1 − 0.6 =    | √(4+0+16) =  | −3
+             |              |       |     | 0.4          | √20 ≈ 4.4721 |
+-------------+--------------+-------+-----+--------------+--------------+-------------
+4 Valerian   | (1, 1, 1, 1) | 1     | 2   | 1 − 0.5 =    | √(0+1+1+1) = | −1
+             |              |       |     | 0.5          | √3 ≈ 1.7321  |
+-------------+--------------+-------+-----+--------------+--------------+-------------
+5 Guarana    | (−2, 0, 0,   | −2    | 2   | 1 − (−1) = 2 | ‖(−3,0,0,0)‖ | 2
+             | 0)           |       |     |              | = 3          |
+-------------+--------------+-------+-----+--------------+--------------+-------------
+6 Placebo    | NULL         |       |     | NULL         | NULL         | NULL
+
+Three lessons sit in this table. Cosine ignores magnitude:
+Chamomile (2, 0, 0, 0) is at distance 0 from q although it is
+twice as long. Euclidean rewards shortness: Valerian, which has
+only a quarter of its "energy" in the calming axis, is the
+second-nearest by euclidean simply because it is short, while the
+strongly calming Elderberry sits far away. 'dot' returns the
+NEGATIVE dot product so that, like the other two metrics, smaller
+means closer — that is why the row for Guarana, which points the
+opposite way, shows the largest value (+2) and why the perfectly
+aligned Chamomile shows −2, not +2. Every metric returns NULL when
+either vector is NULL; the CAST(... AS DECIMAL(10,4)) in the query
+only hides float32 noise (the raw cosine for Elderberry prints as
+0.39999997615814209).
+
+S5 — VECTOR_NORM
+----------------
+
+VECTOR_NORM(v, norm_type) returns a float magnitude: 'norm2' is
+√Σvᵢ² (the Euclidean length), 'norm1' is Σ|vᵢ|, 'norminf' is
+max|vᵢ|. Peppermint (0, 3, 4, 0): √25 = 5, 0+3+4+0 = 7, max = 4.
+Valerian (1, 1, 1, 1): √4 = 2, 4, 1. The absolute values matter:
+Guarana (−2, 0, 0, 0) has norm 2 under all three. An unknown norm
+name fails with Msg 42210 The requested norm function 'euclidean'
+is not supported by vector_norm/vector_normalize. Please provide a
+valid norm function. — note the metric names of VECTOR_DISTANCE
+and the norm names of VECTOR_NORM/VECTOR_NORMALIZE are two
+different vocabularies. VECTOR_NORMALIZE(v, 'norm2') divides v by
+its L2 norm; on Peppermint it yields
+[0.0000000e+000,6.0000002e-001,8.0000001e-001,0.0000000e+000] (0.6
+and 0.8 in float32).
+
+S6 — only three metric names exist
+----------------------------------
+
+'cosine', 'euclidean' and 'dot' are the complete list. 'manhattan'
+is rejected at execution with error 42201 and the metric name
+echoed back. The name is matched case-insensitively ('COSINE'
+works) and may come from a variable, but it must be one of the
+three; there is no L1 distance metric, even though VECTOR_NORM has
+an L1 norm.
+
+S7 — the subtle one: no implicit conversion inside VECTOR_DISTANCE
+------------------------------------------------------------------
+
+Implicit varchar -> vector conversion happens on ASSIGNMENT:
+INSERT into a vector(4) column and DECLARE @q VECTOR(4) = '[...]'
+both accept a string. VECTOR_DISTANCE, however, requires its two
+vector arguments to already be of type vector; a string literal is
+not converted for you, and the function fails with error 8116
+(Argument data type varchar is invalid for argument 3 of
+vector_distance function.) — before the array's length is even
+examined. Either declare a variable (as S4 does) or cast inline:
+VECTOR_DISTANCE('cosine', Effect, CAST('[1, 0, 0, 0]' AS
+VECTOR(4))) succeeds and returns 0.
+
+S8 — vectors cannot be compared
+-------------------------------
+
+The vector type supports no comparison operators: = fails with
+error 8117 (Operand data type vector is invalid for equal to
+operator.), and ORDER BY Effect fails with Msg 42213 The vector
+data types cannot be compared or sorted, except when using the IS
+NULL operator. Consequently a vector column cannot be a key,
+cannot carry UNIQUE/CHECK/DEFAULT constraints, and cannot be
+indexed by a B-tree or columnstore index (a vector index is the
+only kind). "Find the identical vector" must be expressed as a
+distance of 0, and IS NULL / IS NOT NULL are the only predicates
+that apply directly to the column.
+
+S9 vs S10 — the NULL row sneaks into the top k
+----------------------------------------------
+
+SELECT TOP (k) ... ORDER BY VECTOR_DISTANCE(...) is the exact
+k-nearest-neighbour pattern: every row's distance is computed and
+sorted. In S9 the distance for Placebo is NULL, and in T-SQL NULL
+SORTS FIRST IN ASCENDING ORDER, so the top 3 becomes Placebo
+(NULL), Chamomile (0), Elderberry (0.4) — Valerian, a genuine
+neighbour, is pushed out by a row that has no embedding at all.
+S10 adds WHERE Effect IS NOT NULL and returns the true top 3:
+Chamomile 0, Elderberry 0.4, Valerian 0.5. Whenever the vector
+column is nullable (rows whose embedding has not been generated
+yet are common), filter the NULLs before ranking. The RemedyId
+tiebreaker never fires here because all distances are distinct.
+
+S11 — 'dot' ranks by magnitude
+------------------------------
+
+With the negative dot product, Elderberry (−3) ranks above
+Chamomile (−2) although Chamomile points exactly along q and
+Elderberry does not: the raw dot product grows with the length of
+the stored vector. 'dot' is therefore only a sensible ranking
+metric when all stored vectors have the same length — in practice
+when they are pre-normalized, in which case −(v · q) = cos
+distance − 1 and it produces the same order as cosine at lower
+cost. Three metrics, three different second-place remedies
+(cosine: Elderberry; euclidean: Valerian; dot: Chamomile behind
+Elderberry) — the metric string is never cosmetic.
+
+Platform note: on this RTM build (with PREVIEW_FEATURES = ON) a
+DiskANN index CREATE VECTOR INDEX ... WITH (METRIC = 'cosine',
+TYPE = 'diskann') could be built on this 4-dimensional, six-row
+table, and VECTOR_SEARCH(... METRIC = 'cosine', TOP_N = 3)
+returned exactly the rows of S10 (1, 3, 4), silently ignoring the
+NULL row; the read-only table behaviour and the metric-mismatch
+error 42227 of that first-version index are covered in
+vector_index_1.md. The Azure SQL Database WITH APPROXIMATE syntax
+is not available here.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+vector(n) = exactly n float32 values, 4·n + 8 bytes (vector(4) → 24)
+  literal  : a JSON array string '[1, 0, 0, 0]' or JSON_ARRAY(...)   — implicit on INSERT / DECLARE
+  wrong n  : Msg 42204  "The vector dimensions <declared> and <supplied> do not match."
+  bad JSON : Msg 13670  "Input JSON is not a valid Vector : '<reason>'"  (null, string, object, empty, malformed)
+  text form: [2.0000000e+000,0.0000000e+000,...]  (scientific notation, no spaces)
+
+VECTOR_DISTANCE(metric, v1, v2)  → float, NULL if either side is NULL
+  'cosine' = 1 − cosθ   'euclidean' = ‖v1 − v2‖   'dot' = −(v1·v2)   smaller = closer for all three
+  other name → Msg 42201;  string literal as argument → Msg 8116 (CAST it or use a vector variable)
+VECTOR_NORM(v, 'norm2'|'norm1'|'norminf')  → length;  VECTOR_NORMALIZE(v, same names) → unit vector
+
+no = , < , ORDER BY on a vector column (8117 / 42213) — only IS [NOT] NULL
+exact kNN: SELECT TOP (k) ... WHERE v IS NOT NULL ORDER BY VECTOR_DISTANCE(...)  — NULL sorts FIRST in ASC
+
+If a question shows a nullable vector column and TOP (k) ... ORDER
+BY VECTOR_DISTANCE, look for the IS NOT NULL filter; if it shows a
+string literal passed straight to VECTOR_DISTANCE, the statement
+fails; and if the metric is 'dot' on un-normalized vectors, the
+longest vector wins, not the best-aligned one.
