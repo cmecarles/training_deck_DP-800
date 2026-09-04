@@ -129,6 +129,7 @@ Each question is self-contained (own database, schema, and tables), deterministi
 | Design and implement retrieval-augmented generation (RAG) | [rag_structured_to_json_1.md](rag_structured_to_json_1.md) | `FOR JSON PATH`/`JSON_ARRAYAGG`/`STRING_AGG` → `JSON_OBJECT` payload, escaping traps (`JSON_QUERY`, `STRING_ESCAPE`), `sp_invoke_external_rest_endpoint` `@headers`/`@credential`/`@timeout` — db `LoanAdvisor` |
 | Design and implement retrieval-augmented generation (RAG) | [rag_extract_responses_1.md](rag_extract_responses_1.md) | Envelope `$.result`/`$.response.status.http.code`, `JSON_VALUE` vs `JSON_QUERY` vs `OPENJSON WITH`, 4000-char limit (Msg 13625), structured output parsed twice — db `RepairPilot` |
 | Design and implement models and embeddings | [azure_sql_external_model_vector_1.md](azure_sql_external_model_vector_1.md) | **Hands-on (Azure).** Azure OpenAI embedding deployment, managed-identity credential, `CREATE EXTERNAL MODEL`, `AI_GENERATE_EMBEDDINGS`, `vector(1536)` storage, version-3 DiskANN index (100-row minimum, full DML, `WITH APPROXIMATE`), `TOP_N` 42274 — db `SeedVault` |
+| Design and implement models and embeddings | [foundry_embedding_maintenance_1.md](foundry_embedding_maintenance_1.md) | Microsoft Foundry in the embedding pipeline: Azure OpenAI → Foundry resource upgrade, Cohere `embed-v-4-0` from the catalog, `CREATE EXTERNAL MODEL` stays on `*.openai.azure.com` (Foundry FQDN not allow-listed), managed identity + `disableLocalAuth`, routines vs Logic Apps vs retiring prompt flow — db `TransitTimes` |
 | Design and implement intelligent search | [full_text_search_2.md](full_text_search_2.md) | `FORMSOF(INFLECTIONAL)` vs `FORMSOF(THESAURUS)`, `tsenu.xml` expansion vs replacement sets, `sp_fulltext_load_thesaurus_file`, `FREETEXT` implicit stemming, `LANGUAGE 0x0`, `ISABOUT ... WEIGHT`, stoplists — db `AtlasGuides` |
 | Design and implement intelligent search | [search_evaluation_1.md](search_evaluation_1.md) | precision@k, recall@k, reciprocal rank, nDCG@3 over a relevance-judged set, weighted RRF in T-SQL, why P@k ties while RR/nDCG separate — db `DocForge` |
 
@@ -212,7 +213,7 @@ Audit of the 73 task-level bullets in the official study guide (skills measured 
 |---|---|---|
 | Evaluate external models: multimodal, multilanguage, sizes, structured output | Missing | external_models_evaluate_1 |
 | Create and manage external models | Partial (used, not taught) | create_external_model_1 |
-| Embedding maintenance method | Covered | — |
+| Embedding maintenance method | Covered | foundry_embedding_maintenance_1 (Foundry option added) |
 | Which columns to include in embeddings | Missing | embedding_columns_1 |
 | Chunks for embeddings | Missing | chunking_1 |
 | Generate embeddings | Partial | generate_embeddings_1, azure_sql_external_model_vector_1 |
@@ -238,7 +239,7 @@ The 17 conceptual questions of the first batch were re-checked claim by claim ag
 
 - Bullets closed or deepened: data types and sizes, MCP tool options in a chat session, ledger databases and digests, Azure SQL service tiers, DAB pagination and filtering, Azure DevOps pipelines, audit retention, IQP by compatibility level, optimized locking, thesaurus and inflectional full-text search, search evaluation metrics.
 - **Hands-on questions** (`azure_sql_*` and `fabric_*`): lab questions to run from your own Azure subscription or Fabric capacity. Their Statement contains the provisioning steps (Azure CLI or Fabric portal), a cost/cleanup note and teardown; the question then asks about deterministic outcomes. They are docs-based, not engine-verified, and each says so in its closing line.
-- Still to be added from the learning-path audit: `window_functions_2`, `triggers_2`, `query_store_hints_1`, `deadlock_xevents_retry_1`, `vector_search_2`, `columnstore_maintenance_1`, `foundry_embedding_maintenance_1`.
+- Still to be added from the learning-path audit: `window_functions_2`, `triggers_2`, `query_store_hints_1`, `deadlock_xevents_retry_1`, `vector_search_2`, `columnstore_maintenance_1`.
 
 ## Instructor-Examiner companions
 
