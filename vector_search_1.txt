@@ -299,6 +299,9 @@ nothing here because all five distances are distinct, but with
 real embeddings a deterministic tiebreaker is the only way to make
 the row order fully reproducible.
 
+Conceptual question (Azure / tooling); not executed against an
+engine.
+
 DP-800 Exam Rule to Remember
 ----------------------------
 

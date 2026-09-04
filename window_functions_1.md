@@ -227,6 +227,8 @@ The signature of `RANGE` is that **tied rows show the same running total**: 450.
 
 The final `ORDER BY Category, FinishTime, BibNumber` sorts `Elite` before `Masters` (ascending `VARCHAR` order), then by finish time, and resolves the three ties by bib: 101 before 205, 122 before 130, 217 before 233 — matching the expected grid exactly. Without `BibNumber`, the relative order of each tied pair would be an implementation accident and constraint 3 would be violated. This is the mirror image of the previous trap: ties must survive *inside* `OVER (...)` and must be eliminated *outside* it.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 A window `ORDER BY` and the presentation `ORDER BY` are two different instruments, and ties are treated oppositely in each:

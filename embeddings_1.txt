@@ -8,8 +8,8 @@ Statement
 A cooking-recipe platform stores its catalog in an Azure SQL
 Database named RecipeBox.
 
-The database uses the DTU PURCHASING MODEL at the STANDARD S1
-service objective, and the team is not allowed to change the
+The database uses the DTU PURCHASING MODEL AT THE STANDARD S1
+SERVICE OBJECTIVE, and the team is not allowed to change the
 service objective.
 
 Recipes are stored in the following table:
@@ -23,8 +23,8 @@ CREATE TABLE Kitchen.Recipes
     Embedding   vector(1536) NULL
 );
 
-An external model has already been registered in the database
-and works correctly:
+An external model has already been registered in the database and
+works correctly:
 
 CREATE EXTERNAL MODEL RecipeEmbeddingModel
 WITH (
@@ -42,28 +42,28 @@ Ingredients, and Steps.
 
 The solution must satisfy ALL of the following requirements:
 
-1. A user's INSERT or UPDATE transaction must NOT wait for the
-   embedding model call, and the user's write must SUCCEED even
-   when the Azure OpenAI endpoint is unreachable.
+1. A user's INSERT or UPDATE transaction must NOT WAIT FOR THE
+   EMBEDDING MODEL CALL, and the user's write must SUCCEED EVEN
+   WHEN THE AZURE OPENAI ENDPOINT IS UNREACHABLE.
 2. A new or edited recipe must get a refreshed embedding in NEAR
    REAL TIME (within about a minute under normal operation), not
    on a daily cadence.
-3. If the embedding processor is OFFLINE for up to one day
+3. If the embedding processor is OFFLINE FOR UP TO ONE DAY
    (deployment, outage), every recipe changed during that time
-   must still be embedded automatically after the processor
-   comes back. No change may be missed.
+   must still be embedded automatically after the processor comes
+   back. No change may be missed.
 4. Only the rows that actually changed may be reprocessed.
-   Re-embedding the entire table is NOT acceptable because every
+   Re-embedding the entire table is NOT ACCEPTABLE because every
    model call is billed.
-5. Every feature used must be SUPPORTED on the current service
-   objective (Azure SQL Database, DTU model, Standard S1).
+5. Every feature used must be SUPPORTED ON THE CURRENT SERVICE
+   OBJECTIVE (Azure SQL Database, DTU model, Standard S1).
 
 Which architecture should you implement?
 
 a.
 
-Generate the embedding inside the database transaction with a
-DML trigger:
+Generate the embedding inside the database transaction with a DML
+trigger:
 
 CREATE TRIGGER Kitchen.trg_Recipes_Embed
 ON Kitchen.Recipes
@@ -83,8 +83,8 @@ END;
 
 b.
 
-Enable change tracking and process changes with an Azure
-Function that uses the SQL trigger binding:
+Enable change tracking and process changes with an Azure Function
+that uses the SQL trigger binding:
 
 ALTER DATABASE RecipeBox
 SET CHANGE_TRACKING = ON
@@ -117,9 +117,9 @@ EXEC sys.sp_cdc_enable_table
 GO
 
 A timer-triggered Azure Function runs every 30 seconds, reads
-cdc.fn_cdc_get_net_changes_Kitchen_Recipes for the new LSN
-range, calls the embedding model for the changed rows only, and
-updates Kitchen.Recipes.Embedding.
+cdc.fn_cdc_get_net_changes_Kitchen_Recipes for the new LSN range,
+calls the embedding model for the changed rows only, and updates
+Kitchen.Recipes.Embedding.
 
 d.
 
@@ -145,47 +145,65 @@ The correct answer is b.
 The question is a constraint-matching exercise. Evaluate every
 option against the five numbered requirements:
 
-Requirement                                  | a (sync trigger) | b (change tracking + SQL trigger binding) | c (CDC polling) | d (nightly full re-embed)
----------------------------------------------+------------------+-------------------------------------------+-----------------+--------------------------
-1. No model call inside the user transaction | VIOLATED         | satisfied                                 | satisfied       | satisfied
-2. Near-real-time freshness                  | satisfied        | satisfied                                 | satisfied       | VIOLATED
-3. No missed changes across a one-day outage | satisfied        | satisfied                                 | satisfied       | satisfied
-4. Changed rows only                         | satisfied        | satisfied                                 | satisfied       | VIOLATED
-5. Supported at Standard S1 (DTU model)      | satisfied        | satisfied                                 | VIOLATED        | satisfied
+Requirement  | a (sync      | b (change    | c (CDC       | d (nightly
+             | trigger)     | tracking +   | polling)     | full
+             |              | SQL trigger  |              | re-embed)
+             |              | binding)     |              |
+-------------+--------------+--------------+--------------+-------------
+1. No model  | VIOLATED     | satisfied    | satisfied    | satisfied
+call inside  |              |              |              |
+the user     |              |              |              |
+transaction  |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+2. Near-real | satisfied    | satisfied    | satisfied    | VIOLATED
+-time        |              |              |              |
+freshness    |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+3. No missed | satisfied    | satisfied    | satisfied    | satisfied
+changes      |              |              |              |
+across a     |              |              |              |
+one-day      |              |              |              |
+outage       |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+4. Changed   | satisfied    | satisfied    | satisfied    | VIOLATED
+rows only    |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+5. Supported | satisfied    | satisfied    | VIOLATED     | satisfied
+at Standard  |              |              |              |
+S1 (DTU      |              |              |              |
+model)       |              |              |              |
 
 Only option b satisfies all five.
 
 Why option b is correct
 -----------------------
 
-The Azure SQL trigger binding for Azure Functions is built on
-SQL CHANGE TRACKING. The documented behavior maps to each
-requirement:
+The Azure SQL trigger binding for Azure Functions is built on SQL
+CHANGE TRACKING. The documented behavior maps to each requirement:
 
-- Requirement 1 — decoupled writes. Change tracking records,
+- REQUIREMENT 1 — DECOUPLED WRITES. Change tracking records,
   synchronously and cheaply, only the primary-key values of
   changed rows in internal side tables. The user's INSERT/UPDATE
   never calls the model endpoint. The Function's polling loop
   (default PollingIntervalMs = 1000 ms) runs completely outside
-  the user transaction, so an Azure OpenAI outage delays
-  embedding refresh but never blocks or fails a user write.
-- Requirement 2 — near real time. The binding polls for changes
+  the user transaction, so an Azure OpenAI outage delays embedding
+  refresh but never blocks or fails a user write.
+- REQUIREMENT 2 — NEAR REAL TIME. The binding polls for changes
   about once per second and delivers them in batches, so
   embeddings refresh within seconds under normal operation.
-- Requirement 3 — no missed changes. The binding persists its
+- REQUIREMENT 3 — NO MISSED CHANGES. The binding persists its
   progress in leases/state tables in the az_func schema and, per
   the documentation, "picks up processing changes where it left
-  off" after a restart or broken connection. With
-  CHANGE_RETENTION = 2 DAYS, the database retains change history
-  longer than the stated one-day maximum outage, so changes made
-  while the Function is down are still delivered when it
-  resumes.
-- Requirement 4 — changed rows only. Change tracking answers
+  off" after a restart or broken connection. With CHANGE_RETENTION
+  = 2 DAYS, the database retains change history longer than the
+  stated one-day maximum outage, so changes made while the
+  Function is down are still delivered when it resumes.
+- REQUIREMENT 4 — CHANGED ROWS ONLY. Change tracking answers
   exactly the question "which rows changed since version X?", so
   only modified recipes are re-embedded.
-- Requirement 5 — tier support. Change tracking is supported in
-  Azure SQL Database with no service-tier restriction, so it
-  works at Standard S1.
+- REQUIREMENT 5 — TIER SUPPORT. Change tracking is supported in
+  Azure SQL Database with no service-tier restriction, so it works
+  at Standard S1.
 
 Why option a is wrong
 ---------------------
@@ -193,14 +211,14 @@ Why option a is wrong
 Option a VIOLATES REQUIREMENT 1.
 
 An AFTER DML trigger executes INSIDE THE USER'S TRANSACTION.
-AI_GENERATE_EMBEDDINGS performs an HTTPS REST call to the
-external model endpoint at execution time, so:
+AI_GENERATE_EMBEDDINGS performs an HTTPS REST call to the external
+model endpoint at execution time, so:
 
-- Every recipe INSERT/UPDATE now waits for a network round trip
-  to Azure OpenAI, adding the model latency directly to the
-  user's write path.
-- If the endpoint is unreachable or throttled, the trigger
-  raises an error and the USER'S TRANSACTION FAILS, exactly what
+- Every recipe INSERT/UPDATE now waits for a network round trip to
+  Azure OpenAI, adding the model latency directly to the user's
+  write path.
+- If the endpoint is unreachable or throttled, the trigger raises
+  an error and the USER'S TRANSACTION FAILS, exactly what
   requirement 1 forbids.
 
 The option is otherwise fresh and incremental, but a synchronous
@@ -214,21 +232,21 @@ Why option c is wrong
 Option c VIOLATES REQUIREMENT 5.
 
 In Azure SQL Database, change data capture is supported for any
-vCore service tier, but in the DTU purchasing model CDC REQUIRES
+vCore service tier, but in the DTU PURCHASING MODEL CDC REQUIRES
 S3 OR HIGHER; THE SUBCORE TIERS (BASIC, S0, S1, S2) ARE NOT
 SUPPORTED. The scenario pins the database to STANDARD S1 and
 forbids scaling, so sys.sp_cdc_enable_db is not a usable choice
 here.
 
-Even where the tier allows it, CDC is heavier than the task
-needs: it asynchronously scans the transaction log (the Azure
-SQL Database capture scheduler runs every 20 seconds, with no
-latency SLA), and it copies the FULL COLUMN VALUES — including
-the nvarchar(max) Ingredients and Steps — into change tables,
-when the embedding processor only needs to know WHICH rows
-changed and can read the current values from Kitchen.Recipes
-itself. When you only need "which rows changed", change tracking
-is the documented lightweight fit.
+Even where the tier allows it, CDC is heavier than the task needs:
+it asynchronously scans the transaction log (the Azure SQL
+Database capture scheduler runs every 20 seconds, with no latency
+SLA), and it copies the FULL COLUMN VALUES — including the
+nvarchar(max) Ingredients and Steps — into change tables, when the
+embedding processor only needs to know which rows changed and can
+read the current values from Kitchen.Recipes itself. When you only
+need "which rows changed", change tracking is the documented
+lightweight fit.
 
 Why option d is wrong
 ---------------------
@@ -244,14 +262,17 @@ Option d VIOLATES REQUIREMENTS 2 AND 4.
   changed-rows-only requirement.
 
 Logic Apps is a legitimate embedding-maintenance option in
-general, but only when the workflow is driven by DETECTED
-CHANGES, not by a blind full-table recurrence.
+general, but only when the workflow is driven by detected changes,
+not by a blind full-table recurrence.
+
+Conceptual question (Azure / tooling); not executed against an
+engine.
 
 DP-800 Exam Rule to Remember
 ----------------------------
 
-Choosing an embedding MAINTENANCE method is a
-constraint-matching exercise. Anchor on three questions:
+Choosing an embedding MAINTENANCE method is a constraint-matching
+exercise. Anchor on three questions:
 
 1. May the user's write transaction pay for the model call?
    -> If no: rule out synchronous DML triggers that call the model.
@@ -264,9 +285,9 @@ constraint-matching exercise. Anchor on three questions:
    -> CDC: full before/after data from the log scan; in Azure SQL Database it is
       NOT supported on DTU subcore tiers (Basic, S0, S1, S2) - S3+ or vCore only.
 
-The AZURE FUNCTIONS SQL TRIGGER BINDING is the packaged answer
-for "decoupled, near-real-time, no missed changes": it is built
-on change tracking, polls outside the user transaction, and
-persists its position in az_func leases tables so it resumes
-where it left off — as long as CHANGE_RETENTION covers the
-longest expected processor downtime.
+The AZURE FUNCTIONS SQL TRIGGER BINDING is the packaged answer for
+"decoupled, near-real-time, no missed changes": it is built on
+change tracking, polls outside the user transaction, and persists
+its position in az_func leases tables so it resumes where it left
+off — as long as CHANGE_RETENTION covers the longest expected
+processor downtime.

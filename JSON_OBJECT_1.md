@@ -131,6 +131,8 @@ Keys appear exactly in the order the `key : value` pairs are listed in the `JSON
 - Writing the outer object as `JSON_OBJECT(... 'online': d.IsOnline NULL ON NULL)` is exactly equivalent — it only spells out the default.
 - `JSON_OBJECT('ip': d.IpAddress, 'gw': ISNULL(d.Gateway, ...))` is **not** equivalent to `ABSENT ON NULL`; there is no substitution value that removes a key.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 The JSON constructor family has **two different defaults**:

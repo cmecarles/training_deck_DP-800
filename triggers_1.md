@@ -230,6 +230,8 @@ Option d gets `Lending.Books` right but claims `LoanCount = 0` in both audit row
 
 `SET` statements do reset `@@ROWCOUNT` to 0 — but order matters. In this trigger, `DECLARE @RowsInserted int = @@ROWCOUNT;` is the **first** statement of the body, so it captures 3 (statement S1) and 1 (statement S2) before `SET NOCOUNT ON` executes. Had the two lines been swapped, `@RowsInserted` would have read 0, the `IF @RowsInserted = 0 RETURN;` guard would have exited immediately, and **no audit rows at all** would have been written (not even option d's two zero rows) — that fragility is exactly why the capture-first pattern is the documented convention.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 In SQL Server, a DML trigger is a **per-statement** object, never a per-row one:

@@ -133,6 +133,8 @@ Every nonclustered index row carries a **row locator** pointing at its base-tabl
 
 One last myth for completeness: a clustered index defines the *logical* order of the data and is not a promise that pages sit physically contiguous on disk, nor that `SELECT ... FROM Park.Sessions` without `ORDER BY` will return rows in `EntryTime` order. Order of results is guaranteed only by `ORDER BY`.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 ```text

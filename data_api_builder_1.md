@@ -280,6 +280,8 @@ Enabling the endpoints is not enough — this option silently accepts **both** s
 
 The violating keys are the missing `entities.GetExhibitsByEra.rest.methods` (must be `[ "get" ]`) and the missing `entities.GetExhibitsByEra.graphql.operation` (must be `"query"`).
 
+Conceptual question (Azure / tooling); not executed against an engine.
+
 ## DP-800 Exam Rule to Remember
 
 In a DAB `dab-config.json`, the object type drives the configuration:

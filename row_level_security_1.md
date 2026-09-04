@@ -203,6 +203,8 @@ Option c correctly combines:
 3. **BLOCK PREDICATE AFTER UPDATE**
    - Prevents modifying a row so that it belongs to another tenant.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 **FILTER** = Which existing rows can this principal access?

@@ -158,6 +158,8 @@ There is no `BEGIN TRANSACTION`, so each `INSERT` is its own autocommit transact
 
 Hence exactly `(1, PKG0000001, 2.50)` and `(7, PKG0000007, 4.10)`, in `ORDER BY LabelID`.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 ```text

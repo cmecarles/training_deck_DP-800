@@ -1,0 +1,358 @@
+============================================================
+ SQL Server question — Copilot for SQL in Fabric 1
+============================================================
+
+Statement
+---------
+
+Orchard Coop, a fruit-growers' cooperative, keeps its member CRM
+in a SQL DATABASE IN FABRIC named OrchardCrm and its harvest facts
+in a FABRIC DATA WAREHOUSE named OrchardDW. Both live in the
+workspace ws-dp800-orchard. The Fabric tenant's home region is
+CANADA CENTRAL. You will enable and exercise Copilot on both
+items, then pick the plan that satisfies the cooperative's rules.
+
+PREREQUISITES. You are a Fabric tenant admin (or can ask one) and
+a workspace Admin. Copilot needs a PAID F2+ or P1+ capacity: to
+actually see it working you need to assign the workspace to a paid
+capacity at least for the exercise; the observation steps on a
+trial capacity are part of the lab.
+
+Part 1 — Build the lab
+----------------------
+
+1. WORKSPACES > NEW WORKSPACE > ws-dp800-orchard > ADVANCED >
+   choose your TRIAL capacity for now > APPLY.
+2. NEW ITEM > SQL DATABASE > OrchardCrm > CREATE. In the query
+   editor (NEW QUERY) run:
+
+sql CREATE SCHEMA Crm; GO CREATE TABLE Crm.Grower (GrowerID int
+PRIMARY KEY, GrowerName varchar(80) NOT NULL, Region varchar(40)
+NOT NULL); CREATE TABLE Crm.Delivery (DeliveryID int PRIMARY KEY,
+GrowerID int NOT NULL REFERENCES Crm.Grower(GrowerID), Fruit
+varchar(30) NOT NULL, Kg decimal(9,2) NOT NULL, DeliveredOn date
+NOT NULL); INSERT INTO Crm.Grower VALUES (1,'Hillcrest
+Farm','Okanagan'), (2,'Bright Acres','Niagara'), (3,'Cedar
+Row','Okanagan'); INSERT INTO Crm.Delivery VALUES
+(10,1,'Apple',1200.50,'2026-08-20'),
+(11,2,'Peach',430.00,'2026-08-21'),
+(12,3,'Apple',980.25,'2026-08-22'),
+(13,1,'Pear',300.00,'2026-08-23');
+
+3. NEW ITEM > WAREHOUSE > OrchardDW > CREATE. In its query editor
+   run:
+
+sql CREATE TABLE dbo.HarvestFact (HarvestID int NOT NULL, Region
+varchar(40) NOT NULL, Fruit varchar(30) NOT NULL, Kg decimal(9,2)
+NOT NULL, HarvestDate date NOT NULL); INSERT INTO dbo.HarvestFact
+VALUES (1,'Okanagan','Apple',5000.00,'2026-08-15'),
+(2,'Niagara','Peach',2100.00,'2026-08-16');
+
+Part 2 — Tenant settings (Admin portal)
+---------------------------------------
+
+4. Open SETTINGS (GEAR) > ADMIN PORTAL > TENANT SETTINGS and
+   expand the group COPILOT AND AI. Record the state of:
+   - USERS CAN USE COPILOT AND OTHER FEATURES POWERED BY AZURE
+     OPENAI
+   - DATA SENT TO AZURE OPENAI CAN BE PROCESSED OUTSIDE YOUR
+     CAPACITY'S GEOGRAPHIC REGION, COMPLIANCE BOUNDARY, OR
+     NATIONAL CLOUD INSTANCE
+   - DATA SENT TO AZURE OPENAI CAN BE STORED OUTSIDE YOUR
+     CAPACITY'S GEOGRAPHIC REGION, COMPLIANCE BOUNDARY, OR
+     NATIONAL CLOUD INSTANCE
+   - USERS CAN USE COPILOT, AI AGENTS AND OTHER AI EXPERIENCES
+     POWERED BY OPENAI AS A MICROSOFT SUBPROCESSOR
+   - CAPACITIES CAN BE DESIGNATED AS COPILOT IN FABRIC CAPACITIES
+
+For each setting note whether it can be applied to SPECIFIC
+SECURITY GROUPS and whether it can be DELEGATED to capacity admins
+(CAPACITY SETTINGS > your capacity > DELEGATED TENANT SETTINGS).
+
+Part 3 — Exercise Copilot
+-------------------------
+
+5. Open OrchardCrm, NEW QUERY, and select the COPILOT ribbon
+   button. Observe the pane while the workspace is on the trial
+   capacity. Then move the workspace to a paid capacity (WORKSPACE
+   SETTINGS > WORKSPACE TYPE > EDIT > FABRIC CAPACITY > pick the F
+   SKU) and reopen the pane.
+6. At the bottom of the chat pane locate the EXECUTION MODE
+   SELECTOR with the options READ-ONLY and READ AND WRITE WITH
+   APPROVAL. In READ-ONLY mode type show the total kilograms
+   delivered per region and observe whether a query runs. Then
+   type create a table Crm.Payout with PayoutID int and Amount
+   decimal(9,2) and observe. Switch the mode and repeat the second
+   prompt.
+7. In the editor, paste SELECT GrowerName, SUM(Kg) FROM
+   Crm.Delivery d JOIN Crm.Grower g ON g.GrowerID = d.GrowerId
+   GROUP BY Region (note the deliberate mistakes), highlight it,
+   and look at the EXPLAIN and FIX buttons next to RUN. Select FIX
+   before running; then RUN, then FIX again.
+8. Open the database SETTINGS > COPILOT pane and find SHOW COPILOT
+   COMPLETIONS; also look at the status bar at the bottom of the
+   query editor. Type -- list growers with more than 1000 kg
+   delivered on a new line and wait for ghost text; press TAB.
+9. Open OrchardDW, NEW SQL QUERY, select COPILOT on the ribbon,
+   ask count deliveries by fruit, then ask now only for Okanagan
+   and observe whether the second prompt is understood in context.
+   Repeat step 7 in the warehouse.
+10. Open the SQL ANALYTICS ENDPOINT of OrchardCrm and check
+    whether a COPILOT button exists there too.
+
+The cooperative's rules
+-----------------------
+
+1. Copilot must be available in OrchardCrm and OrchardDW ONLY to
+   the security group sg-orchard-analysts, in the Canada Central
+   capacity.
+2. In the OrchardCrm chat pane, analysts may let Copilot RUN
+   SELECT QUERIES, but Copilot must NEVER EXECUTE DDL or DML.
+3. Inline ghost-text completions must be SWITCHED OFF IN
+   ORCHARDCRM (auditors do not want unreviewed code inserted),
+   while the chat pane, EXPLAIN and FIX stay available.
+4. The compliance officer needs a one-paragraph statement of what
+   leaves the tenant when an analyst uses Copilot in OrchardCrm.
+
+Which plan is correct?
+
+a.
+
+Keep the workspace on the paid F2 (or larger) capacity — the trial
+SKU does not support Copilot. In TENANT SETTINGS > COPILOT AND AI,
+leave USERS CAN USE COPILOT AND OTHER FEATURES POWERED BY AZURE
+OPENAI enabled but apply it to sg-orchard-analysts only, and
+enable DATA SENT TO AZURE OPENAI CAN BE PROCESSED OUTSIDE YOUR
+CAPACITY'S GEOGRAPHIC REGION, COMPLIANCE BOUNDARY, OR NATIONAL
+CLOUD INSTANCE (also scoped to the group), because Canada Central
+is outside the US and the EU data boundary. In the OrchardCrm chat
+pane set the execution mode to READ-ONLY: SELECT prompts still run
+automatically, while CREATE TABLE is only drafted. Turn off SHOW
+COPILOT COMPLETIONS in the database SETTINGS > COPILOT pane.
+Statement: Copilot receives the prompt, the session's previous
+messages, the text and error messages of queries the analyst
+executed, and the database schema; it has no access to table data,
+prompts are not used to train foundation models, and — because of
+the second setting — requests may be processed by Azure OpenAI
+outside the capacity's region.
+
+b.
+
+Leave the workspace on the trial capacity, which is an
+F64-equivalent and therefore satisfies the "F2 or higher"
+requirement, and enable USERS CAN USE COPILOT AND OTHER FEATURES
+POWERED BY AZURE OPENAI for sg-orchard-analysts. No cross-region
+setting is needed because Copilot always processes requests in the
+capacity's own region. Meet rule 2 by choosing READ AND WRITE WITH
+APPROVAL, since in READ-ONLY mode Copilot cannot run any query,
+including SELECT. Meet rule 3 by disabling completions from the
+same tenant setting.
+
+c.
+
+Same capacity and group scoping as option a, but enable DATA SENT
+TO AZURE OPENAI CAN BE STORED OUTSIDE YOUR CAPACITY'S GEOGRAPHIC
+REGION, COMPLIANCE BOUNDARY, OR NATIONAL CLOUD INSTANCE instead of
+the processed setting — it is the one that unblocks Copilot for
+the SQL database outside the US and EU. Meet rule 2 with READ AND
+WRITE WITH APPROVAL so that the analyst can approve each SELECT.
+Meet rule 3 by removing the analyst's WRITE permission on
+OrchardCrm, which hides the completion feature.
+
+d.
+
+Disable USERS CAN USE COPILOT AND OTHER FEATURES POWERED BY AZURE
+OPENAI for the whole tenant, and instead enable USERS CAN USE
+COPILOT, AI AGENTS AND OTHER AI EXPERIENCES POWERED BY OPENAI AS A
+MICROSOFT SUBPROCESSOR for sg-orchard-analysts; this routes the
+SQL database Copilot to OpenAI-operated models without any
+cross-region setting. Meet rule 2 with READ-ONLY mode. Meet rule 3
+by turning off the SHOW COPILOT COMPLETIONS switch, which also
+disables the FIX and EXPLAIN quick actions since they share the
+completion engine.
+
+CAPACITY AND CLEANUP. Copilot calls consume capacity units of the
+workspace's capacity. When done, WORKSPACE SETTINGS > GENERAL >
+REMOVE THIS WORKSPACE > DELETE, pause the paid F capacity in the
+Azure portal, and revert any tenant settings you changed.
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+The correct answer is a.
+
+Rule         | a            | b (trial +   | c (storage   | d (OpenAI su
+             |              | R/W mode)    | setting)     | bprocessor)
+-------------+--------------+--------------+--------------+-------------
+1. Copilot   | satisfied    | VIOLATED     | VIOLATED     | VIOLATED
+for the      |              | (trial SKU;  | (wrong       | (wrong
+group in     |              | no           | setting)     | setting
+Canada       |              | cross-region |              | group; Azure
+Central      |              | setting)     |              | OpenAI
+             |              |              |              | switch off)
+-------------+--------------+--------------+--------------+-------------
+2. SELECT    | satisfied    | VIOLATED     | VIOLATED     | satisfied
+runs,        | (Read-only)  | (R/W with    |              |
+DDL/DML      |              | approval can |              |
+never        |              | execute DDL) |              |
+executes     |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+3.           | satisfied    | VIOLATED (no | VIOLATED     | VIOLATED
+Completions  |              | such tenant  | (permission  | (Fix/Explain
+off,         |              | switch)      | does not     | are
+Explain/Fix  |              |              | control it)  | independent)
+on           |              |              |              |
+-------------+--------------+--------------+--------------+-------------
+4. Accurate  | satisfied    | —            | —            | —
+data         |              |              |              |
+statement    |              |              |              |
+
+What you observed in the lab
+----------------------------
+
+- TRIAL CAPACITY: "Copilot in Microsoft Fabric isn't supported on
+  trial SKUs. Only paid SKUs (F2 or higher, or P1 or higher) are
+  supported at this time." The trial page itself lists "Copilot
+  and Trusted Workspace Access aren't supported". The pane only
+  becomes usable after the move to the paid capacity (step 5).
+- TENANT SETTINGS live in the COPILOT AND AI group. Enabled by
+  default: Users can use Copilot and other features powered by
+  Azure OpenAI and Capacities can be designated as Copilot in
+  Fabric capacities. Disabled by default: both processed outside
+  settings, the stored outside setting, and the two OpenAI as a
+  Microsoft Subprocessor settings. The Azure OpenAI switch and the
+  subprocessor switch "can be managed at both the tenant and the
+  capacity levels", and every setting can be applied to specific
+  security groups.
+- EXECUTION MODE SELECTOR (step 6): in READ-ONLY mode "Copilot
+  doesn't run Data Definition Language (DDL) or Data Manipulation
+  Language (DML) statements that change data or schema. Instead,
+  Copilot suggests SQL code for you to review and run manually",
+  whereas a SELECT prompt is generated AND RUN AUTOMATICALLY
+  "REGARDLESS OF THE SELECTED MODE". In READ AND WRITE WITH
+  APPROVAL the CREATE TABLE is drafted and Copilot "prompts you to
+  approve execution".
+- FIX (step 7) "only gets enabled after you run your T-SQL query
+  and it has returned an error"; it "automatically takes the SQL
+  error message into context" and leaves a comment where it
+  edited. EXPLAIN works on any highlighted text and writes a
+  summary plus in-line comments.
+- SHOW COPILOT COMPLETIONS (step 8) is a per-database switch in
+  SETTINGS > COPILOT, mirrored in the query editor status bar;
+  completions "use your database schema and query tab context",
+  are accepted with TAB (or word-by-word with CTRL+RIGHT), and
+  cover DDL, DQL and DML.
+- WAREHOUSE COPILOT (steps 9–10) applies to "SQL analytics
+  endpoint and Warehouse", so the button exists on the SQL
+  analytics endpoint too; unlike the SQL database chat pane, the
+  warehouse Copilot "doesn't understand previous inputs", so now
+  only for Okanagan is not resolved against the previous answer,
+  and "natural language to SQL supports English language to
+  T-SQL". Copilot for the warehouse "doesn't use data in tables to
+  generate T-SQL suggestions".
+
+Why option a is correct
+-----------------------
+
+Rule 1 needs three things the option supplies: a paid capacity,
+the group-scoped Azure OpenAI switch, and — for a capacity outside
+the US and the EU data boundary — the PROCESSED OUTSIDE setting:
+"If your tenant or capacity is outside the US or France, Copilot
+is disabled by default unless your Fabric tenant admin enables"
+it. Rule 2 maps to the READ-ONLY execution mode, whose documented
+behaviour is exactly "SELECT runs automatically, DDL/DML is only
+suggested". Rule 3 maps to the SHOW COPILOT COMPLETIONS switch,
+which is independent of chat and of the quick actions. The data
+statement reproduces the privacy article: "In database, Copilot
+can only access the database schema that is accessible in the
+user's database" and by default has access to "previous messages
+sent to and replies from Copilot for that user in that session",
+"contents of SQL query that the user has executed", "error
+messages of a SQL query that the user has executed", and "schemas
+of the database"; "prompts and responses ... aren't used to train
+foundation models".
+
+Why option b is wrong
+---------------------
+
+Three factual errors. The trial capacity is sized like an F64 but
+Copilot is explicitly unsupported on trial SKUs. Outside the US
+and the EU boundary the cross-region processing setting is
+required — Copilot is otherwise disabled. And READ-ONLY mode does
+run SELECT prompts automatically; choosing READ AND WRITE WITH
+APPROVAL would let Copilot execute DDL after a click, which rule 2
+forbids. There is no tenant-level switch for completions; it is a
+database setting.
+
+Why option c is wrong
+---------------------
+
+The stored outside setting "is only applicable for customers who
+want to use Copilot in notebooks and data agents" — it governs
+conversation-history storage across sessions and does nothing for
+the SQL database Copilot; the required switch is the processed
+outside one. READ AND WRITE WITH APPROVAL is the mode in which
+DDL/DML can be executed, the opposite of rule 2 (and SELECT needs
+no approval in either mode). Removing WRITE on the item changes
+what the analyst may do in the database, not whether Copilot shows
+ghost text.
+
+Why option d is wrong
+---------------------
+
+The subprocessor setting enables experiences "powered by
+OpenAI-operated models"; it is a separate, off-by-default
+model-provider option with its own cross-region companion setting
+(Data sent to OpenAI as a Microsoft Subprocessor can be processed
+outside...), not a replacement for the Azure OpenAI switch that
+Copilot for SQL database depends on. Disabling the Azure OpenAI
+switch tenant-wide turns Copilot off for everyone. Finally, FIX
+and EXPLAIN are quick actions with their own prerequisites; the
+completions toggle does not disable them.
+
+Where each capability lives
+---------------------------
+
+Admin portal > Tenant settings > Copilot and AI
+   Users can use Copilot and other features powered by Azure OpenAI ............ ON by default, group-scoped, delegable
+   Data sent to Azure OpenAI can be PROCESSED outside your capacity's region ... OFF; required outside US / EU boundary
+   Data sent to Azure OpenAI can be STORED outside ............................. OFF; notebooks + data agents only
+   Users can use Copilot, AI Agents ... OpenAI as a Microsoft Subprocessor ..... OFF; different model provider
+SQL database query editor      Copilot ribbon button -> chat pane (NL2SQL, doc Q&A, remembers the session)
+                               execution mode: Read-only (SELECT runs, DDL/DML drafted) | Read and write with approval
+                               Explain / Fix next to Run (Fix enabled only after an error)
+                               Settings > Copilot > Show Copilot completions (Tab / Ctrl+Right)
+Warehouse + SQL analytics endpoint   same three surfaces; no memory of previous prompts; English only
+SSMS / VS Code (MSSQL)         Ask mode read-only; Agent mode writes only after approval; execution-plan analysis
+
+Documentation relied upon (ms.date): Copilot and Agent admin
+settings 2026-08-11; Enable and configure Copilot in Fabric
+2026-08-10; Copilot in the SQL database workload overview
+2026-02-26; Copilot chat pane 2025-11-18; Copilot quick actions
+2025-11-18; Copilot code completion 2025-11-18; Privacy, security
+and responsible use of Copilot in the SQL database workload
+2025-11-18; Copilot in the Data Warehouse workload 2026-09-02;
+Fabric trial capacity 2026-08-12.
+
+Hands-on question (Microsoft Fabric capacity required); behaviour
+is taken from the official documentation as of the ms.date cited
+above.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+Copilot for SQL database / Warehouse in Fabric
+  Needs: paid F2+/P1+ (never trial) + "Users can use Copilot ... Azure OpenAI" (ON by default, scope to a group)
+         + outside US/EU boundary: "Data sent to Azure OpenAI can be PROCESSED outside..." (OFF by default)
+  "...STORED outside..." = notebooks/data agents only.  "OpenAI as a Microsoft Subprocessor" = other provider.
+  Chat pane sees: schema + your prompt + session history + executed query text/errors.  Never table data.
+  SQL database chat pane modes: Read-only (SELECT auto-runs, DDL/DML only drafted)
+                                Read and write with approval (DDL/DML run after you approve)
+  Quick actions: Explain (comments) | Fix (enabled only after a run returned an error, uses the error text)
+  Ghost-text completions: per-database Settings > Copilot > Show Copilot completions; Tab accepts.
+  Warehouse Copilot = SQL analytics endpoint + Warehouse; no memory of earlier prompts; English only.

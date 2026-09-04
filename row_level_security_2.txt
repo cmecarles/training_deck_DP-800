@@ -1,10 +1,19 @@
+============================================================
+ SQL Server question — Row-Level Security 2
+============================================================
+
 Statement
+---------
 
-An organization hosts a multi-tenant application in Azure SQL Database.
+An organization hosts a multi-tenant application in Azure SQL
+Database.
 
-Application users do not connect directly to the database. The middle-tier application connects by using the database principal AppUser.
+Application users do not connect directly to the database. The
+middle-tier application connects by using the database principal
+AppUser.
 
-At the beginning of each request, the application sets the current application user's ID:
+At the beginning of each request, the application sets the current
+application user's ID:
 
 EXEC sys.sp_set_session_context
     @key = N'UserId',
@@ -22,28 +31,27 @@ GO
 
 Three database principals already exist:
 
-- AppUser
-  Used only by the middle-tier application.
+- APPUSER — Used only by the middle-tier application.
+- SUPPORTADMIN — Used by support administrators.
+- REPORTINGUSER — Used by a separate reporting workload.
 
-- SupportAdmin
-  Used by support administrators.
+Assume that all three principals have already been granted SELECT
+and INSERT permissions on Sales.OrderData.
 
-- ReportingUser
-  Used by a separate reporting workload.
+You must implement Row-Level Security with the following
+requirements:
 
-Assume that all three principals have already been granted SELECT and INSERT permissions on Sales.OrderData.
-
-You must implement Row-Level Security with the following requirements:
-
-1. AppUser must be able to SELECT only rows where AppUserId matches SESSION_CONTEXT(N'UserId').
-
-2. AppUser must be prevented from inserting a row whose AppUserId does not match SESSION_CONTEXT(N'UserId').
-
-3. SupportAdmin must be able to SELECT all rows and INSERT rows for any AppUserId.
-
-4. ReportingUser must see no rows and must be unable to insert any rows, even if ReportingUser calls sp_set_session_context and supplies a valid UserId.
-
-5. The solution must be enforced by Azure SQL Database and must not depend on application WHERE clauses.
+1. AppUser must be able to SELECT only rows where AppUserId
+   matches SESSION_CONTEXT(N'UserId').
+2. AppUser must be prevented from inserting a row whose AppUserId
+   does not match SESSION_CONTEXT(N'UserId').
+3. SupportAdmin must be able to SELECT all rows and INSERT rows
+   for any AppUserId.
+4. ReportingUser must see no rows and must be unable to insert any
+   rows, even if ReportingUser calls sp_set_session_context and
+   supplies a valid UserId.
+5. The solution must be enforced by Azure SQL Database and must
+   not depend on application WHERE clauses.
 
 You create the following schema:
 
@@ -51,7 +59,6 @@ CREATE SCHEMA Security;
 GO
 
 Which implementation should you use?
-
 
 a.
 
@@ -83,7 +90,6 @@ ADD BLOCK PREDICATE
     ON Sales.OrderData AFTER INSERT
 WITH (STATE = ON);
 GO
-
 
 b.
 
@@ -121,7 +127,6 @@ ADD BLOCK PREDICATE
 WITH (STATE = ON);
 GO
 
-
 c.
 
 CREATE FUNCTION Security.fn_OrderAccess
@@ -152,7 +157,6 @@ ADD BLOCK PREDICATE
     ON Sales.OrderData AFTER INSERT
 WITH (STATE = ON);
 GO
-
 
 d.
 
@@ -190,12 +194,10 @@ ADD BLOCK PREDICATE
 WITH (STATE = ON);
 GO
 
-
 Correct Answer
 --------------
 
 b
-
 
 Explanation
 -----------
@@ -207,21 +209,26 @@ This question tests two independent RLS concepts:
 1. The application-level identity stored in SESSION_CONTEXT.
 2. The actual database principal executing the statement.
 
-The important trap is that SESSION_CONTEXT by itself is not an authorization boundary.
+The important trap is that SESSION_CONTEXT BY ITSELF IS NOT AN
+AUTHORIZATION BOUNDARY.
 
-A database session can set values in its own session context. Therefore, if a predicate checks only:
+A database session can set values in its own session context.
+Therefore, if a predicate checks only:
 
-    @AppUserId = CAST(SESSION_CONTEXT(N'UserId') AS int)
+@AppUserId = CAST(SESSION_CONTEXT(N'UserId') AS int)
 
-then another database principal that already has SELECT or INSERT permission could potentially set UserId to a chosen value and satisfy the predicate.
+then another database principal that already has SELECT or INSERT
+permission could potentially set UserId to a chosen value and
+satisfy the predicate.
 
 The RLS predicate must therefore verify BOTH:
 
 - that the executing database principal is AppUser, and
-- that the row's AppUserId matches the application UserId in SESSION_CONTEXT.
+- that the row's AppUserId matches the application UserId in
+  SESSION_CONTEXT.
 
-SupportAdmin must be handled as a separate explicitly authorized database principal.
-
+SupportAdmin must be handled as a separate explicitly authorized
+database principal.
 
 Why option b is correct
 -----------------------
@@ -244,7 +251,8 @@ For AppUser:
 - The database-principal check succeeds.
 - The row must additionally match SESSION_CONTEXT(N'UserId').
 - The FILTER predicate limits SELECT visibility.
-- The AFTER INSERT BLOCK predicate prevents inserting a row for another application user.
+- The AFTER INSERT BLOCK predicate prevents inserting a row for
+  another application user.
 
 For SupportAdmin:
 
@@ -257,16 +265,13 @@ For ReportingUser:
 - ReportingUser is neither AppUser nor SupportAdmin.
 - Even if ReportingUser executes:
 
-    EXEC sys.sp_set_session_context
-        @key = N'UserId',
-        @value = 42;
+sql EXEC sys.sp_set_session_context @key = N'UserId', @value = 42;
 
-  the AppUser database-principal check still fails.
+the AppUser database-principal check still fails.
 
 - The predicate returns no row.
 - The FILTER predicate hides all rows.
 - The AFTER INSERT BLOCK predicate rejects inserts.
-
 
 Why option a is wrong
 ---------------------
@@ -279,14 +284,17 @@ OR
 @AppUserId =
     CAST(SESSION_CONTEXT(N'UserId') AS int)
 
-The first condition is TRUE for every principal other than AppUser.
+The first condition is TRUE for every principal other than
+AppUser.
 
-Therefore both SupportAdmin AND ReportingUser satisfy the predicate for every row.
+Therefore both SupportAdmin AND ReportingUser satisfy the
+predicate for every row.
 
-Because ReportingUser already has SELECT and INSERT permissions, RLS would effectively allow ReportingUser to see and insert all rows.
+Because ReportingUser already has SELECT and INSERT permissions,
+RLS would effectively allow ReportingUser to see and insert all
+rows.
 
 This violates the requirements.
-
 
 Why option c is wrong
 ---------------------
@@ -301,7 +309,8 @@ DATABASE_PRINCIPAL_ID() =
 
 This correctly permits SupportAdmin.
 
-However, it does not verify that a session using SESSION_CONTEXT is actually AppUser.
+However, it does not verify that a session using SESSION_CONTEXT
+is actually AppUser.
 
 ReportingUser can set:
 
@@ -311,8 +320,8 @@ EXEC sys.sp_set_session_context
 
 Rows having AppUserId = 42 would then satisfy the predicate.
 
-Therefore ReportingUser could gain row access despite the requirement that it must see no rows.
-
+Therefore ReportingUser could gain row access despite the
+requirement that it must see no rows.
 
 Why option d is wrong
 ---------------------
@@ -330,44 +339,48 @@ AND
 DATABASE_PRINCIPAL_ID() <>
     DATABASE_PRINCIPAL_ID(N'ReportingUser')
 
-The logical operator between the AppUser principal check and the SESSION_CONTEXT comparison is OR instead of AND.
+The logical operator between the AppUser principal check and the
+SESSION_CONTEXT comparison is OR instead of AND.
 
-For AppUser, the first part becomes TRUE simply because the current database principal is AppUser.
+For AppUser, the first part becomes TRUE simply because the
+current database principal is AppUser.
 
-That means AppUser would satisfy the predicate for every AppUserId, regardless of the UserId stored in SESSION_CONTEXT.
+That means AppUser would satisfy the predicate for every
+AppUserId, regardless of the UserId stored in SESSION_CONTEXT.
 
-AppUser would therefore see every row and could insert rows for other application users.
+AppUser would therefore see every row and could insert rows for
+other application users.
 
 This violates the tenant-isolation requirements.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
 
 DP-800 Exam Rule to Remember
 ----------------------------
 
-SESSION_CONTEXT identifies an application-level caller only because the database predicate chooses to trust that value.
+SESSION_CONTEXT identifies an application-level caller only
+because the database predicate chooses to trust that value.
 
-When multiple database principals have object permissions, a strong RLS predicate may need to validate BOTH:
+When multiple database principals have object permissions, a
+strong RLS predicate may need to validate BOTH:
 
-    database principal
-    +
-    application identity in SESSION_CONTEXT
+database principal
++
+application identity in SESSION_CONTEXT
 
 Think of the authorization test as:
 
-    Is this the expected database principal?
-                 AND
-    Does this row belong to the application identity?
+Is this the expected database principal?
+             AND
+Does this row belong to the application identity?
 
-Then explicitly add any administrative principal that is supposed to bypass tenant filtering.
+Then explicitly add any administrative principal that is supposed
+to bypass tenant filtering.
 
 For this scenario:
 
-AppUser
-    -> principal must be AppUser
-    -> AppUserId must match SESSION_CONTEXT
-
-SupportAdmin
-    -> explicitly allowed
-
-ReportingUser
-    -> never allowed by the predicate
+- APPUSER -> principal must be AppUser, and AppUserId must match
+  SESSION_CONTEXT
+- SUPPORTADMIN -> explicitly allowed
+- REPORTINGUSER -> never allowed by the predicate

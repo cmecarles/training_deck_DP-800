@@ -160,6 +160,8 @@ Option c inverts the meaning of the `WITH (PARTITIONS ...)` clause, treating `(2
 
 Option d reads `WITH (PARTITIONS (2, 4))` as the range `2 TO 4`, truncating partitions 2, 3, and 4 and leaving only partition 1. A range requires the keyword `TO` — `WITH (PARTITIONS (2 TO 4))`. A comma-separated list names individual partitions, so partition 3 is untouched and its 3 rows (2025-03-15, 2025-03-31, 2025-04-01) must appear in the result.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 For `CREATE PARTITION FUNCTION ... AS RANGE { LEFT | RIGHT } FOR VALUES (b1, ..., bn)`:

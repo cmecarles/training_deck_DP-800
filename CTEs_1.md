@@ -166,6 +166,8 @@ It describes `MAXRECURSION` as a silent truncation. Exceeding the limit is an **
 - `ORDER BY Path` could be replaced by `ORDER BY Path COLLATE Latin1_General_BIN` or by `ORDER BY Lvl, Path` only if the intended order changed; as written, `Path` alone is a deterministic total order because paths are unique.
 - The two `CAST(... AS VARCHAR(200))` calls are required as written: anchor and recursive member must produce **identical types**, and without the casts the concatenated types/lengths differ between the two branches and the statement fails with `Msg 240 — Types don't match between the anchor and the recursive part in column "Path" of recursive query "Chain".`
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 For a recursive CTE:

@@ -24,6 +24,7 @@ az group create -n $RG -l $LOCATION
 az cognitiveservices account create -g $RG -n $AOAI -l $LOCATION --kind OpenAI --sku S0 --custom-domain $AOAI --yes
 az cognitiveservices account deployment create -g $RG -n $AOAI --deployment-name embed-small \
   --model-name text-embedding-3-small --model-version "1" --model-format OpenAI --sku-name Standard --sku-capacity 1
+  # if your region rejects the Standard SKU for this model, repeat with --sku-name GlobalStandard
 AOAI_EP=$(az cognitiveservices account show -g $RG -n $AOAI --query properties.endpoint -o tsv)   # https://<AOAI>.openai.azure.com/
 AOAI_ID=$(az cognitiveservices account show -g $RG -n $AOAI --query id -o tsv)
 

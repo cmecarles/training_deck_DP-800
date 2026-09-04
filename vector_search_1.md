@@ -217,6 +217,8 @@ ORDER BY Distance ASC, s.SongId ASC;
 
 Swapping the last two arguments — `VECTOR_DISTANCE('cosine', @q, s.ThemeVector)` — is also equivalent: cosine and euclidean distances are symmetric. Omitting the `s.SongId` tiebreaker changes nothing *here* because all five distances are distinct, but with real embeddings a deterministic tiebreaker is the only way to make the row order fully reproducible.
 
+Conceptual question (Azure / tooling); not executed against an engine.
+
 ## DP-800 Exam Rule to Remember
 
 The `vector` type is declared as `VECTOR(n)` (float32 elements by default, max 1998 dimensions) and its literals are JSON arrays in a string: `'[1, 0, 0]'`. Inspect a vector with `VECTORPROPERTY(v, 'Dimensions')` / `VECTORPROPERTY(v, 'BaseType')`; rescale to unit length with `VECTOR_NORMALIZE(v, 'norm2')`.

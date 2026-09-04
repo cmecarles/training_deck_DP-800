@@ -132,6 +132,8 @@ The optional third argument of `REGEXP_SPLIT_TO_TABLE` is `flags` (`i` case-inse
 - `CROSS APPLY REGEXP_SPLIT_TO_TABLE(p.Tags, N'[,;]') AS s` with `TRIM(s.value) AS Keyword` returns the identical 9 rows for this data set (the delimiter no longer eats the spaces, so `TRIM` removes them from the values instead). It is only equivalent because no keyword here has *interior* edge whitespace that must survive.
 - Replacing `CROSS APPLY` with `OUTER APPLY` is **not** equivalent: it returns 10 rows, adding `(4, NULL, NULL)`.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `REGEXP_SPLIT_TO_TABLE` (SQL Server 2025, Azure SQL) is a table-valued function that always returns exactly two columns:

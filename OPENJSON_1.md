@@ -165,6 +165,8 @@ The `WHERE s.StationCode = 'KSEA'` filter does not save the query — the error 
 - `OPENJSON` requires `COMPATIBILITY_LEVEL >= 130` (or the `ALLOW_BUILTIN_TVF_IN_ALL_COMPAT_LEVELS` scoped configuration); 170 comfortably satisfies it. The queries behave identically if `Obs` is declared with the native `json` type instead of `NVARCHAR(MAX)` with an `ISJSON` check.
 - `GustsScalar`'s always-NULL behavior can equally be predicted from `JSON_VALUE(Obs, '$.gusts')`, and `Gusts` from `JSON_QUERY(Obs, '$.gusts')` — the `WITH` clause without/with `AS JSON` mirrors that function pair exactly.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 Default-schema `OPENJSON` returns `key`, `value`, `type` for **first-level** properties only, and the type codes are:

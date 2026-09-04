@@ -193,3 +193,5 @@ FOR XML AUTO, ROOT('Data'), ELEMENTS XSINIL;
 ```
 
 Also, because Id, Step and the four sequence columns all increase together within `TABLE_A`, `ORDER BY Step` (or `AB`, `ABC`, `ABCD`, `ABCDE`) produces the same row order as `ORDER BY Id`.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.

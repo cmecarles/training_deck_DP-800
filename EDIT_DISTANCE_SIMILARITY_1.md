@@ -93,6 +93,8 @@ Equivalent alternatives (all verified to return the same values on the same engi
 
 - Because the raw query calls the function twice (SELECT list and `WHERE`), a `CROSS APPLY (SELECT EDIT_DISTANCE_SIMILARITY(FeedName, CatalogName) AS Score) AS x ... WHERE x.Score >= 75` computes it once and returns the same result set.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `EDIT_DISTANCE_SIMILARITY` (SQL Server 2025, documented for compat 170, preview-gated on RTM) returns an **int 0–100**, defined as:

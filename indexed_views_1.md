@@ -173,6 +173,8 @@ Outer joins are banned because NULL-extended rows cannot be maintained increment
 
 For option c, the index key could equivalently be declared with an explicit name-only variation (any index name works), and `SUM(ISNULL(...))` wrapping is unnecessary here because both columns are `NOT NULL` — a `SUM` over a *nullable* expression would be another disqualifier.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 Checklist for an indexable aggregate view — every item is enforced with its own error:

@@ -114,6 +114,8 @@ No result set is returned at all — you do **not** get policy 2's row with `250
 - The results are identical if `Meta` is declared with the native **json** type instead of `NVARCHAR(MAX) + ISJSON` — the JSON functions behave the same over both storage choices. The `json` type additionally unlocks `JSON_VALUE(... RETURNING <data_type>)` (SQL Server 2025), e.g. `RETURNING int` to get `2500` as an **int** instead of text; on this build, `RETURNING` over a plain `nvarchar` input is rejected.
 - `RidersQ`/`RidersV` and `HolderQ` behave exactly like `OPENJSON ... WITH` columns with and without `AS JSON` — the same scalar-vs-fragment split under a different syntax.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 Split the world in two and never cross the line:

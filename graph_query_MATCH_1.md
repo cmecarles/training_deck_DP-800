@@ -176,6 +176,8 @@ Node tables get an implicit `$node_id` pseudo-column and edge tables get `$edge_
 - Query 1's pattern can be split as `MATCH(s1-(sa1)->sess AND s2-(sa2)->sess)` — two arcs combined with `AND` inside `MATCH` — with the same result.
 - Pre-2017-style equivalents joining on `$from_id = $node_id` by hand work but are exactly what `MATCH` exists to replace.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 SQL Graph in three lines of syntax:

@@ -7,7 +7,7 @@ Statement
 
 PageTurner is the database behind an online second-hand bookstore.
 Its search page is powered by the table below, which currently has
-no index other than the clustered primary key:
+NO INDEX OTHER THAN THE CLUSTERED PRIMARY KEY:
 
 CREATE DATABASE PageTurner;
 GO
@@ -55,16 +55,16 @@ WHERE CategoryID = 7
 ORDER BY Price;
 
 You may create EXACTLY ONE nonclustered index. The index must let
-the engine answer this exact query with a single covering index
-seek, meaning all three of the following, verifiable in the actual
+the engine answer this exact query with a SINGLE COVERING INDEX
+SEEK, meaning all three of the following, verifiable in the actual
 execution plan (for example with SET STATISTICS PROFILE ON):
 
 1. One Index Seek on the new index in which BOTH WHERE conditions
-   appear as seek predicates (SEEK:(...)), so the seek range
+   appear as SEEK PREDICATES (SEEK:(...)), so the seek range
    contains only qualifying rows — no residual WHERE:(...)
    predicate discarding rows after they are read;
-2. No access to the base table — no Key Lookup into PK_Listings;
-3. No Sort operator — the seek must return the rows already
+2. NO ACCESS TO THE BASE TABLE — no Key Lookup into PK_Listings;
+3. NO SORT OPERATOR — the seek must return the rows already
    ordered by Price.
 
 Which index definition meets all three requirements?
@@ -100,34 +100,34 @@ b
 Explanation
 -----------
 
-The four options are deliberately built from the same
-ingredients — the two predicate columns and the two returned
-columns — and differ only in where each column sits: leading key,
-trailing key, or INCLUDE. That placement is the whole question:
+The four options are deliberately built from the same ingredients
+— the two predicate columns and the two returned columns — and
+differ only in where each column sits: leading key, trailing key,
+or INCLUDE. That placement is the whole question:
 
-- Key columns define the sort order of the index and are the only
+- KEY COLUMNS define the sort order of the index and are the only
   columns the storage engine can seek on and the only order it can
   return rows in without sorting.
-- INCLUDE (nonkey) columns are stored in the leaf level only. They
+- INCLUDE (NONKEY) COLUMNS are stored in the leaf level only. They
   can make an index covering (requirement 2) and can be checked by
   a residual predicate, but they can never define a seek range and
   never contribute ordering.
-- Within the key, a seek can consume the leading equality columns
-  plus ONE trailing range condition. A range on the FIRST key
+- Within the key, a SEEK can consume the leading equality columns
+  plus ONE trailing range condition. A range on the first key
   column ends the usable seek chain immediately: everything after
   it degrades to a residual predicate.
 
 The canonical composite key for this query is therefore equality
 column first, range column second: (CategoryID, Price). All four
 plans below were captured from actual runs against the script
-above on SQL Server 2025 (SET STATISTICS PROFILE ON,
-SET STATISTICS IO ON; three-part column names shortened, and
-OPTION (RECOMPILE) appended in the capture runs so literal values
-appear in the plan text instead of auto-parameterization
-markers — the plan shapes are identical either way).
+above on SQL Server 2025 (SET STATISTICS PROFILE ON, SET
+STATISTICS IO ON; three-part column names shortened, and OPTION
+(RECOMPILE) appended in the capture runs so literal values appear
+in the plan text instead of auto-parameterization markers — the
+plan shapes are identical either way).
 
 Why option b is correct
-.......................
+-----------------------
 
 Index Seek(OBJECT:(IX_Listings_Search),
            SEEK:(CategoryID=(7) AND Price < (15.00)) ORDERED FORWARD)
@@ -140,11 +140,11 @@ One operator, and it satisfies every requirement:
    rows, no residual predicate.
 2. Title and ListedOn are in the leaf via INCLUDE, so the index
    covers the SELECT list; there is no Key Lookup.
-3. Within CategoryID = 7, rows are stored in Price order, so
-   ORDER BY Price is satisfied by the seek itself
-   (ORDERED FORWARD) — no Sort.
+3. Within CategoryID = 7, rows are stored in Price order, so ORDER
+   BY Price is satisfied by the seek itself (ORDERED FORWARD) — no
+   Sort.
 
-Measured cost: 10 logical reads.
+Measured cost: 10 LOGICAL READS.
 
 Equivalent correct alternatives (not offered as options): the same
 definition with the INCLUDE list written as (ListedOn, Title) —
@@ -156,7 +156,7 @@ and be subject to key-size and key-column restrictions for no
 benefit, which is precisely what INCLUDE exists to avoid.
 
 Why option a is wrong
-.....................
+---------------------
 
 (Price, CategoryID) INCLUDE (Title, ListedOn) — same columns, key
 order reversed. The actual plan:
@@ -165,17 +165,17 @@ Index Seek(OBJECT:(IX_Listings_Search),
            SEEK:(Price < (15.00)),
            WHERE:(CategoryID=(7)) ORDERED FORWARD)
 
-This is the subtle distractor: it IS a covering Index Seek with no
+This is the subtle distractor: it is a covering Index Seek with no
 lookup and no Sort (the leading key is Price, so the output is
 already price-ordered). But the range condition sits on the FIRST
 key column, so the seek range is Price < 15.00 across ALL 40
-categories — 32,199 rows — and CategoryID = 7 is applied as a
+CATEGORIES — 32,199 rows — and CategoryID = 7 is applied as a
 residual WHERE:(...) predicate that throws away 31,394 of them
-after reading. Requirement 1 explicitly fails. Measured cost:
-238 logical reads, about 24 times option b.
+after reading. Requirement 1 explicitly fails. Measured cost: 238
+LOGICAL READS, about 24 times option b.
 
 Why option c is wrong
-.....................
+---------------------
 
 (CategoryID) INCLUDE (Price, Title, ListedOn) puts the range
 column in INCLUDE. Included columns cannot be seek predicates and
@@ -188,11 +188,11 @@ Sort(ORDER BY:(Price ASC))
 
 Two failures: Price < 15.00 is a residual predicate over all 5,000
 category-7 rows (requirement 1), and an explicit Sort operator is
-needed for ORDER BY Price (requirement 3). It does cover the
-query — no lookup — but covering alone is not what was asked.
+needed for ORDER BY Price (requirement 3). It does cover the query
+— no lookup — but covering alone is not what was asked.
 
 Why option d is wrong
-.....................
+---------------------
 
 (CategoryID, Price) has the perfect key but no INCLUDE, so Title
 and ListedOn live only in the base table and the index does not
@@ -204,11 +204,13 @@ Sort(ORDER BY:(Price ASC))
                           WHERE:(CategoryID=(7) AND Price<(15.00)))
 
 Forcing the index with WITH (INDEX(IX_Listings_Search)) shows why
-it refused: a seek on the 805 qualifying rows followed by 805
-Key Lookup executions into PK_Listings
-(Clustered Index Seek ... LOOKUP, executed 805 times) —
-2,480 logical reads versus 10 for option b. Either way,
-requirement 2 fails.
+it refused: a seek on the 805 qualifying rows followed by 805 KEY
+LOOKUP EXECUTIONS into PK_Listings (Clustered Index Seek ...
+LOOKUP, executed 805 times) — 2,480 LOGICAL READS versus 10 for
+option b. Either way, requirement 2 fails.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
 
 DP-800 Exam Rule to Remember
 ----------------------------
@@ -229,13 +231,13 @@ names the tier you got wrong.
 
 Two adjacent facts the exam likes:
 
-- A filtered index (CREATE INDEX ... WHERE IsSold = 0) could
+- A FILTERED INDEX (CREATE INDEX ... WHERE IsSold = 0) could
   shrink this index further because the shop only searches unsold
   books — but the query must then contain the filter predicate
   (AND IsSold = 0) for the optimizer to match it, and
   parameterized predicates on the filtered column may prevent
   matching.
-- A UNIQUE nonclustered index is both a constraint and an index:
+- A UNIQUE NONCLUSTERED INDEX is both a constraint and an index:
   when a column really is unique, declaring it gives the optimizer
   free information for better plans. It would be wrong here —
   (CategoryID, Price) is obviously not unique — and remember that

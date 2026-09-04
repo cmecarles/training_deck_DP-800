@@ -34,14 +34,14 @@ GO
 Note what the second INSERT builds: policy 2's notes property is a
 JSON string of 4,100 x characters, and the document is valid JSON
 (the ISJSON check passed). Policy 1 has no notes and no
-limits.deductible; policy 2 has an empty riders array and no
+limits.deductible; policy 2 has an EMPTY riders array and no
 prior_claims.
 
-Two queries are then executed. Predict the exact output of each —
-every value and every NULL — or the exact failure.
+Two queries are then executed. PREDICT THE EXACT OUTPUT OF EACH —
+EVERY VALUE AND EVERY NULL — OR THE EXACT FAILURE.
 
 Query 1
-.......
+-------
 
 SELECT
     p.PolicyID,
@@ -58,7 +58,7 @@ FROM Ins.Policies AS p
 ORDER BY p.PolicyID;
 
 Query 2
-.......
+-------
 
 SELECT
     p.PolicyID,
@@ -72,7 +72,7 @@ Correct Answer
 Both outputs were produced by SQL Server 2025 (RTM, 17.0.1000.7).
 
 Query 1 — 2 rows
-................
+----------------
 
 PolicyID  PolicyNo   SecondRider  RidersV  RidersQ            HolderQ  ActiveV  Deductible  Paid2  Notes
 --------  ---------  -----------  -------  -----------------  -------  -------  ----------  -----  -----
@@ -80,94 +80,97 @@ PolicyID  PolicyNo   SecondRider  RidersV  RidersQ            HolderQ  ActiveV  
 2         HP-2189-B  NULL         NULL     []                 NULL     false    2500        NULL   NULL
 
 Query 2 — fails at run time, no rows
-....................................
+------------------------------------
 
 Msg 13608, Level 16, State 2
 Property cannot be found on the specified JSON path.
 
-(The line number in the error depends on the batch; message number,
-severity, and text are fixed.)
+(The line number in the error depends on the batch; message
+number, severity, and text are fixed.)
 
 Explanation
 -----------
 
-JSON_VALUE(expression, path) extracts a scalar and returns it as
-nvarchar(4000); JSON_QUERY extracts an object or array fragment.
+JSON_VALUE(expression, path) extracts a SCALAR and returns it as
+NVARCHAR(4000); JSON_QUERY extracts an OBJECT OR ARRAY fragment.
 Each function returns NULL (lax mode, the default) or raises an
 error (strict prefix) when asked for the kind of thing it does not
 extract, when the path does not resolve — or, for JSON_VALUE, when
 the scalar is longer than 4,000 characters.
 
 Query 1, column by column
-.........................
+-------------------------
 
-- PolicyNo — $."policy no" — a key containing a space (or any
+- POLICYNO — $."POLICY NO" — a key containing a space (or any
   special character) must be double-quoted inside the path. It
   resolves normally: HP-2044-X, HP-2189-B.
-- SecondRider — $.riders[1] — array indexes are 0-based, so [1] is
+- SECONDRIDER — $.RIDERS[1] — array indexes are 0-BASED, so [1] is
   the second element: quake for policy 1 (not flood). Policy 2's
-  riders is [], index 1 does not exist, lax mode → NULL.
-- RidersV — JSON_VALUE on $.riders — the path resolves to an
-  array, and JSON_VALUE only returns scalars: lax mode → NULL for
+  riders is [], index 1 does not exist, lax mode -> NULL.
+- RIDERSV — JSON_VALUE ON $.RIDERS — the path resolves to an
+  ARRAY, and JSON_VALUE only returns scalars: lax mode -> NULL for
   both rows, even for the non-empty array.
-- RidersQ — JSON_QUERY on $.riders — the mirror image: JSON_QUERY
-  returns the fragment, ["flood","quake"] and []. An empty array is
-  the two-character text [], not NULL — the property exists.
-- HolderQ — JSON_QUERY on $.holder.name — the reverse trap: the
-  path resolves to the string "Marta Voss" / "Ade Kaplan", a
-  scalar, and JSON_QUERY does not return scalars: lax mode → NULL
+- RIDERSQ — JSON_QUERY ON $.RIDERS — the mirror image: JSON_QUERY
+  returns the fragment, ["flood","quake"] and []. An empty array
+  is the two-character text [], not NULL — the property exists.
+- HOLDERQ — JSON_QUERY ON $.HOLDER.NAME — the reverse trap: the
+  path resolves to the STRING "Marta Voss" / "Ade Kaplan", a
+  scalar, and JSON_QUERY does not return scalars: lax mode -> NULL
   for both rows. JSON_VALUE would have returned the names.
-- ActiveV — $.active — JSON booleans are scalars, returned as the
-  text true / false (nvarchar, not bit).
-- Deductible — $.limits.deductible — exists only for policy 2
-  (2500); missing property, lax mode → NULL for policy 1.
-- Paid2 — $.prior_claims[1].paid — policy 1's second claim has
-  "paid": null: the property exists and holds JSON null, which
+- ACTIVEV — $.ACTIVE — JSON booleans are scalars, returned as the
+  TEXT true / false (nvarchar, not bit).
+- DEDUCTIBLE — $.LIMITS.DEDUCTIBLE — exists only for policy 2
+  (2500); missing property, lax mode -> NULL for policy 1.
+- PAID2 — $.PRIOR_CLAIMS[1].PAID — policy 1's second claim has
+  "paid": null: the property EXISTS and holds JSON null, which
   surfaces as SQL NULL. Policy 2 has no prior_claims at all — also
   NULL, for a different reason (path not found, lax). The output
   cannot distinguish the two cases; that is precisely why the
   column is a trap.
-- Notes — $.notes — the deep trap. Policy 2's notes exists and is
-  a valid scalar string, but it is 4,100 characters long.
-  JSON_VALUE returns nvarchar(4000); when the value exceeds 4,000
-  characters, lax mode returns NULL instead of truncating. Policy 1
-  simply lacks the key → NULL. So the column is NULL on both
+- NOTES — $.NOTES — the deep trap. Policy 2's notes EXISTS AND IS
+  A VALID SCALAR STRING, but it is 4,100 characters long.
+  JSON_VALUE returns NVARCHAR(4000); when the value exceeds 4,000
+  characters, lax mode returns NULL instead of truncating. Policy
+  1 simply lacks the key -> NULL. So the column is NULL on both
   rows — one from the length limit, one from a missing path.
   (Engine-verified: LEN(JSON_VALUE(Meta, '$.notes')) is NULL for
-  policy 2, and JSON_VALUE(Meta, 'strict $.notes') raises
-  Msg 13625, Level 16 — "String value in the specified JSON path
-  would be truncated.". To read the full value, use
-  OPENJSON ... WITH (Notes NVARCHAR(MAX) '$.notes'), or
-  JSON_VALUE(... RETURNING nvarchar(max)) on a json-typed input.)
+  policy 2, and JSON_VALUE(Meta, 'strict $.notes') raises Msg
+  13625, Level 16 — "String value in the specified JSON path would
+  be truncated.". To read the full value, use OPENJSON ... WITH
+  (Notes NVARCHAR(MAX) '$.notes'), or JSON_VALUE(... RETURNING
+  nvarchar(max)) on a json-typed input.)
 
 Query 2 — strict mode turns NULL into an error
-..............................................
+----------------------------------------------
 
-strict $.limits.deductible resolves for policy 2 (2500) but not for
-policy 1. In strict mode a missing property is not smoothed over
-with NULL; it aborts the statement at run time:
+strict $.limits.deductible resolves for policy 2 (2500) but NOT
+for policy 1. In strict mode a missing property is not smoothed
+over with NULL; it aborts the statement at run time:
 
 Msg 13608, Level 16, State 2
 Property cannot be found on the specified JSON path.
 
-No result set is returned at all — you do not get policy 2's row
+No result set is returned at all — you do NOT get policy 2's row
 with 2500. One failing row fails the whole query, which is why
 strict belongs in data-quality checks and not in general-purpose
 reports over heterogeneous documents.
 
 Equivalent alternatives
-.......................
+-----------------------
 
 - The results are identical if Meta is declared with the native
-  json type instead of NVARCHAR(MAX) + ISJSON — the JSON functions
+  JSON type instead of NVARCHAR(MAX) + ISJSON — the JSON functions
   behave the same over both storage choices. The json type
-  additionally unlocks JSON_VALUE(... RETURNING <data_type>)
-  (SQL Server 2025), e.g. RETURNING int to get 2500 as an int
-  instead of text; on this build, RETURNING over a plain nvarchar
-  input is rejected.
-- RidersQ/RidersV and HolderQ behave exactly like OPENJSON ... WITH
-  columns with and without AS JSON — the same scalar-vs-fragment
-  split under a different syntax.
+  additionally unlocks JSON_VALUE(... RETURNING <data_type>) (SQL
+  Server 2025), e.g. RETURNING int to get 2500 as an INT instead
+  of text; on this build, RETURNING over a plain nvarchar input is
+  rejected.
+- RidersQ/RidersV and HolderQ behave exactly like OPENJSON ...
+  WITH columns with and without AS JSON — the same
+  scalar-vs-fragment split under a different syntax.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message
+above is the engine's literal output.
 
 DP-800 Exam Rule to Remember
 ----------------------------
@@ -178,16 +181,16 @@ JSON_VALUE → scalars only   (string, number, true/false)
 JSON_QUERY → fragments only (objects, arrays)
 
 Asked for the wrong kind, each returns NULL in lax mode (the
-default) and an error in strict mode. Then stack the JSON_VALUE
+default) and an ERROR in strict mode. Then stack the JSON_VALUE
 specifics:
 
-- Return type is nvarchar(4000): a scalar over 4,000 chars → lax
+- Return type is NVARCHAR(4000): a scalar over 4,000 chars -> lax
   NULL / strict Msg 13625 (use OPENJSON or RETURNING nvarchar(max)
   on the json type for longer values).
-- Booleans and numbers come back as text (true, 2500) unless
+- Booleans and numbers come back as TEXT (true, 2500) unless
   RETURNING (2025, json-type input) casts them.
-- Array indexes are 0-based; quote unusual keys: $."policy no".
+- Array indexes are 0-BASED; quote unusual keys: $."policy no".
 - Lax mode makes missing paths, wrong-kind paths, JSON null, and
-  oversized scalars all collapse into the same NULL — and strict on
-  a mixed document set fails the entire statement, not just the
+  oversized scalars all collapse into the same NULL — and strict
+  on a mixed document set fails the ENTIRE STATEMENT, not just the
   offending row.

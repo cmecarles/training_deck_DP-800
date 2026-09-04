@@ -166,6 +166,8 @@ Two distractor-level contrasts worth internalizing:
 - A masking rule **cannot be defined on an Always Encrypted column** — the two features are mutually exclusive per column.
 - With Always Encrypted, the *engine itself* stores ciphertext and could not have evaluated `MonthlyFee >= 200` at all (range predicates are not supported over encrypted columns unless secure enclaves with enclave-enabled randomized encryption are configured — a very different setup). The fact that the filter works on real values is the signature of DDM: the server sees everything; only the presentation is masked.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 Dynamic Data Masking is a **presentation-layer** feature. Fix these five facts:

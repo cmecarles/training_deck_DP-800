@@ -143,6 +143,8 @@ The statement says `StoreCatalog` has **never been registered as a data-tier app
 
 Bypassing the pull-request process by swapping binary artifacts inside the pipeline also defeats the purpose of keeping the schema under source control.
 
+Conceptual question (Azure / tooling); not executed against an engine.
+
 ## DP-800 Exam Rule to Remember
 
 Match the SqlPackage action to the question being asked:

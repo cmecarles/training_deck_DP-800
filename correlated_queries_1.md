@@ -176,6 +176,8 @@ ORDER BY VineyardName, HarvestYear;
 
 Substituting `ROW_NUMBER()` for `RANK()` is **not** equivalent: it would keep only one arbitrary Mirador row (3 rows total) unless a deterministic tie-breaker column is added to the `OVER (... ORDER BY ...)`.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 Three-valued logic turns `NOT IN` into a trap:

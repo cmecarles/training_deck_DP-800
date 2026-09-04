@@ -176,6 +176,8 @@ Option d **violates requirements 2 and 4**.
 
 Logic Apps is a legitimate embedding-maintenance option in general, but only when the workflow is driven by *detected changes*, not by a blind full-table recurrence.
 
+Conceptual question (Azure / tooling); not executed against an engine.
+
 ## DP-800 Exam Rule to Remember
 
 Choosing an embedding **maintenance** method is a constraint-matching exercise. Anchor on three questions:

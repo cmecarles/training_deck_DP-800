@@ -82,6 +82,8 @@ Notes and equivalent alternatives:
 - The function accepts an optional third argument, `maximum_distance`, as a short-circuit for filtering (`EDIT_DISTANCE(a, b, 2)`). Per the documentation, when the true distance exceeds the cap the function *may* return any value ≥ the cap (observed: `EDIT_DISTANCE('Johannessen','Jones', 2)` returns 2 while the true distance is 6), so its exact output is not something to hard-code in expected results — only the predicate `EDIT_DISTANCE(a, b, @n) <= @n` is reliable.
 - The inputs cannot be `varchar(max)`/`nvarchar(max)`.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 `EDIT_DISTANCE` (SQL Server 2025, documented for compat level 170, preview — gated by `PREVIEW_FEATURES = ON` on RTM):

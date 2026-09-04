@@ -1,0 +1,301 @@
+============================================================
+ SQL Server question — Azure SQL Change Event Streaming 1
+============================================================
+
+Statement
+---------
+
+A ski resort sells lift passes from an AZURE SQL DATABASE named
+LiftPass and wants every change to the Resort.Passes table pushed
+to AZURE EVENT HUBS with CHANGE EVENT STREAMING (CES, PREVIEW),
+authenticated with the logical server's managed identity, and
+consumed by a small Python script.
+
+This is a HANDS-ON question: provision, enable the stream, run the
+DML/DDL steps D1–D7, read the events, and answer the
+multiple-choice question about what the consumer sees.
+
+Provisioning (Azure CLI, bash; az login first)
+----------------------------------------------
+
+LOCATION="westeurope"
+SUFFIX=$RANDOM
+RG="rg-dp800-liftpass-$SUFFIX"
+SQL="sql-liftpass-$SUFFIX"; DB="LiftPass"
+EHNS="ehns-liftpass-$SUFFIX"; EH="passes"
+ADMIN_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+ADMIN_OID=$(az ad signed-in-user show --query id -o tsv)
+MYIP=$(curl -s https://api.ipify.org)
+
+az group create -n $RG -l $LOCATION
+# Standard tier: CES publishes with the Kafka protocol on port 9093, which the Basic tier does not offer
+az eventhubs namespace create -g $RG -n $EHNS -l $LOCATION --sku Standard --capacity 1 --enable-kafka true
+az eventhubs eventhub create -g $RG --namespace-name $EHNS -n $EH --partition-count 2 --cleanup-policy Delete --retention-time 24
+EH_ID=$(az eventhubs eventhub show -g $RG --namespace-name $EHNS -n $EH --query id -o tsv)
+
+az sql server create -g $RG -n $SQL -l $LOCATION --enable-ad-only-auth --assign-identity --identity-type SystemAssigned \
+  --external-admin-principal-type User --external-admin-name "$ADMIN_UPN" --external-admin-sid $ADMIN_OID
+az sql server firewall-rule create -g $RG -s $SQL -n client --start-ip-address $MYIP --end-ip-address $MYIP
+az sql db create -g $RG -s $SQL -n $DB -e GeneralPurpose -f Gen5 -c 1 --compute-model Serverless \
+  --auto-pause-delay 60 --min-capacity 0.5 --backup-storage-redundancy Local
+SQL_FQDN=$(az sql server show -g $RG -n $SQL --query fullyQualifiedDomainName -o tsv)
+SQL_MI=$(az sql server show -g $RG -n $SQL --query identity.principalId -o tsv)
+
+# the server identity may SEND to this one event hub; you may RECEIVE from it
+az role assignment create --assignee-object-id $SQL_MI --assignee-principal-type ServicePrincipal \
+  --role "Azure Event Hubs Data Sender" --scope $EH_ID
+az role assignment create --assignee-object-id $ADMIN_OID --assignee-principal-type User \
+  --role "Azure Event Hubs Data Receiver" --scope $EH_ID
+echo "Destination: $EHNS.servicebus.windows.net:9093/$EH"
+
+Connect (sqlcmd -S $SQL_FQDN -d $DB --authentication-method
+ActiveDirectoryDefault -I, or -G -U "$ADMIN_UPN" -I) and enable
+the stream; replace <EHNS> with the namespace name:
+
+CREATE SCHEMA Resort;
+GO
+CREATE TABLE Resort.Passes
+(
+    PassId   INT           NOT NULL PRIMARY KEY,
+    Holder   NVARCHAR(40)  NOT NULL,
+    Days     TINYINT       NOT NULL,
+    Price    DECIMAL(7,2)  NOT NULL
+);
+INSERT INTO Resort.Passes VALUES (1, N'Ana Roig', 1, 62.00), (2, N'Tomas Vik', 6, 290.00);   -- rows that exist BEFORE streaming
+GO
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'Str0ng!Passw0rd#2026';
+CREATE DATABASE SCOPED CREDENTIAL LiftHubCred WITH IDENTITY = 'Managed Identity';
+GO
+EXEC sys.sp_enable_event_stream;
+EXEC sys.sp_create_event_stream_group
+     @stream_group_name = N'PassesGroup', @destination_type = N'AzureEventHubs',
+     @destination_location = N'<EHNS>.servicebus.windows.net:9093/passes',
+     @destination_credential = LiftHubCred, @max_message_size_kb = 256, @partition_key_scheme = N'None';
+EXEC sys.sp_add_object_to_event_stream_group N'PassesGroup', N'Resort.Passes';
+GO
+SELECT name, is_event_stream_enabled FROM sys.databases WHERE name = DB_NAME();
+SELECT name, is_replicated FROM sys.tables;
+EXEC sys.sp_help_change_feed;
+GO
+
+Start the consumer BEFORE the DML (Python 3.9+, pip install
+azure-eventhub azure-identity; it uses your az login):
+
+import json, os
+from azure.eventhub import EventHubConsumerClient
+from azure.identity import DefaultAzureCredential
+
+client = EventHubConsumerClient(
+    fully_qualified_namespace=os.environ["EHNS"] + ".servicebus.windows.net",
+    eventhub_name="passes", consumer_group="$Default", credential=DefaultAzureCredential())
+
+def on_event(ctx, event):
+    if event is None:
+        return
+    ce = json.loads(event.body_as_str())           # the CloudEvent envelope
+    data = json.loads(ce["data"])                  # the data attribute is a JSON *string*
+    src, row = data["eventsource"], data["eventrow"]
+    print(f'p{ctx.partition_id} {ce["type"]} {ce["operation"]} {src["schema"]}.{src["tbl"]} '
+          f'pk={src["pkkey"]} seq={src["transaction"]["sequencenumber"]} cols={[c["name"] for c in src["cols"]]}')
+    print("   old    :", row["old"]); print("   current:", row["current"])
+
+with client:
+    client.receive(on_event=on_event, starting_position="-1", max_wait_time=30)
+
+(EHNS=<namespace> python consume.py; stop it with Ctrl+C when the
+lab is over.)
+
+The steps (each in its own batch)
+---------------------------------
+
+-- D1
+INSERT INTO Resort.Passes VALUES (3, N'Ines Sola', 3, 150.00), (4, N'Piet Bos', 2, 110.00);
+-- D2
+BEGIN TRAN; UPDATE Resort.Passes SET Price = 145.00 WHERE PassId = 3; DELETE Resort.Passes WHERE PassId = 4; COMMIT;
+-- D3
+TRUNCATE TABLE Resort.Passes;
+-- D4
+ALTER TABLE Resort.Passes ADD Lane TINYINT NULL;
+-- D5
+EXEC sp_rename 'Resort.Passes.Holder', 'Guest', 'COLUMN';
+-- D6
+INSERT INTO Resort.Passes (PassId, Holder, Days, Price, Lane) VALUES (5, N'Lea Kurz', 1, 62.00, 2);
+-- D7
+EXEC sys.sp_create_event_stream_group @stream_group_name = N'KafkaGroup', @destination_type = N'AzureEventHubsApacheKafka',
+     @destination_location = N'<EHNS>.servicebus.windows.net:9093/passes', @destination_credential = LiftHubCred;
+
+Which statement about the lab is CORRECT?
+
+a.
+
+The consumer prints FIVE events — INS, INS (D1), UPD, DEL (D2) and
+INS (D6) — never anything for passes 1 and 2. Each envelope has
+type = com.microsoft.SQL.CES.DML.V1, source = "/", the operation
+attribute at envelope level, and a data attribute that is a JSON
+string whose eventsource carries db, schema, tbl, the cols array,
+pkkey ([{"columnname":"PassId","value":"3"}]) and transaction
+(commitlsn, beginlsn, sequencenumber, committime); eventrow.old is
+"{}" for inserts and eventrow.current is "{}" for deletes. D2's
+two events share a commitlsn and have sequencenumber 1 and 2. D3
+fails with Msg 23663, D4 succeeds and D6's cols then includes
+Lane, D5 fails with Msg 4928, and D7 fails with Msg 23626 because
+AzureEventHubs is the only destination type Azure SQL Database
+accepts.
+
+b.
+
+The consumer prints SEVEN events: the five DML events plus one INS
+per pre-existing row (passes 1 and 2), emitted as a snapshot when
+sp_add_object_to_event_stream_group ran; D3 emits one DEL per row,
+so the count is actually nine.
+
+c.
+
+D4 and D5 each produce a CloudEvent of type
+com.microsoft.SQL.CES.DDL.V1 describing the schema change, which
+consumers must apply before reading the next INS; D3 is allowed
+and produces no event.
+
+d.
+
+Because Azure SQL Database publishes CES over AMQP on port 5671, a
+Basic-tier namespace and @destination_location =
+N'<EHNS>.servicebus.windows.net:5671/passes' would have worked,
+and D7's AzureEventHubsApacheKafka is the value to use when the
+namespace has Kafka enabled.
+
+COST AND CLEANUP. One Standard throughput unit is about €0.02 per
+hour plus a negligible per-million-events charge; the serverless
+database bills while active. Disable the stream (so the log can
+truncate) and delete the group:
+
+EXEC sys.sp_remove_object_from_event_stream_group N'PassesGroup', N'Resort.Passes';
+EXEC sys.sp_drop_event_stream_group N'PassesGroup';
+EXEC sys.sp_disable_event_stream;
+
+az group delete -n $RG --yes --no-wait
+
+Correct Answer
+--------------
+
+a
+
+Explanation
+-----------
+
+Why option a is correct
+-----------------------
+
+- WHAT IS STREAMED. "CES emits events only for data changes from
+  INSERT, UPDATE, and DELETE DML statements" and "doesn't stream
+  data that exists in a table before CES is enabled. Existing data
+  isn't seeded, or sent as a snapshot". Passes 1 and 2 therefore
+  never appear; D1, D2 and D6 give exactly five events (operation
+  = INS, INS, UPD, DEL, INS).
+- ENVELOPE. Every CES CloudEvent has 11 attributes: specversion,
+  type (com.microsoft.SQL.CES.DML.V{n}, currently V1), source
+  (always \/), id, logicalid, time (commit time, UTC),
+  datacontenttype, operation (INS/UPD/DEL), segmentindex,
+  finalsegment, and data — a BYTE ARRAY that in JSON encoding is a
+  string you parse a second time (@encoding defaults to JSON;
+  Binary selects Avro). logicalid/segmentindex/finalsegment exist
+  because a change bigger than @max_message_size_kb (128–1024,
+  default 256) is split into chunks; column values above 1 MB are
+  silently truncated first.
+- DATA ATTRIBUTE. eventsource = db, schema, tbl, cols (name, type,
+  index), pkkey (array of columnname/value, the primary key is
+  mandatory for a streamed table) and transaction (commitlsn,
+  beginlsn, sequencenumber, finalevent — always false —,
+  committime); eventrow = old and current, both objects wrapped in
+  strings: an insert has old = "{}", a delete has current = "{}",
+  an update has both images. This is why the update carries the
+  previous price (145.00 replaces 150.00) — CES is a BEFORE/AFTER
+  stream like CDC, not a key-only stream like change tracking.
+- ORDERING. sequencenumber "is the sequential number of the data
+  operation within the transaction. Use this value to sort events
+  within a transaction"; D2's UPD and DEL share the commit LSN and
+  are numbered 1 and 2. With @partition_key_scheme = N'None' (the
+  default) "events are assigned to partitions by the event hub
+  using a round-robin strategy", so across the two partitions the
+  consumer must not assume global order; StreamGroup, Table or
+  Column (with @partition_key_column_name) pin related events to
+  one partition.
+- D3, D4, D5. TRUNCATE TABLE "isn't supported on tables enabled
+  for CES" — verified on SQL Server 2025 as Msg 23663 Cannot
+  truncate the table because it is being used for Change Streams.
+  DDL is "not blocked" but "CES doesn't handle schema changes ...
+  it doesn't emit events for DDL operations ... the schema of
+  subsequent DML events reflects the updated table structure", so
+  D4 succeeds and D6's cols lists Lane. Renaming a streamed column
+  fails — verified: Msg 4928 Cannot alter column 'Holder' because
+  it is 'enabled for Change Streams'. (table renames fail too;
+  database renames are allowed).
+- D7. On Azure SQL Database and SQL database in Fabric
+  AzureEventHubs is "the only accepted value" of
+  @destination_type; AzureEventHubsApacheKafka is for SQL Server
+  2025 and Managed Instance, and AzureEventHubsAmqp is deprecated
+  since 15 August 2026. A wrong value fails validation with Msg
+  23626 (verified on SQL Server 2025 with the mirror case: The
+  error/state returned was 23625/15: 'The argument
+  '@destination_type' failed validation.').
+
+Why option b is wrong
+---------------------
+
+No snapshot exists in CES; pre-existing rows are never emitted,
+and TRUNCATE TABLE is rejected rather than expanded into deletes.
+If you need the initial state, load it separately, as with CDC
+(which also starts at enable time — the seed question of this deck
+showed the pre-enable insert missing from the CDC change table).
+
+Why option c is wrong
+---------------------
+
+There is no DDL event type; the only schema information a consumer
+gets is the cols array inside each DML event, which is why the
+documentation asks you to "gracefully handle events with the
+updated schema". D3 is not allowed at all.
+
+Why option d is wrong
+---------------------
+
+AzureEventHubs on Azure SQL Database "uses the Kafka protocol",
+hence the mandatory :9093 in @destination_location; Kafka
+endpoints exist on Standard and higher tiers (the Basic tier lists
+Kafka consumer groups as N/A, and its 256 KB publication limit
+would also cap @max_message_size_kb). AMQP (port 5671) is the
+deprecated AzureEventHubsAmqp path on Managed Instance/SQL Server
+only, and D7's value is rejected on Azure SQL Database.
+
+CES versus CDC, for the record
+------------------------------
+
+CES keeps no capture tables in the database (CDC fills
+cdc.<schema>_<table>_CT), needs no polling of LSN ranges, and
+pushes CloudEvents to Event Hubs or Fabric Eventstream; the two
+cannot coexist ("CES doesn't support databases configured with ...
+change data capture"), while change tracking can. What CES shares
+with CDC: full recovery model, before/after images, and the
+transaction log as the source — which is why the log cannot
+truncate while events are pending and why disabling the stream is
+part of cleanup.
+
+Hands-on question (Azure subscription required); the T-SQL
+fragments that do not depend on Azure were checked on SQL Server
+2025 RTM 17.0.1000.7; Azure-side behaviour is taken from the
+official documentation.
+
+DP-800 Exam Rule to Remember
+----------------------------
+
+CES on Azure SQL Database (preview): full recovery, PK required, no CDC on the same database
+  CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'Managed Identity'   (+ "Azure Event Hubs Data Sender" on the hub)
+  sp_enable_event_stream -> sp_create_event_stream_group (@destination_type = 'AzureEventHubs' ONLY on Azure SQL DB / Fabric,
+     @destination_location '<ns>.servicebus.windows.net:9093/<hub>' = Kafka, @max_message_size_kb 128..1024 (256),
+     @partition_key_scheme None|StreamGroup|Table|Column, @encoding JSON|Binary) -> sp_add_object_to_event_stream_group
+  catalog: sys.databases.is_event_stream_enabled, sys.tables.is_replicated, sp_help_change_feed, sys.dm_change_feed_errors
+CloudEvent: type com.microsoft.SQL.CES.DML.V1, source "/", operation INS|UPD|DEL, logicalid/segmentindex/finalsegment (chunks)
+  data (JSON string): eventsource{db,schema,tbl,cols[],pkkey[],transaction{commitlsn,beginlsn,sequencenumber,committime}}
+                      eventrow{old,current}  insert old="{}"  delete current="{}"
+  order: sequencenumber within a transaction; partitions round-robin unless a partition key scheme is set
+Not streamed: rows before enabling (no snapshot), DDL (no event; next DML shows new cols); TRUNCATE -> 23663; rename -> 4928

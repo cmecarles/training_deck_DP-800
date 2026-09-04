@@ -145,6 +145,8 @@ index without the COLUMNSTORE keyword.
 
 A columnstore index has **no key columns at all** — all columns are metadata-included — so it cannot enforce uniqueness. The `ORDER (SaleLineID)` clause is legal by itself (ordered *clustered* columnstore since SQL Server 2022, ordered *nonclustered* columnstore new in SQL Server 2025 — verified: `CREATE CLUSTERED COLUMNSTORE INDEX ... ORDER (col)` succeeds and `sys.index_columns.column_store_order_ordinal = 1` for the ordered column), but ordering only sorts data to improve **rowgroup/segment elimination**; it is a performance feature, not a constraint. Even with `UNIQUE` removed, option d would leave requirement 2 unmet — uniqueness on a CCI table needs a separate unique B-tree, which is exactly what option b adds.
 
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
 ## DP-800 Exam Rule to Remember
 
 ```text
