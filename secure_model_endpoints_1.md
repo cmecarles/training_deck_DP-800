@@ -78,7 +78,7 @@ CREATE DATABASE SCOPED CREDENTIAL
 
 ### Why option b is wrong
 
-`IDENTITY = 'HTTPEndpointHeaders'` with `{"api-key": ...}` is the documented **key-based** pattern — valid, but it violates requirement 1: the key is a long-lived secret stored in the database (encrypted by the master key, yes, but retrievable by anyone who can create a credential-using call, and rotated only by hand). It also fails requirement 4 in a second way: `[AzureOpenAI]` is not a URL, so it is rejected by the credential-name rules ("Must be a valid URL"), and neither `sp_invoke_external_rest_endpoint` nor `CREATE EXTERNAL MODEL` could bind it to the endpoint. Finally, "no outbound rule is needed" contradicts requirement 3.
+`IDENTITY = 'HTTPEndpointHeaders'` with `{"api-key": ...}` is the documented **key-based** pattern — valid, but it violates requirement 1: the key is a long-lived secret stored in the database (encrypted by the master key, yes, but retrievable by anyone who can create a credential-using call, and rotated only by hand). It also ignores the credential-name rules that both `sp_invoke_external_rest_endpoint` and `CREATE EXTERNAL MODEL` document for endpoint credentials ("Must be a valid URL" whose scheme + FQDN match the called URL): `[AzureOpenAI]` is not a URL, so it is not the documented way to bind a credential to `https://patentscout-aoai.openai.azure.com` — every Azure OpenAI example in the docs names the credential after the endpoint. Finally, "no outbound rule is needed" contradicts requirement 3.
 
 ### Why option c is wrong
 

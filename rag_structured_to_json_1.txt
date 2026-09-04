@@ -175,7 +175,7 @@ embed it UNESCAPED". The engine produced:
 
 The document is valid JSON (ISJSON = 1) but content is now a JSON
 ARRAY OF PRODUCT OBJECTS, not a string:
-JSON_VALUE(@payload,'$.messages[0].content') returns NULL and
+JSON_VALUE(@payload,'$.messages[1].content') returns NULL and
 JSON_QUERY returns the array. The chat-completions API accepts
 content only as a string or as an array of typed content parts
 ({"type":"text","text":...}), so the service rejects the request
