@@ -1,0 +1,161 @@
+# SQL Server question — Columnstore Maintenance 1
+
+## Statement
+
+`WindFarmLog` receives one telemetry reading per second from each turbine of a wind farm. The readings land in a clustered columnstore table. The database is built by the following complete script; the helper view `Telemetry.RowGroups` simply projects the rowgroup DMV for the table so that every step below can be inspected with `SELECT * FROM Telemetry.RowGroups`:
+
+```sql
+CREATE DATABASE WindFarmLog;
+GO
+USE WindFarmLog;
+GO
+CREATE SCHEMA Telemetry;
+GO
+CREATE TABLE Telemetry.TurbineReadings
+(
+    ReadingId  BIGINT       NOT NULL,
+    TurbineId  INT          NOT NULL,
+    ReadAt     DATETIME2(0) NOT NULL,
+    WindSpeed  DECIMAL(5,2) NOT NULL,
+    PowerKw    DECIMAL(8,2) NOT NULL
+);
+GO
+CREATE CLUSTERED COLUMNSTORE INDEX CCI_TurbineReadings ON Telemetry.TurbineReadings;
+GO
+CREATE VIEW Telemetry.RowGroups AS
+SELECT row_group_id, state_desc, total_rows, deleted_rows,
+       trim_reason_desc, transition_to_compressed_state_desc
+FROM sys.dm_db_column_store_row_group_physical_stats
+WHERE object_id = OBJECT_ID('Telemetry.TurbineReadings');
+GO
+```
+
+The following eight statements are then executed **in order, each in its own batch**, on an otherwise idle instance. `TurbineId` is `n % 20 + 1`, so every load spreads its rows evenly over turbines 1–20 (each turbine gets exactly one row in twenty).
+
+```sql
+-- S1: one INSERT ... SELECT of 102,399 rows
+WITH Digits AS (SELECT d FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS t(d)),
+     N AS (SELECT TOP (102399) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+           FROM Digits a CROSS JOIN Digits b CROSS JOIN Digits c
+                CROSS JOIN Digits d CROSS JOIN Digits e CROSS JOIN Digits f)
+INSERT INTO Telemetry.TurbineReadings (ReadingId, TurbineId, ReadAt, WindSpeed, PowerKw)
+SELECT n, n % 20 + 1, DATEADD(SECOND, n, '2026-09-01'), 5 + (n % 100) / 10.0, 100 + n % 2000
+FROM N;
+
+-- S2: one INSERT ... SELECT of 102,400 rows (ReadingId 200001 ... 302400)
+WITH Digits AS (SELECT d FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS t(d)),
+     N AS (SELECT TOP (102400) 200000 + ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+           FROM Digits a CROSS JOIN Digits b CROSS JOIN Digits c
+                CROSS JOIN Digits d CROSS JOIN Digits e CROSS JOIN Digits f)
+INSERT INTO Telemetry.TurbineReadings (ReadingId, TurbineId, ReadAt, WindSpeed, PowerKw)
+SELECT n, n % 20 + 1, DATEADD(SECOND, n, '2026-09-01'), 5 + (n % 100) / 10.0, 100 + n % 2000
+FROM N;
+
+-- S3
+DELETE FROM Telemetry.TurbineReadings WHERE TurbineId = 7;
+
+-- S4
+DELETE FROM Telemetry.TurbineReadings WHERE TurbineId IN (8, 9) AND ReadingId > 200000;
+
+-- S5
+ALTER INDEX CCI_TurbineReadings ON Telemetry.TurbineReadings REORGANIZE;
+
+-- S6
+ALTER INDEX CCI_TurbineReadings ON Telemetry.TurbineReadings REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON);
+
+-- S7
+ALTER INDEX CCI_TurbineReadings ON Telemetry.TurbineReadings REORGANIZE;
+
+-- S8
+ALTER INDEX CCI_TurbineReadings ON Telemetry.TurbineReadings REBUILD;
+```
+
+After **each** statement, `SELECT * FROM Telemetry.RowGroups ORDER BY row_group_id` is run. For every step give the rowgroups it shows: `row_group_id`, `state_desc`, `total_rows`, `deleted_rows`, and (for compressed rowgroups) `trim_reason_desc` and `transition_to_compressed_state_desc`. Also state how many rows `SELECT COUNT(*)` returns after S3 and after S8.
+
+## Correct Answer
+
+| After | row_group_id | state_desc | total_rows | deleted_rows | trim_reason_desc | transition_to_compressed_state_desc |
+|---|---|---|---|---|---|---|
+| S1 | 0 | OPEN | 102399 | 0 | NULL | NULL |
+| S2 | 0 | OPEN | 102399 | 0 | NULL | NULL |
+| | 1 | COMPRESSED | 102400 | 0 | BULKLOAD | BULKLOAD |
+| S3 | 0 | OPEN | **97279** | 0 | NULL | NULL |
+| | 1 | COMPRESSED | 102400 | **5120** | BULKLOAD | BULKLOAD |
+| S4 | 0 | OPEN | 97279 | 0 | NULL | NULL |
+| | 1 | COMPRESSED | 102400 | **15360** | BULKLOAD | BULKLOAD |
+| S5 | 0 | OPEN | 97279 | 0 | NULL | NULL |
+| | 1 | COMPRESSED | 102400 | 15360 | BULKLOAD | BULKLOAD |
+| S6 | 0 | TOMBSTONE | 97279 | 0 | NULL | NULL |
+| | 1 | COMPRESSED | 102400 | 15360 | BULKLOAD | BULKLOAD |
+| | 2 | COMPRESSED | 97279 | 0 | REORG | REORG_FORCED |
+| S7 | 1 | TOMBSTONE | 102400 | 15360 | NULL | NULL |
+| | 2 | TOMBSTONE | 97279 | 0 | NULL | NULL |
+| | 3 | COMPRESSED | **184319** | 0 | REORG | MERGE |
+| S8 | 0 | COMPRESSED | 184319 | 0 | RESIDUAL_ROW_GROUP | INDEX_BUILD |
+
+`COUNT(*)` is **194,559** after S3 and **184,319** after S8 (and already after S4: S5–S8 change storage, never the logical row count).
+
+## Explanation
+
+A clustered columnstore index keeps its data in **rowgroups** of up to 1,048,576 rows, each stored as compressed column segments. Rows do not always go there directly: small inserts land in a row-format **delta rowgroup** (the delta store) and are compressed later. Deletes never touch a compressed segment; they mark the row in a **delete bitmap**. `sys.dm_db_column_store_row_group_physical_stats` shows all of this, one row per rowgroup, and every value below was read from it.
+
+### S1 — 102,399 rows go to the delta store
+
+A bulk load (`INSERT ... SELECT`, `BULK INSERT`, `bcp`, SSIS) is compressed straight into a columnstore rowgroup **only if the batch has at least 102,400 rows**. One row short, the whole batch goes to a delta rowgroup: `state_desc = OPEN`, `total_rows = 102399`, `trim_reason_desc = NULL` (trim reasons only exist for compressed rowgroups). An `OPEN` delta rowgroup keeps accepting rows; it becomes `CLOSED` when it reaches 1,048,576 rows, and the background **tuple mover** (every few minutes) compresses `CLOSED` rowgroups. So this batch, as well as any trickle `INSERT ... VALUES`, would sit uncompressed until a million rows accumulate or someone forces the issue. (Verified: two consecutive 51,200-row batches produce one `OPEN` rowgroup of 102,400 rows — the threshold is per batch, not cumulative.)
+
+### S2 — 102,400 rows bypass the delta store
+
+Exactly at the threshold the engine compresses the batch directly: rowgroup 1 appears as `COMPRESSED`, `trim_reason_desc = BULKLOAD` (the rowgroup is smaller than the 1,048,576 maximum because *the batch size limited it*) and `transition_to_compressed_state_desc = BULKLOAD` (it never passed through the delta store). Rowgroup 0 is untouched. A larger single batch is cut into 1,048,576-row rowgroups plus a remainder: 1,100,000 rows in one `INSERT ... SELECT` gave one `COMPRESSED` rowgroup of 1,048,576 rows (`trim_reason_desc = NO_TRIM`) and an `OPEN` delta rowgroup of 51,424 rows, because the remainder was below 102,400. The data-loading rule: size batches at ≥ 102,400 rows, ideally ~1,048,576.
+
+### S3 — a delete behaves differently in each store
+
+Turbine 7 owns one row in twenty in both rowgroups: 5,120 in each (10,240 rows affected).
+
+- In the **delta rowgroup** (row format, a B-tree) the rows are physically deleted: `total_rows` drops from 102,399 to **97,279** and `deleted_rows` stays 0 — the DMV documents that `deleted_rows` is always 0 for delta rowgroups.
+- In the **compressed rowgroup** the segments are immutable; the 5,120 rows are flagged in the delete bitmap: `deleted_rows = 5120` while `total_rows` stays **102,400**. The rows are still physically stored and still scanned (then filtered out through the bitmap), which is why deletes degrade columnstore performance and why "fragmentation" of a columnstore is defined as `deleted_rows / total_rows`.
+
+`COUNT(*)` reports the logical count 97,279 + (102,400 − 5,120) = **194,559**. (`sys.internal_partitions` shows the supporting structures: `COLUMN_STORE_DELETE_BITMAP` and `COLUMN_STORE_DELTA_STORE`.) An `UPDATE` of a compressed row is a delete plus an insert: `deleted_rows` grows by one and the new version lands in the delta store.
+
+### S4 — 15 % of the compressed rowgroup is now dead
+
+The filter `ReadingId > 200000` restricts the delete to rowgroup 1: two more turbines, 10,240 rows, so `deleted_rows = 15360` = 15 % of 102,400. Nothing else changes. Fifteen percent is above the 10 % figure Microsoft's `REORGANIZE` documentation uses for removing deleted rows, and below the 20 % the DMV's own example uses as its "remove the deleted rows" threshold — which makes S5 the test.
+
+### S5 — plain `REORGANIZE` does nothing here
+
+`ALTER INDEX ... REORGANIZE` (always online) is documented to (1) compress `CLOSED` delta rowgroups without waiting for the tuple mover, (2) merge small compressed rowgroups together, and (3) physically remove deleted rows from rowgroups with 10 % or more deleted. On this build, with one `OPEN` (not `CLOSED`) delta rowgroup and a single compressed rowgroup that has no merge partner, the statement completed instantly and **changed nothing**: rowgroup 0 stayed `OPEN` and rowgroup 1 kept its 15,360 deleted rows. (Verified further: the same rowgroup with 60 % deleted rows was still left untouched by two consecutive plain `REORGANIZE` calls.) The deleted-row clean-up only materialises as part of a *merge* into a new rowgroup, and an open delta rowgroup is never compressed by a plain `REORGANIZE` — that is the subtle distractor: "REORGANIZE removes the deleted rows" is not something you can rely on for a lone rowgroup.
+
+### S6 — `COMPRESS_ALL_ROW_GROUPS = ON` forces the delta store into the columnstore
+
+The option compresses **open** delta rowgroups too, regardless of size. The DMV shows the mechanics rather than an in-place change: a new rowgroup 2 is `COMPRESSED` with 97,279 rows, `trim_reason_desc = REORG` (forced compression by a REORG command) and `transition_to_compressed_state_desc = REORG_FORCED` (it "was open in the deltastore and was forced into the columnstore before it had a full number of rows"); the old delta rowgroup 0 becomes `TOMBSTONE` — "a row group that was formerly in the deltastore and is no longer used" — until a background task removes it. Rowgroup 1 and its deleted rows are still exactly as before: this option is about the delta store, not about deleted rows. Use it right after a load when no more rows are expected.
+
+### S7 — a second `REORGANIZE` now merges, and the deleted rows vanish with it
+
+Now there are two compressed rowgroups, both far below 1,048,576 rows, so the merge rule applies: the engine reads the live rows of both — (102,400 − 15,360) + 97,279 = **184,319** — and compresses them into new rowgroup 3 with `deleted_rows = 0`, `trim_reason_desc = REORG` and `transition_to_compressed_state_desc = MERGE`. Rowgroups 1 and 2 turn into `TOMBSTONE`s. This is the only way `REORGANIZE` ever purged the delete bitmap in this exercise: as a by-product of merging. (Since SQL Server 2019 a background merge task performs the same consolidation on its own schedule for "smaller open delta rowgroups that have existed for some time" and rowgroups "where a large number of rows has been deleted", producing `trim_reason_desc = AUTO_MERGE`.)
+
+### S8 — `REBUILD` rewrites everything
+
+`ALTER INDEX ... REBUILD` reads every rowgroup and the delta store, drops the deleted rows, and re-creates the index from scratch: a single rowgroup 0 with 184,319 rows, `trim_reason_desc = RESIDUAL_ROW_GROUP` (the last rowgroup of an index build, holding fewer than a million rows) and `transition_to_compressed_state_desc = INDEX_BUILD`; the tombstones are gone. `REBUILD` is offline on a clustered columnstore unless `WITH (ONLINE = ON)` (SQL Server 2019+), needs space for a second copy, and — unlike `REORGANIZE` — updates statistics; on a partitioned table rebuild only the affected partition (`REBUILD PARTITION = n`).
+
+### When to do which
+
+- Loads: batch ≥ 102,400 rows → direct compression, else the delta store; after loading, `REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON)`.
+- Trickle inserts / `CLOSED` rowgroups: the tuple mover handles them; `REORGANIZE` hurries it.
+- Deleted rows: compute `100.0 * deleted_rows / total_rows` per compressed rowgroup. Microsoft's guidance is to remove deleted rows once a rowgroup is around 10 % (the `REORGANIZE` rule) to 20 % (the DMV example's threshold) fragmented; `REORGANIZE` is the cheap online first choice and does it while merging, `REBUILD` is the guaranteed clean-up when a rowgroup will not merge or fragmentation is heavy.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+bulk batch ≥ 102,400 rows → COMPRESSED rowgroup directly (trim BULKLOAD); < 102,400 → OPEN delta rowgroup
+delta rowgroup: OPEN → CLOSED at 1,048,576 rows → tuple mover compresses it (transition TUPLE_MOVER)
+DELETE : delta rows physically removed (total_rows falls)   compressed rows flagged (deleted_rows grows, total_rows same)
+UPDATE on a compressed row = delete flag + insert into delta store
+REORGANIZE                                : online; compresses CLOSED rowgroups; merges small compressed rowgroups
+                                            (deleted rows dropped in the merge, transition MERGE); OPEN rowgroups untouched
+REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON) : also compresses OPEN delta rowgroups (REORG / REORG_FORCED), old one → TOMBSTONE
+REBUILD                                   : rewrites all rowgroups, purges every deleted row (RESIDUAL_ROW_GROUP / INDEX_BUILD)
+fragmentation = 100 * deleted_rows / total_rows  → clean up at ~10–20 %  (sys.dm_db_column_store_row_group_physical_stats)
+```
+
+If the scenario says "loaded in batches of 50,000 and queries are slow" the answer is bigger batches or `REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON)`; if it says "millions of rows deleted, scans slow" the answer is `REORGANIZE` (online) or `REBUILD` (thorough) on the affected partition; and `deleted_rows` never decreases on its own — a delete only marks.
