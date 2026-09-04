@@ -1,0 +1,151 @@
+# SQL Server question — Optimized Locking 1
+
+## Statement
+
+A regional rail operator allocates platform slots in a SQL Server 2025 database named `RailSlots`. Dispatchers complained that holding a platform for one train blocks other dispatchers working on *other* platforms, so the DBA decided to try **optimized locking**. The first attempt failed:
+
+```sql
+CREATE DATABASE RailSlots;
+GO
+ALTER DATABASE RailSlots SET OPTIMIZED_LOCKING = ON;
+```
+
+```text
+Msg 12133, Level 16, State 2
+Optimized Locking cannot be enabled for this database because Accelerated Database Recovery is not enabled.
+Enable Accelerated Database Recovery and try again.
+Msg 5069, Level 16, State 1
+ALTER DATABASE statement failed.
+```
+
+So the DBA enabled the prerequisites and created the tables:
+
+```sql
+ALTER DATABASE RailSlots SET ACCELERATED_DATABASE_RECOVERY = ON;
+ALTER DATABASE RailSlots SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+ALTER DATABASE RailSlots SET OPTIMIZED_LOCKING = ON;
+GO
+SELECT DATABASEPROPERTYEX('RailSlots', 'IsOptimizedLockingOn') AS IsOptimizedLockingOn;   -- 1
+GO
+USE RailSlots;
+GO
+CREATE SCHEMA Rail;
+GO
+CREATE TABLE Rail.Slots
+(
+    SlotId   INT         NOT NULL PRIMARY KEY,
+    Platform INT         NOT NULL,          -- no index on Platform
+    Status   VARCHAR(10) NOT NULL,
+    TrainRef VARCHAR(10) NULL
+);
+INSERT INTO Rail.Slots (SlotId, Platform, Status) VALUES
+    (1, 1, 'FREE'), (2, 1, 'FREE'), (3, 1, 'FREE'),
+    (4, 2, 'FREE'), (5, 2, 'FREE'), (6, 3, 'FREE');
+GO
+CREATE TABLE Rail.Signals (SignalId INT NOT NULL, Aspect INT NOT NULL);   -- heap
+INSERT INTO Rail.Signals VALUES (1, 1);
+GO
+```
+
+Three sessions then run, all at the default `READ COMMITTED` isolation level, with the timing shown:
+
+```sql
+-- Session 1 (spid 61), t = 0
+BEGIN TRAN;
+UPDATE Rail.Slots   SET Status = 'HELD', TrainRef = 'IC-201' WHERE Platform = 1;   -- 3 rows
+UPDATE Rail.Signals SET Aspect = 2 WHERE SignalId = 1;
+WAITFOR DELAY '00:00:12';
+COMMIT;
+
+-- Session 2 (spid 102), t = 3 s
+SELECT request_session_id, resource_type, resource_description, request_mode, request_status
+FROM sys.dm_tran_locks
+WHERE resource_database_id = DB_ID('RailSlots') AND request_session_id <> @@SPID
+  AND resource_type IN ('OBJECT', 'PAGE', 'KEY', 'RID', 'XACT');                     -- (i)
+SET LOCK_TIMEOUT 4000;
+BEGIN TRAN;
+UPDATE Rail.Slots SET Status = 'HELD', TrainRef = 'RE-77' WHERE Platform = 2;       -- (ii)
+UPDATE Rail.Signals SET Aspect = 3 WHERE Aspect = 2;                                -- (iii)
+COMMIT;
+BEGIN TRAN;
+UPDATE Rail.Slots SET Status = 'HELD', TrainRef = 'RE-78' WHERE Platform = 1;       -- (iv)
+IF @@TRANCOUNT > 0 ROLLBACK;
+
+-- Session 3 (monitor), t = 6 s
+SELECT session_id, blocking_session_id, wait_type, wait_resource, command
+FROM sys.dm_exec_requests WHERE database_id = DB_ID('RailSlots') AND session_id <> @@SPID;
+```
+
+Which option describes what happens?
+
+### a.
+
+(i) Session 1 holds only three locks: `OBJECT IX` on `Rail.Slots`, `OBJECT IX` on `Rail.Signals`, and one `XACT X` lock (`XACT: 18:1272:0`) — no `KEY`, `PAGE` or `RID` locks. (ii) completes immediately, 2 rows. (iii) completes immediately, **0 rows**. (iv) waits; session 3 sees `102 | 61 | LCK_M_S_XACT_MODIFY | XACT: 18:1272:0 KEY: 18:72057594047234048 (8194443284a0) | UPDATE`, and after 4 s session 2 gets `Msg 1222 Lock request time out period exceeded.` Final state: slots 1–3 `HELD/IC-201`, slots 4–5 `HELD/RE-77`, slot 6 `FREE`, `Signals.Aspect = 2`.
+
+### b.
+
+(i) Session 1 holds `KEY X` on slots 1, 2 and 3, `PAGE IX`, `OBJECT IX` on both tables and `RID X` on the signal row. (ii) is blocked — the scan of `Rail.Slots` takes `U` locks row by row and hits session 1's `X` key locks — and fails after 4 s with `Msg 1222`. (iii) waits for session 1 and then updates 1 row. (iv) is blocked and times out. Final state: slots 1–3 `HELD/IC-201`, slots 4–6 `FREE`, `Signals.Aspect = 3`.
+
+### c.
+
+(i) Session 1 holds the three locks of option a. (ii) is blocked: the `XACT X` lock is a transaction-wide lock on every table the transaction touched, so any write to `Rail.Slots` must wait; session 2 gets `Msg 1222` after 4 s. (iii) is blocked for the same reason. (iv) is blocked. Final state: slots 1–3 `HELD/IC-201`, slots 4–6 `FREE`, `Signals.Aspect = 2`.
+
+### d.
+
+(i) Session 1 holds the three locks of option a. (ii) completes immediately, 2 rows. (iii) waits for session 1 to commit, re-evaluates its predicate against the committed row (`Aspect = 2`) and updates **1 row**. (iv) waits; session 3 sees `wait_type = LCK_M_X` on `KEY: 18:72057594047234048 (8194443284a0)`, and session 2 gets `Msg 1222` after 4 s. Final state: slots 1–3 `HELD/IC-201`, slots 4–5 `HELD/RE-77`, slot 6 `FREE`, `Signals.Aspect = 3`.
+
+## Correct Answer
+
+**a**
+
+## Explanation
+
+Optimized locking "is composed of two primary components: **transaction ID (TID) locking** and **lock after qualification (LAQ)**". TID locking changes *what is held* until commit; LAQ changes *how a writer finds the rows it will lock*. Every result below is the engine's literal output for the three-session run.
+
+### Why option a is correct
+
+- **(i) TID locking.** "Each row is labeled with the last TID that modified it. Instead of potentially many key or row identifier locks, a single lock on the TID is used to protect all modified rows." Page and row locks are still taken while each row is modified, "but each page and row lock is released as soon as each row is modified. The only lock held until the end of transaction is the single `X` lock on the TID resource". Session 2 saw exactly that:
+
+  | request_session_id | resource_type | resource_description | request_mode | request_status |
+  |---|---|---|---|---|
+  | 61 | OBJECT | | IX | GRANT |
+  | 61 | OBJECT | | IX | GRANT |
+  | 61 | XACT | XACT: 18:1272:0 | X | GRANT |
+
+  Three modified keys and one modified heap row, and not a single `KEY`, `PAGE` or `RID` lock left — "enabling optimized locking reduces or eliminates row and page locks acquired by DML"; schema/intent object locks are unaffected.
+- **(ii) LAQ lets writers on different rows pass.** Without optimized locking "query predicates are checked row by row in a scan by first taking an update (`U`) row lock". With optimized locking and RCSI "predicates can be optimistically checked on the latest committed version of the row without taking any locks. If the predicate doesn't satisfy, the query moves to the next row". `Platform` has no index, so session 2 scans all six rows, passes over the three held rows (their committed version has `Platform = 1`), and updates slots 4 and 5 at once: **2 rows**, no wait.
+- **(iii) LAQ evaluates the predicate on the *committed* version.** Session 1 changed `Aspect` from 1 to 2 but has not committed. Session 2's `WHERE Aspect = 2` is checked against the latest committed version, where `Aspect = 1`: "The row doesn't qualify; hence it's skipped and the statement completes without having been blocked" — **0 rows**, and after both commits `Aspect` is 2. This is the documented behaviour change: "In this example, LAQ removes blocking but leads to different results", which is why the documentation tells workloads that "rely on strict execution order of transactions" to use `REPEATABLE READ`/`SERIALIZABLE` or the `READCOMMITTEDLOCK` hint.
+- **(iv) Same rows → wait on the XACT resource.** Slots 1–3 *do* qualify, and "if there's an active transaction holding an `X` TID lock on the row, the database engine waits for it to complete" by requesting an `S` lock on that TID. Session 3 saw the new wait type `LCK_M_S_XACT_MODIFY` ("waiting for a shared lock on an `XACT` `wait_resource` type, with an intent to modify") with `wait_resource = XACT: 18:1272:0 KEY: 18:72057594047234048 (8194443284a0)`, `sys.dm_tran_locks` showed session 102 with `XACT [XACT: 18:1272:0] KEY(8194443284a0) | S | WAIT`, and `sys.dm_os_waiting_tasks` described it as `xactlock xdesIdLow=1272 ... mode=X UnderlyingResource keylock hobtid=72057594047234048`. `SET LOCK_TIMEOUT 4000` turned the wait into `Msg 1222`; without it session 2 would simply have completed after session 1's commit. In a deadlock graph the same information appears as `<xactlock>` elements under each resource.
+
+### Why option b is wrong
+
+Option b is exactly what the engine does with `OPTIMIZED_LOCKING = OFF` — verified by rerunning the same sessions after `ALTER DATABASE RailSlots SET OPTIMIZED_LOCKING = OFF`: session 1 then held `KEY X` ×3, `PAGE IX` ×2, `OBJECT IX` ×2 and `RID X`; the platform-2 update timed out with `Msg 1222` because the scan's `U` locks collided with the `X` key locks; and the signals update blocked, requalified after the commit and changed the row to 3. All of that is the classic behaviour the DBA enabled optimized locking to get rid of. (Only the platform-2 blocking is a "no index" artefact; an index on `Platform` would avoid it in classic locking too — but LAQ avoids it without the index.)
+
+### Why option c is wrong
+
+The `XACT X` lock is not a table lock. It protects **the rows the transaction modified** (each stamped with its TID); other transactions take an `S` lock on that TID only when they try to modify one of *those* rows. Rows that never qualified are never touched — that is the whole point of "concurrent queries modifying different rows don't block each other". Optimized locking also "avoids lock escalations", so there is no escalation to `OBJECT X` either; it holds fewer locks, not bigger ones.
+
+### Why option d is wrong
+
+This is the subtle distractor: (i), (ii) and the final `Slots` rows are right. It misreads **requalification**. The engine re-evaluates a predicate only for a row that *qualified* on the committed version and then changed before the lock was obtained ("If the row has changed after the predicate was evaluated previously, the database engine reevaluates (requalifies) the predicate again before modifying the row"). A row whose committed version does **not** qualify is skipped without waiting — so (iii) affects 0 rows and `Aspect` ends at 2, not 3. And the wait in (iv) is on the `XACT` resource with wait type `LCK_M_S_XACT_MODIFY`, not `LCK_M_X` on a key: the blocked side asks for an `S` lock on the holder's TID.
+
+### Other verified facts
+
+- ADR is a hard prerequisite in both directions: with optimized locking on, `ALTER DATABASE RailSlots SET ACCELERATED_DATABASE_RECOVERY = OFF` fails with `Msg 12134 Optimized Locking is enabled for this database. To disable Accelerated Database Recovery, disable Optimized Locking and try again.` `DATABASEPROPERTYEX(..., 'IsOptimizedLockingOn')` returned 0 before and 1 after; `sys.databases.is_optimized_locking_on` shows the same (NULL = feature not available).
+- LAQ needs RCSI and the default `READ COMMITTED` level; it is not used with `UPDLOCK`, `READCOMMITTEDLOCK`, `XLOCK`, `HOLDLOCK`, other isolation levels, columnstore tables, `MERGE`, `OUTPUT` into a table variable/result set, variable assignment, or when its heuristics disable it (plan-level feedback is stored in `sys.query_store_plan_feedback`, `feature_desc = 'LAQ Feedback'`). TID locking works without RCSI.
+- Availability: always on in Azure SQL Database, SQL database in Fabric and Managed Instance with the Always-up-to-date or SQL Server 2025 update policy; off by default but enableable per user database in SQL Server 2025; not available on SQL Server 2022 or the MI 2022 policy; not used in `tempdb`.
+
+Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+
+## DP-800 Exam Rule to Remember
+
+```text
+OPTIMIZED_LOCKING = ON   needs ACCELERATED_DATABASE_RECOVERY = ON (Msg 12133 / 12134), wants RCSI
+   TID locking : 1 X lock on XACT per transaction; row/page locks released per row; fewer escalations, less lock memory
+   LAQ (RCSI)  : predicate checked on the LAST COMMITTED version without U locks
+                 not qualified -> skipped, no wait (even if another txn is changing it)   <- results can differ
+                 qualified     -> S lock on the holder's TID: wait LCK_M_S_XACT_MODIFY on "XACT: db:xdes:0 KEY(...)"
+   Diagnose    : sys.dm_tran_locks resource_type XACT, dm_exec_requests wait_resource XACT..., <xactlock> in deadlock XML
+   Opt out     : READCOMMITTEDLOCK / UPDLOCK / REPEATABLE READ where strict ordering matters
+Azure SQL DB / Fabric / MI (AUTD, 2025 policy): always on.  SQL Server 2025: per database, off by default.
+```

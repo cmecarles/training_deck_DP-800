@@ -2,12 +2,12 @@
 
 ## Statement
 
-A plant nursery exposes its catalogue through **Data API builder (DAB)** in front of the Azure SQL database `SeedVault`:
+A plant nursery exposes its catalogue through **Data API builder (DAB)** in front of the Azure SQL database `SproutHouse`:
 
 ```sql
-CREATE DATABASE SeedVault;
+CREATE DATABASE SproutHouse;
 GO
-USE SeedVault;
+USE SproutHouse;
 GO
 CREATE SCHEMA Catalog;
 GO
