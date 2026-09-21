@@ -161,7 +161,54 @@ GO
 
 ## Correct Answer
 
-**c**
+### Option C — FILTER + AFTER INSERT + AFTER UPDATE
+
+Option c combines:
+
+1. **FILTER PREDICATE**
+   - Restricts `SELECT` to the current tenant's rows.
+   - Restricts `UPDATE` and `DELETE` to the current tenant's existing rows.
+2. **BLOCK PREDICATE AFTER INSERT**
+   - Prevents creating rows for another tenant.
+3. **BLOCK PREDICATE AFTER UPDATE**
+   - Prevents modifying a row so that it belongs to another tenant.
+
+```mermaid
+sequenceDiagram
+    actor User as Tenant 42
+    participant App
+    participant DB as Sales.Orders
+    participant Filter as FILTER Predicate
+    participant Block as BLOCK Predicate
+
+    User->>App: SELECT / UPDATE / DELETE
+    App->>DB: Execute operation
+    DB->>Filter: Check existing TenantId
+    Filter-->>DB: Allow only TenantId = 42
+    DB-->>User: Only own rows accessible
+
+    User->>App: INSERT TenantId = 99
+    App->>DB: INSERT
+    DB->>Block: AFTER INSERT: check new TenantId
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Insert fails
+
+    User->>App: INSERT TenantId = 42
+    App->>DB: INSERT
+    DB->>Block: AFTER INSERT: check new TenantId
+    Block-->>DB: 42 == 42 → Allow
+    DB-->>User: Insert succeeds
+
+    User->>App: UPDATE own row TenantId 42 → 99
+    App->>DB: UPDATE
+    DB->>Filter: Can user access existing row?
+    Filter-->>DB: 42 == 42 → Yes
+    DB->>Block: AFTER UPDATE: check new TenantId
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Update fails
+
+    Note over User,DB: ✅ Existing rows isolated<br/>✅ Invalid inserts blocked<br/>✅ Invalid new values blocked
+```
 
 ## Explanation
 
@@ -289,53 +336,5 @@ sequenceDiagram
     Note over User,DB: ❌ BEFORE UPDATE validates the old value<br/>not the resulting TenantId
 ```
 
-### Option C — FILTER + AFTER INSERT + AFTER UPDATE
-
-Option c combines:
-
-1. **FILTER PREDICATE**
-   - Restricts `SELECT` to the current tenant's rows.
-   - Restricts `UPDATE` and `DELETE` to the current tenant's existing rows.
-2. **BLOCK PREDICATE AFTER INSERT**
-   - Prevents creating rows for another tenant.
-3. **BLOCK PREDICATE AFTER UPDATE**
-   - Prevents modifying a row so that it belongs to another tenant.
-
-```mermaid
-sequenceDiagram
-    actor User as Tenant 42
-    participant App
-    participant DB as Sales.Orders
-    participant Filter as FILTER Predicate
-    participant Block as BLOCK Predicate
-
-    User->>App: SELECT / UPDATE / DELETE
-    App->>DB: Execute operation
-    DB->>Filter: Check existing TenantId
-    Filter-->>DB: Allow only TenantId = 42
-    DB-->>User: Only own rows accessible
-
-    User->>App: INSERT TenantId = 99
-    App->>DB: INSERT
-    DB->>Block: AFTER INSERT: check new TenantId
-    Block-->>DB: 99 != 42 → Reject
-    DB-->>User: Insert fails
-
-    User->>App: INSERT TenantId = 42
-    App->>DB: INSERT
-    DB->>Block: AFTER INSERT: check new TenantId
-    Block-->>DB: 42 == 42 → Allow
-    DB-->>User: Insert succeeds
-
-    User->>App: UPDATE own row TenantId 42 → 99
-    App->>DB: UPDATE
-    DB->>Filter: Can user access existing row?
-    Filter-->>DB: 42 == 42 → Yes
-    DB->>Block: AFTER UPDATE: check new TenantId
-    Block-->>DB: 99 != 42 → Reject
-    DB-->>User: Update fails
-
-    Note over User,DB: ✅ Existing rows isolated<br/>✅ Invalid inserts blocked<br/>✅ Invalid new values blocked
-```
 
 ---
