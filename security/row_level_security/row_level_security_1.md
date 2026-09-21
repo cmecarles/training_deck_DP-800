@@ -165,15 +165,77 @@ GO
 
 ## Explanation
 
-This question tests the difference between FILTER predicates and BLOCK predicates in SQL Server and Azure SQL Database Row-Level Security.
+### Option A — FILTER only
 
-A FILTER predicate restricts which existing rows are visible or accessible to `SELECT`, `UPDATE`, and `DELETE` operations.
+Option A violates both the `INSERT` requirement and the `UPDATE`-of-`TenantId` requirement.
 
-However, a FILTER predicate by itself does not prevent a user from inserting a row that belongs to another tenant. It also does not prevent an `UPDATE` that changes a visible row's `TenantId` to another tenant: the filter is evaluated against the existing row (which the tenant owns), the update succeeds, and the row simply disappears from the tenant's view afterwards. Option a therefore violates both the `INSERT` requirement and the `UPDATE`-of-`TenantId` requirement, and is incomplete.
+A FILTER predicate restricts which existing rows are visible or accessible to `SELECT`, `UPDATE`, and `DELETE` operations. 
 
-Option b uses BLOCK predicates to protect `INSERT` and `UPDATE` operations, but it does not contain a FILTER predicate. As a result, it does not restrict which existing rows `AppUser` can see. Therefore, option b is incomplete.
+However, a FILTER predicate by itself does not prevent a user from inserting a row that belongs to another tenant. 
 
-Option d is the subtle distractor.
+It also does not prevent an `UPDATE` that changes a visible row's `TenantId` to another tenant: the filter is evaluated against the existing row (which the tenant owns), the update succeeds, and the row simply disappears from the tenant's view afterwards. 
+
+```mermaid
+sequenceDiagram
+    actor User as Tenant 42
+    participant App
+    participant DB as Sales.Orders
+    participant RLS as FILTER Predicate
+
+    User->>App: SELECT / UPDATE / DELETE
+    App->>DB: Execute operation
+    DB->>RLS: Check existing row TenantId
+    RLS-->>DB: Allow only TenantId = 42
+    DB-->>User: Only own rows accessible
+
+    User->>App: INSERT row with TenantId = 99
+    App->>DB: INSERT
+    Note over DB,RLS: FILTER does not block INSERT
+    DB-->>User: Insert succeeds
+
+    User->>App: SELECT inserted row
+    App->>DB: SELECT
+    DB->>RLS: TenantId 99 == Session 42?
+    RLS-->>DB: No
+    DB-->>User: Row hidden
+
+    Note over User,DB: ❌ Tenant 42 can create data for another tenant
+```
+
+### Option B — BLOCK predicates only
+
+Option b uses BLOCK predicates to protect `INSERT` and `UPDATE` operations, but it does not contain a FILTER predicate. As a result, it does not restrict which existing rows `AppUser` can see.
+
+```mermaid
+sequenceDiagram
+    actor User as Tenant 42
+    participant App
+    participant DB as Sales.Orders
+    participant Block as BLOCK Predicate
+
+    User->>App: SELECT
+    App->>DB: SELECT all rows
+    Note over DB,Block: No FILTER predicate
+    DB-->>User: Rows for Tenant 42 AND Tenant 99
+
+    Note over User,DB: ❌ Existing rows are not isolated
+
+    User->>App: INSERT TenantId = 99
+    App->>DB: INSERT
+    DB->>Block: AFTER INSERT check
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Insert fails
+
+    User->>App: UPDATE own row TenantId 42 → 99
+    App->>DB: UPDATE
+    DB->>Block: AFTER UPDATE check
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Update fails
+
+    Note over User,DB: ✅ Writes protected<br/>❌ Reads not protected
+```
+
+### Option D — FILTER + AFTER INSERT + BEFORE UPDATE
 
 A `BEFORE UPDATE` block predicate evaluates the existing row before the modification. For example, assume tenant 42 owns this row:
 
@@ -193,7 +255,43 @@ A `BEFORE UPDATE` predicate evaluates the original `TenantId` value of 42, which
 
 An `AFTER UPDATE` block predicate evaluates the resulting row state. It can therefore reject the change when `TenantId` becomes 99.
 
-Option c correctly combines:
+```mermaid
+sequenceDiagram
+    actor User as Tenant 42
+    participant App
+    participant DB as Sales.Orders
+    participant Filter as FILTER Predicate
+    participant Block as BLOCK Predicate
+
+    User->>App: SELECT / UPDATE / DELETE
+    App->>DB: Execute operation
+    DB->>Filter: Check existing TenantId
+    Filter-->>DB: Allow only TenantId = 42
+    DB-->>User: Only own rows accessible
+
+    User->>App: INSERT TenantId = 99
+    App->>DB: INSERT
+    DB->>Block: AFTER INSERT check
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Insert fails
+
+    User->>App: UPDATE TenantId 42 → 99
+    App->>DB: UPDATE
+    DB->>Filter: Can user access existing row?
+    Filter-->>DB: 42 == 42 → Yes
+
+    DB->>Block: BEFORE UPDATE: check OLD TenantId
+    Block-->>DB: 42 == 42 → Allow
+
+    DB->>DB: Change TenantId to 99
+    DB-->>User: Update succeeds
+
+    Note over User,DB: ❌ BEFORE UPDATE validates the old value<br/>not the resulting TenantId
+```
+
+### Option C — FILTER + AFTER INSERT + AFTER UPDATE
+
+Option c combines:
 
 1. **FILTER PREDICATE**
    - Restricts `SELECT` to the current tenant's rows.
@@ -203,22 +301,41 @@ Option c correctly combines:
 3. **BLOCK PREDICATE AFTER UPDATE**
    - Prevents modifying a row so that it belongs to another tenant.
 
-Verified against SQL Server 2025 (RTM 17.0.1000.7); every message above is the engine's literal output.
+```mermaid
+sequenceDiagram
+    actor User as Tenant 42
+    participant App
+    participant DB as Sales.Orders
+    participant Filter as FILTER Predicate
+    participant Block as BLOCK Predicate
 
-## DP-800 Exam Rule to Remember
+    User->>App: SELECT / UPDATE / DELETE
+    App->>DB: Execute operation
+    DB->>Filter: Check existing TenantId
+    Filter-->>DB: Allow only TenantId = 42
+    DB-->>User: Only own rows accessible
 
-**FILTER** = Which existing rows can this principal access?
+    User->>App: INSERT TenantId = 99
+    App->>DB: INSERT
+    DB->>Block: AFTER INSERT: check new TenantId
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Insert fails
 
-**BLOCK** = Which row states may this principal create through DML?
+    User->>App: INSERT TenantId = 42
+    App->>DB: INSERT
+    DB->>Block: AFTER INSERT: check new TenantId
+    Block-->>DB: 42 == 42 → Allow
+    DB-->>User: Insert succeeds
 
-For this scenario, the required combination is:
+    User->>App: UPDATE own row TenantId 42 → 99
+    App->>DB: UPDATE
+    DB->>Filter: Can user access existing row?
+    Filter-->>DB: 42 == 42 → Yes
+    DB->>Block: AFTER UPDATE: check new TenantId
+    Block-->>DB: 99 != 42 → Reject
+    DB-->>User: Update fails
 
-```text
-FILTER
-+
-BLOCK AFTER INSERT
-+
-BLOCK AFTER UPDATE
+    Note over User,DB: ✅ Existing rows isolated<br/>✅ Invalid inserts blocked<br/>✅ Invalid new values blocked
 ```
 
-Therefore, the correct answer is **c**.
+---
